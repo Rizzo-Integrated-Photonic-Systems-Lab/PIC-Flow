@@ -1,0 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.dylib
+
+# Virtual environments / packaging
+.env
+.venv
+env/
+venv/
+*.egg-info/
+pip-wheel-metadata/
+.eggs/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs / experiment outputs
+logs/
+wandb/
+*.log
+
+# Large generated data
+Data/*
+!Data/test.py
+
+# Build artifacts
+build/
+dist/
+
+
