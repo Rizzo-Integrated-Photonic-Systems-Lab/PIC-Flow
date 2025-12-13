@@ -23,7 +23,7 @@ from conflictfree.utils import apply_gradient_vector, get_gradient_vector
 
 # If you want to use your multi-device FDTDDataset, swap this import.
 # For now this assumes the simple "coupler_sweep" layout.
-from dataset import CouplerDataset  # or from coupler_dataset import CouplerDataset
+from dataset import FDTDDataset  # unified dataset over all sweeps
 
 from physics_unet import PhysicsUNet
 from flow_matching import (
@@ -119,18 +119,17 @@ def main(args):
             config=vars(args),
         )
 
-    # ---- dataset ----
-    # If you want multi-device, use your more general FDTDDataset and pass device_subdirs.
-    train_ds = CouplerDataset(
-        root_dir=os.path.join(args.data_root, "coupler_sweep"),
+    # ---- dataset (all sweeps under data_root) ----
+    train_ds = FDTDDataset(
+        root_dir=args.data_root,
         split="train",
         train_fraction=args.train_fraction,
         normalize_eps=args.normalize_eps,
     )
     stats = train_ds.get_stats()
 
-    val_ds = CouplerDataset(
-        root_dir=os.path.join(args.data_root, "coupler_sweep"),
+    val_ds = FDTDDataset(
+        root_dir=args.data_root,
         split="val",
         train_fraction=args.train_fraction,
         stats=stats,
