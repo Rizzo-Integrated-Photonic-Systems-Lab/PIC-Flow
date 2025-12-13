@@ -103,9 +103,9 @@ def plot_fields_2d(
     else:
         # use actual cell extents, optionally cropped
         x_min = -0.5 * cell_x_um if x_left_um is None else x_left_um
-        x_max =  0.5 * cell_x_um if x_right_um is None else x_right_um
+        x_max = 0.5 * cell_x_um if x_right_um is None else x_right_um
         y_min = -0.5 * cell_y_um
-        y_max =  0.5 * cell_y_um
+        y_max = 0.5 * cell_y_um
         extent = [x_min, x_max, y_min, y_max]
         x_label = "x (µm)"
         y_label = "y (µm)"
