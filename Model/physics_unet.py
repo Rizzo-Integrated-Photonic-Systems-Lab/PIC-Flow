@@ -364,96 +364,109 @@ class AttentionBlock(nn.Module):
     
 class FiniteDiff2D(nn.Module):
     """
-    Fixed finite-difference operators for 2D
+    Fixed finite-difference operators for 2D on a uniform grid.
 
-    Assumes uniform grid spacing dx, dy
+    dx, dy are the physical spacing per pixel (in your length units).
     """
 
-    def __init__(self, dx: float = 1.0, dy: float = 1.0):
+    def __init__(self, dx: float = 1.0, dy: float = 1.0, pad_mode: str = "replicate"):
         super().__init__()
-        self.dx = dx
-        self.dy = dy
+        self.dx = float(dx)
+        self.dy = float(dy)
+        self.pad_mode = pad_mode
 
-        # first derivatives
+        # Central differences:
+        # d/dx ~ (f[i,j+1] - f[i,j-1])/(2 dx)
         kx = torch.tensor(
-            [[0, 0, 0],
+            [[0.0,  0.0, 0.0],
              [-0.5, 0.0, 0.5],
-             [0, 0, 0]],
+             [0.0,  0.0, 0.0]],
             dtype=torch.float32,
-        ) / dx
+        ) / self.dx
 
+        # d/dy ~ (f[i+1,j] - f[i-1,j])/(2 dy)
         ky = torch.tensor(
-            [[0, -0.5, 0],
-             [0,  0.0, 0],
-             [0,  0.5, 0]],
+            [[0.0, -0.5, 0.0],
+             [0.0,  0.0, 0.0],
+             [0.0,  0.5, 0.0]],
             dtype=torch.float32,
-        ) / dy
+        ) / self.dy
 
-        # 5-point Laplacian (assuming dx == dy; good for your grids)
+        # Anisotropic 5-point Laplacian:
+        # ∇²f ~ (f[i,j+1]-2f[i,j]+f[i,j-1])/dx^2 + (f[i+1,j]-2f[i,j]+f[i-1,j])/dy^2
+        inv_dx2 = 1.0 / (self.dx * self.dx)
+        inv_dy2 = 1.0 / (self.dy * self.dy)
         klap = torch.tensor(
-            [[0.0,  1.0, 0.0],
-             [1.0, -4.0, 1.0],
-             [0.0,  1.0, 0.0]],
+            [[0.0,     inv_dy2, 0.0],
+             [inv_dx2, -2.0*(inv_dx2 + inv_dy2), inv_dx2],
+             [0.0,     inv_dy2, 0.0]],
             dtype=torch.float32,
-        ) / (dx * dx)
+        )
 
         self.register_buffer("kx",   kx[None, None, :, :])
         self.register_buffer("ky",   ky[None, None, :, :])
         self.register_buffer("klap", klap[None, None, :, :])
 
-    def diff_x(self, x: torch.Tensor) -> torch.Tensor:
+    def _depthwise_conv3(self, x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         C = x.shape[1]
-        weight = self.kx.expand(C, 1, 3, 3)
-        return F.conv2d(x, weight, padding=1, groups=C)
+        weight = k.expand(C, 1, 3, 3)
+
+        # Explicit padding (avoids implicit zero outside the domain)
+        xpad = F.pad(x, (1, 1, 1, 1), mode=self.pad_mode)
+        return F.conv2d(xpad, weight, padding=0, groups=C)
+
+    def diff_x(self, x: torch.Tensor) -> torch.Tensor:
+        return self._depthwise_conv3(x, self.kx)
 
     def diff_y(self, x: torch.Tensor) -> torch.Tensor:
-        C = x.shape[1]
-        weight = self.ky.expand(C, 1, 3, 3)
-        return F.conv2d(x, weight, padding=1, groups=C)
+        return self._depthwise_conv3(x, self.ky)
 
     def laplacian(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        2D Laplacian ∇²x using a 5-point stencil.
-        """
-        C = x.shape[1]
-        weight = self.klap.expand(C, 1, 3, 3)
-        return F.conv2d(x, weight, padding=1, groups=C)
+        return self._depthwise_conv3(x, self.klap)
+
 
 class HelmholtzResidual2D(nn.Module):
-    """
-    Scalar Helmholtz residual for Ez in 2D:
-
-        (∇² + k0^2 * eps) Ez = 0
-
-    We assume Ez is complex, stored as [Re(Ez), Im(Ez)].
-    Returns [Re(R), Im(R)] as physics feature channels.
-    """
-
-    def __init__(self, dx: float, dy: float, omega: float, c0: float = 1.0):
+    def __init__(self, dx: float, dy: float, omega: float, c0: float = 1.0, pml_cells: int = 0, normalize: bool = False):
         super().__init__()
         self.diff = FiniteDiff2D(dx, dy)
-        # in normalized units you can treat k0 = omega / c0
         self.k0 = omega / c0
+        self.pml_cells = int(pml_cells)
+        self.normalize = bool(normalize)
 
-    def forward(self, x: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
-        """
-        x:   [B, 2, H, W]  -> [Re(Ez), Im(Ez)]
-        eps: [B, 1, H, W]
-        returns: [B, 2, H, W]  -> [Re(R), Im(R)]
-        """
-        Ez_r = x[:, 0:1]
-        Ez_i = x[:, 1:2]
-
+    def forward(self, x: torch.Tensor, eps: torch.Tensor, k0: Optional[torch.Tensor] = None) -> torch.Tensor:
+        Ez_r, Ez_i = x[:, 0:1], x[:, 1:2]
         lap_r = self.diff.laplacian(Ez_r)
         lap_i = self.diff.laplacian(Ez_i)
 
-        k0_sq_eps = (self.k0 ** 2) * eps
+        if k0 is None:
+            k0_sq_eps = (self.k0 ** 2) * eps
+        else:
+            k0 = k0.view(-1, 1, 1, 1).to(device=eps.device, dtype=eps.dtype)
+            k0_sq_eps = (k0 ** 2) * eps
 
-        # R = (∇² + k0^2 eps) Ez
         R_r = lap_r + k0_sq_eps * Ez_r
         R_i = lap_i + k0_sq_eps * Ez_i
+        R = torch.cat([R_r, R_i], dim=1)
 
-        return torch.cat([R_r, R_i], dim=1)   # [B, 2, H, W]
+        # mask PML band (+2 margin)
+        p = self.pml_cells
+        if p > 0:
+            B, C, H, W = R.shape
+            p2 = min(p + 2, max(0, H // 2 - 1), max(0, W // 2 - 1))
+            if p2 > 0:
+                m = torch.ones((B, 1, H, W), device=R.device, dtype=R.dtype)
+                m[:, :, :p2, :] = 0
+                m[:, :, -p2:, :] = 0
+                m[:, :, :, :p2] = 0
+                m[:, :, :, -p2:] = 0
+                R = R * m
+
+        if self.normalize:
+            denom = R.abs().mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+            R = R / denom
+
+        return R
+
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +528,8 @@ class PhysicsUNet(nn.Module):
         self.cond_dim = cond_dim
 
         # Physics module
-        self.helmholtz = HelmholtzResidual2D(dx=dx, dy=dy, omega=omega)
+        pml_cells = int(round(1.0 * 30))
+        self.helmholtz = HelmholtzResidual2D(dx=dx, dy=dy, omega=omega, pml_cells=pml_cells)
         self.n_phys_feats = 2 # R1, R2, R3 real/imag
 
         # effective input channels seen by the UNet
@@ -662,49 +676,95 @@ class PhysicsUNet(nn.Module):
             zero_module(conv_nd(dims, ch, out_channels, 3, padding=1)),
         )
 
+        # --- normalization flags + stats buffers (set later from dataset stats) ---
+        self.normalize_inputs = True   # set True if your x is normalized in the dataloader
+        self.normalize_eps = False     # will be set from args.normalize_eps
+
+        # Defaults; will be overwritten by set_normalization_stats(...)
+        self.register_buffer("ez_real_mean", torch.tensor(0.0))
+        self.register_buffer("ez_real_std",  torch.tensor(1.0))
+        self.register_buffer("ez_imag_mean", torch.tensor(0.0))
+        self.register_buffer("ez_imag_std",  torch.tensor(1.0))
+        self.register_buffer("eps_mean",     torch.tensor(0.0))
+        self.register_buffer("eps_std",      torch.tensor(1.0))
+    
+    @torch.no_grad()
+    def set_normalization_stats(self, stats: dict, normalize_eps: bool = True):
+        self.normalize_inputs = True
+        self.normalize_eps = bool(normalize_eps)
+
+        self.ez_real_mean.fill_(float(stats["ez_real_mean"]))
+        self.ez_real_std.fill_(float(stats["ez_real_std"]))
+        self.ez_imag_mean.fill_(float(stats["ez_imag_mean"]))
+        self.ez_imag_std.fill_(float(stats["ez_imag_std"]))
+        self.eps_mean.fill_(float(stats["eps_mean"]))
+        self.eps_std.fill_(float(stats["eps_std"]))
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         cond: Optional[torch.Tensor] = None,
+        lambda_um: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        x: [B, 3, H, W] = [Re(Ez), Im(Ez), eps]
-        """
-        # Split fields and geometry
-        Ez = x[:, 0:2]    # [B, 2, H, W]
-        eps = x[:, 2:3]   # [B, 1, H, W]
+        # x: [B,3,H,W] = [Re(Ez), Im(Ez), eps] (typically normalized)
+        Ez  = x[:, 0:2]
+        eps = x[:, 2:3]
 
-        # physics features from scalar Helmholtz residual
-        phys_feats = self.helmholtz(Ez, eps)          # [B, 2, H, W]
-        x_aug = torch.cat([x, phys_feats], dim=1)     # [B, 5, H, W]
+        # per-sample k0 from physical lambda_um (um)
+        k0 = None
+        if lambda_um is not None:
+            k0 = (2.0 * math.pi) / lambda_um.view(-1)  # [B]
 
-        # timestep embedding (unchanged)
-        t_emb = timestep_embedding(t, self.model_channels)  # [B, model_channels]
+        # de-normalize for physics computation (if inputs are normalized)
+        Ez_phys = Ez
+        eps_phys = eps
+        if getattr(self, "normalize_inputs", False):
+            Ez_phys = Ez.clone()
+            Ez_phys[:, 0] = Ez_phys[:, 0] * self.ez_real_std + self.ez_real_mean
+            Ez_phys[:, 1] = Ez_phys[:, 1] * self.ez_imag_std + self.ez_imag_mean
+
+            eps_phys = eps.clone()
+            if getattr(self, "normalize_eps", False):
+                eps_phys = eps_phys * self.eps_std + self.eps_mean
+
+        # physics features (PML mask happens inside helmholtz)
+        phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # [B,2,H,W]
+
+        # stabilize scale so physics channels don't dominate (optional but good)
+        phys_scale = phys_feats.abs().mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        phys_feats = phys_feats / phys_scale
+
+        x_aug = torch.cat([x, phys_feats.to(dtype=x.dtype)], dim=1)  # [B,5,H,W]
+
+        # timestep embedding wants [B]
+        t_in = t.view(t.shape[0]) if t.dim() > 1 else t
+        t_emb = timestep_embedding(t_in, self.model_channels)
+
         if self.cond_dim > 0:
             if cond is None:
-                cond = torch.zeros(x.shape[0], self.cond_dim, device=x.device, dtype=x.dtype)
-            emb_input = torch.cat([t_emb, cond], dim=-1)
+                cond = torch.zeros(x.shape[0], self.cond_dim, device=x.device, dtype=t_emb.dtype)
+            emb_input = torch.cat([t_emb, cond.to(dtype=t_emb.dtype)], dim=-1)
         else:
             emb_input = t_emb
+
         emb = self.time_embed(emb_input)
 
         h = x_aug.type(self.dtype)
         hs: List[torch.Tensor] = []
 
-        # down path
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
 
-        # middle
         h = self.middle_block(h, emb)
 
-        # up path
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
 
         h = h.type(x.dtype)
         return self.out(h)
+
+
 

@@ -56,12 +56,11 @@ def cfm_loss_residual(
     """
     Conditional FM loss + physics residual, WITHOUT calling the sampler.
 
-    - model input:  x_t = [fields_t (2ch), eps (1ch)]
-    - model output: u_t_pred_fields (2ch)
-    - v_t_fields:   target velocity for fields only
-    - eps is kept fixed and only used as conditioning.
-    - cond:         e.g. normalized wavelength passed into PhysicsUNet
-    - lambda_um:    physical wavelength (um) for PDE residual; per-sample
+    Key fix:
+      - Keep wavelength_um passed into GradientsHelper.compute_residual as [B,1]
+        (NOT [B,1,1,1]) to avoid shape mismatches.
+      - Still pass lambda_um through to the model so PhysicsUNet can compute k0
+        inside its forward().
     """
     B, C, H, W = x_t.shape
     device = x_t.device
@@ -70,30 +69,30 @@ def cfm_loss_residual(
     # -----------------------
     # 1) FM loss on fields
     # -----------------------
-    # model expects t as [B]
-    t_vec = t.view(B)
+    t_vec = t.view(B)  # [B]
+
+    # Keep lambda_um as [B,1] for the model (PhysicsUNet handles .view(-1) internally)
+    if lambda_um is not None:
+        lambda_um_model = lambda_um.view(B, 1).to(device=device, dtype=dtype)
+    else:
+        lambda_um_model = None
 
     if cond is None:
-        u_t_pred = model(x_t, t_vec)              # [B,2,H,W]
+        u_t_pred = model(x_t, t_vec, lambda_um=lambda_um_model)               # [B,2,H,W]
     else:
-        # PhysicsUNet: forward(x, t, cond)
-        u_t_pred = model(x_t, t_vec, cond=cond)   # [B,2,H,W]
+        u_t_pred = model(x_t, t_vec, cond=cond, lambda_um=lambda_um_model)    # [B,2,H,W]
 
     fm_loss = F.mse_loss(u_t_pred, v_t_fields)
 
     # -----------------------
     # 2) Estimate clean fields x1 from (x_t, u_t_pred)
     # -----------------------
-    # split fields vs eps
-    fields_t = x_t[:, 0:2]      # [B,2,H,W]
-    eps      = x_t[:, 2:3]      # [B,1,H,W]
+    fields_t = x_t[:, 0:2]  # [B,2,H,W]
+    eps      = x_t[:, 2:3]  # [B,1,H,W]
 
-    # straight-path flow matching (σ_min = 0):
-    #   x_1 = x_t + (1 - t) * u_t(x_t, t)
-    t_view = t.view(B, 1, 1, 1)                     # [B,1,1,1]
+    t_view = t.view(B, 1, 1, 1)  # [B,1,1,1]
     x1_fields_pred = fields_t + (1.0 - t_view) * u_t_pred
 
-    # full state [Re, Im, eps] for residual computation
     x1_full = torch.cat([x1_fields_pred, eps], dim=1)  # [B,3,H,W]
 
     # -----------------------
@@ -117,23 +116,17 @@ def cfm_loss_residual(
     # -----------------------
     # 4) Physics residual (Helmholtz), with per-sample λ if available
     # -----------------------
-    # GradientsHelper.compute_residual is assumed to accept optional wavelength_um
     if lambda_um is not None:
-        # lambda_um: [B,1] → [B,1,1,1] for broadcasting
-        lambda_um_broadcast = lambda_um.view(B, 1, 1, 1).to(device=device, dtype=dtype)
+        # IMPORTANT: keep as [B,1] unless your GradientsHelper explicitly wants [B,1,1,1]
+        lambda_um_helper = lambda_um.view(B, 1).to(device=device, dtype=dtype)
         residual_sq = grad_helper.compute_residual(
             x1_phys,
-            wavelength_um=lambda_um_broadcast,
-        )["residual_sq"]   # [B, H*W, 1]
+            wavelength_um=lambda_um_helper,
+        )["residual_sq"]  # expected [B, H*W, 1] (or similar)
     else:
-        # fallback to the helper's default wavelength (set at construction)
         residual_sq = grad_helper.compute_residual(x1_phys)["residual_sq"]
 
-    # mean squared residual over the spatial domain (and batch)
     residual_loss = residual_sq.mean()
-
-    # `use_dignorm` and `residual_dt` are kept in the signature for future tricks
-    # (e.g. dignorm or time-weighted residuals), but are not used here.
 
     return fm_loss, residual_loss
 
@@ -145,6 +138,7 @@ def sample(
     use_stoc_samp: bool,
     cond_eps: torch.Tensor,     # fixed eps: [B, 1, H, W]
     cond=None,                  # optional conditioning [B, 1]
+    lambda_um=None,             # optional physical wavelength [B, 1]
 ) -> torch.Tensor:
     """
     Flow-matching sampler for fields, conditioned on eps (and optionally λ).
@@ -174,9 +168,9 @@ def sample(
         x_in = torch.cat([x_new, cond_eps], dim=1)   # [B, 3, H, W]
 
         if cond is None:
-            net = lambda x: ema(x, t_vec)
+            net = lambda x: ema(x, t_vec, lambda_um=lambda_um)
         else:
-            net = lambda x: ema(x, t_vec, cond=cond)
+            net = lambda x: ema(x, t_vec, cond=cond, lambda_um=lambda_um)
 
         if (t0 < 0.2) and use_stoc_samp:
             # predictor step

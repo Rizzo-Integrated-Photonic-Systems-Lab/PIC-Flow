@@ -40,8 +40,9 @@ from matplotlib import pyplot as plt
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
-
-torch.backends.cuda.preferred_linalg_library("magma")
+# Prefer cuSOLVER for linear algebra used inside ConFIG; magma was triggering
+# cusolverDnSormqr_bufferSize INVALID_VALUE on some batches.
+torch.backends.cuda.preferred_linalg_library("cusolver")
 
 dtype = torch.float32
 
@@ -183,9 +184,16 @@ def main(args):
         omega=omega,
     ).to(device)
 
+    # IMPORTANT: tell the model how to de-normalize for physics features
+    model.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+
     ema = deepcopy(model).to(device)
     for p in ema.parameters():
         p.requires_grad = False
+
+    # Keep buffers consistent on ema too (safe even though deepcopy copied them)
+    ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+
     update_ema(ema, model, decay=0.0)
 
     logger.info(f"Model params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -209,6 +217,10 @@ def main(args):
         model.load_state_dict(checkpoint["model"])
         ema.load_state_dict(checkpoint["ema"])
         opt.load_state_dict(checkpoint["opt"])
+
+        # re-apply normalization buffers (in case code changed / buffers missing)
+        model.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+        ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
         try:
             ckpt_name = os.path.basename(args.resume_from)
             last_epoch = int(os.path.splitext(ckpt_name)[0])
@@ -218,7 +230,9 @@ def main(args):
         scheduler.last_epoch = last_epoch
 
     # ---- training loop ----
-    use_config = args.use_residual  # when True, use ConFIG conflict-free combo
+    # Disable ConFIG entirely for now; use summed gradients of FM + weighted residual.
+    use_config = False
+    config_failed = False           # retained for clarity; unused when use_config is False
     train_steps = 0
     running_fm_loss = 0.0
     running_residual_loss = 0.0
@@ -304,7 +318,7 @@ def main(args):
                     opt.zero_grad()
                     if torch.isfinite(grads[0]).all():
                         apply_gradient_vector(model, grads[0])
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                         opt.step()
                 else:
                     try:
@@ -313,16 +327,21 @@ def main(args):
                             raise ValueError("ConFIG produced non-finite grad")
                         apply_gradient_vector(model, g_cfg)
                     except Exception as e:
-                        print(f"ConFIG failed: {e}; using summed grads.")
+                        # After a ConFIG failure, avoid repeated cusolver errors by
+                        # switching to summed gradients for the rest of training.
+                        if not config_failed:
+                            logger.warning(f"ConFIG failed: {e}; falling back to summed grads for the rest of training.")
+                            config_failed = True
+                            use_config = False
                         apply_gradient_vector(model, grads[0] + grads[1])
 
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                     opt.step()
             else:
                 total_loss = fm_loss + weighted_residual_loss
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 opt.step()
 
             update_ema(ema, model)
@@ -401,6 +420,7 @@ def main(args):
                         use_stoc_samp=args.use_stoc_samp,
                         cond_eps=eps,
                         cond=cond,              # conditioning for the network
+                        lambda_um=lambda_um,
                     )
                     x1_pred = torch.cat([x1_fields_pred, eps], dim=1)
 
