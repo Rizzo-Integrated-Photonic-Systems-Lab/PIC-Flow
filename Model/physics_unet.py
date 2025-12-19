@@ -452,7 +452,7 @@ class HelmholtzResidual2D(nn.Module):
         p = self.pml_cells
         if p > 0:
             B, C, H, W = R.shape
-            p2 = min(p + 2, max(0, H // 2 - 1), max(0, W // 2 - 1))
+            p2 = min(p + 4, max(0, H // 2 - 1), max(0, W // 2 - 1))
             if p2 > 0:
                 m = torch.ones((B, 1, H, W), device=R.device, dtype=R.dtype)
                 m[:, :, :p2, :] = 0
@@ -466,6 +466,53 @@ class HelmholtzResidual2D(nn.Module):
             R = R / denom
 
         return R
+
+class PhaseFeatures2D(nn.Module):
+    """
+    Phase-aware, amplitude-robust features derived from complex field E = Er + j Ei.
+
+    Outputs (B, 5, H, W):
+      [u_r, u_i, log|E|, dphi_dx, dphi_dy]
+    where u = E / (|E| + eps) and
+      dphi = Im(conj(E) * dE) / (|E|^2 + eps)
+    """
+    def __init__(self, dx: float, dy: float, pad_mode: str = "replicate", eps: float = 1e-8):
+        super().__init__()
+        self.diff = FiniteDiff2D(dx=dx, dy=dy, pad_mode=pad_mode)
+        self.eps = float(eps)
+
+    def forward(self, E: torch.Tensor) -> torch.Tensor:
+        # E: (B, 2, H, W) => [Er, Ei]
+        Er = E[:, 0:1]
+        Ei = E[:, 1:2]
+
+        # amplitude
+        A2 = Er * Er + Ei * Ei
+        A  = torch.sqrt(A2 + self.eps)
+
+        # unit phasor (cos phi, sin phi)
+        invA = 1.0 / (A + self.eps)
+        u_r = Er * invA
+        u_i = Ei * invA
+
+        # log amplitude (stabilizes learning near small |E|)
+        logA = torch.log(A + self.eps)
+
+        # spatial derivatives
+        dEr_dx = self.diff.diff_x(Er)
+        dEi_dx = self.diff.diff_x(Ei)
+        dEr_dy = self.diff.diff_y(Er)
+        dEi_dy = self.diff.diff_y(Ei)
+
+        # Im(conj(E) * dE) = Er*dEi - Ei*dEr
+        imag_conjE_dE_dx = Er * dEi_dx - Ei * dEr_dx
+        imag_conjE_dE_dy = Er * dEi_dy - Ei * dEr_dy
+
+        invA2 = 1.0 / (A2 + self.eps)
+        dphi_dx = imag_conjE_dE_dx * invA2
+        dphi_dy = imag_conjE_dE_dy * invA2
+
+        return torch.cat([u_r, u_i, logA, dphi_dx, dphi_dy], dim=1)
 
 
 
@@ -532,11 +579,14 @@ class PhysicsUNet(nn.Module):
         self.helmholtz = HelmholtzResidual2D(dx=dx, dy=dy, omega=omega, pml_cells=pml_cells)
         self.n_phys_feats = 2 # R1, R2, R3 real/imag
 
+        # phase features module
+        self.phase_features = PhaseFeatures2D(dx=dx, dy=dy, pad_mode="replicate", eps=1e-8)
+        self.n_phase_feats = 5
+
         # effective input channels seen by the UNet
         self.base_in_channels = in_channels
-        self.in_channels = in_channels + self.n_phys_feats
+        self.in_channels = in_channels + self.n_phys_feats + self.n_phase_feats
         
-
         # time + conditioning embedding
         time_embed_dim = model_channels * 4
         # input to this MLP is [t_embed (model_channels) ; cond (cond_dim)]
@@ -727,15 +777,36 @@ class PhysicsUNet(nn.Module):
             eps_phys = eps.clone()
             if getattr(self, "normalize_eps", False):
                 eps_phys = eps_phys * self.eps_std + self.eps_mean
+        
+        # build non-PML mask (same logic as elsewhere)
+        pml_m = torch.ones((x.shape[0], 1, Ez_phys.shape[-2], Ez_phys.shape[-1]), device=x.device, dtype=Ez_phys.dtype)
+        p = self.helmholtz.pml_cells
+        p2 = min(p + 4, max(0, Ez_phys.shape[-2] // 2 - 1), max(0, Ez_phys.shape[-1] // 2 - 1))
+        if p2 > 0:
+            pml_m[:, :, :p2, :] = 0
+            pml_m[:, :, -p2:, :] = 0
+            pml_m[:, :, :, :p2] = 0
+            pml_m[:, :, :, -p2:] = 0
 
-        # physics features (PML mask happens inside helmholtz)
-        phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # [B,2,H,W]
+        # physics features
+        phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # already masked inside, but ok
 
-        # stabilize scale so physics channels don't dominate (optional but good)
-        phys_scale = phys_feats.abs().mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        # masked scale (avoid PML dominating)
+        den = pml_m.float().sum(dim=(2,3), keepdim=True).clamp_min(1.0)
+        phys_scale = (phys_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
+        phys_scale = phys_scale.clamp_min(1e-6)
         phys_feats = phys_feats / phys_scale
+        phys_feats = phys_feats * pml_m  # optional but recommended
 
-        x_aug = torch.cat([x, phys_feats.to(dtype=x.dtype)], dim=1)  # [B,5,H,W]
+        # phase features
+        phase_feats = self.phase_features(Ez_phys)
+        phase_scale = (phase_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
+        phase_scale = phase_scale.clamp_min(1e-6)
+        phase_feats = phase_feats / phase_scale
+        phase_feats = phase_feats * pml_m  # optional but recommended
+
+        x_masked = x * pml_m.to(dtype=x.dtype)
+        x_aug = torch.cat([x_masked, phys_feats.to(dtype=x.dtype), phase_feats.to(dtype=x.dtype)], dim=1)  # [B,10,H,W]
 
         # timestep embedding wants [B]
         t_in = t.view(t.shape[0]) if t.dim() > 1 else t

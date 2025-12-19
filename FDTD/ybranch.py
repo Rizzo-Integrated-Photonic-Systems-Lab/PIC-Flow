@@ -26,7 +26,7 @@ class YBranch2D(Device2DBase):
         self,
         wg_width_um: float = 0.45,
         wavelength_um: float = 1.55,
-        resolution: int = 25,
+        resolution: int | None = None,
         n_core: float | None = None,
         n_clad: float = 1.444,
         dpml: float = 1.0,
@@ -52,10 +52,13 @@ class YBranch2D(Device2DBase):
 
         port_y_span_um: float | None = None,
     ):
-        # Match the directional coupler defaults for cell sizing
-        cx = 32 if cell_x_um is None else cell_x_um
-        cy = 6.4 if cell_y_um is None else cell_y_um
-        super().__init__(cell_x_um=cx, cell_y_um=cy, dpml=dpml, resolution=resolution)
+        # Use shared defaults from Device2DBase unless overridden
+        super().__init__(
+            cell_x_um=DEFAULT_CELL_X_UM if cell_x_um is None else cell_x_um,
+            cell_y_um=DEFAULT_CELL_Y_UM if cell_y_um is None else cell_y_um,
+            dpml=DEFAULT_DPML_UM if dpml is None else dpml,
+            resolution=DEFAULT_RESOLUTION if resolution is None else resolution,
+        )
 
         self.wg_width_um = float(wg_width_um)
         self.wavelength_um = float(wavelength_um)

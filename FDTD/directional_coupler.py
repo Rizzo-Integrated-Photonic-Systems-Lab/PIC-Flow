@@ -1,8 +1,15 @@
 import meep as mp
 import numpy as np
 from utils import neff_siwire_from_tables
-from devices_base import Device2DBase
+from devices_base import (
+    Device2DBase,
+    DEFAULT_CELL_X_UM,
+    DEFAULT_CELL_Y_UM,
+    DEFAULT_DPML_UM,
+    DEFAULT_RESOLUTION,
+)
 from straight_waveguide import StraightWaveguide2D
+
 
 
 class DirectionalCoupler2D(Device2DBase):
@@ -24,13 +31,13 @@ class DirectionalCoupler2D(Device2DBase):
       - `wg_length_um` is the physical length between inner PML faces (coupling region)
     """
 
-    def __init__(
+    def __init__(   
         self,
         wg_width_um: float = 0.45,
         gap_um: float = 0.2,         # edge–to–edge gap between the two guides [µm]
         wg_length_um: float = 20.0,  # physical length between inner PML faces [µm]
         wavelength_um: float = 1.55,
-        resolution: int = 25,
+        resolution: int | None = None,
         n_core: float | None = None,
         n_clad: float = 1.444,
         dpml: float = 1.0,
@@ -41,11 +48,14 @@ class DirectionalCoupler2D(Device2DBase):
         bend_n_segments: int = 24, # nums segments to approximate bend with
         cell_x_um: float | None = None,
         cell_y_um: float | None = None,
-    ):
-        # Use device base sizing with per-device defaults
-        cx = 32 if cell_x_um is None else cell_x_um
-        cy = 6.4 if cell_y_um is None else cell_y_um
-        super().__init__(cell_x_um=cx, cell_y_um=cy, dpml=dpml, resolution=resolution)
+    ):  
+        # Use shared defaults from Device2DBase unless overridden
+        super().__init__(
+            cell_x_um=DEFAULT_CELL_X_UM if cell_x_um is None else cell_x_um,
+            cell_y_um=DEFAULT_CELL_Y_UM if cell_y_um is None else cell_y_um,
+            dpml=DEFAULT_DPML_UM if dpml is None else dpml,
+            resolution=DEFAULT_RESOLUTION if resolution is None else resolution,
+        )
 
         self.wg_width_um = wg_width_um
         self.gap_um = gap_um
@@ -76,6 +86,10 @@ class DirectionalCoupler2D(Device2DBase):
         self.port_2 = None  # left-bottom
         self.port_3 = None  # right-top
         self.port_4 = None  # right-bottom
+
+        self.x_port_left_um = None
+        self.x_port_right_um = None
+        self.port_y_offset_um = None
 
         self.src_1 = None   # source volume for port 1 excitation
         self.src_2 = None   # source volume for port 2 excitation
@@ -343,6 +357,7 @@ class DirectionalCoupler2D(Device2DBase):
         # record final port x-locations for external use (e.g. plotting helpers)
         self.x_port_left_um = port_x_left
         self.x_port_right_um = port_x_right
+        self.port_y_offset_um = port_y_offset
 
 
         # port cross-section height: just big enough to capture one arm, not both
@@ -385,33 +400,47 @@ class DirectionalCoupler2D(Device2DBase):
             size=mp.Vector3(self.cell_x, self.cell_y, 0),
         )
 
-    # def run_normalization(self, port: int = 1, decay_tol: float = 1e-6):
-    #     # build a straight waveguide version of the geometry
-    #     swg = StraightWaveguide2D(
-    #         wg_width_um=self.wg_width_um,
-    #         wg_length_um=self.domain_length_um,
-    #         wavelength_um=self.wavelength_um,
-    #         resolution=self.resolution,
-    #         n_core=self.n_core,
-    #         n_clad=self.n_clad,
-    #         dpml=self.dpml,
-    #         pad_y_um=self.pad_y_um,
-    #         port_margin_um=self.port_margin_um,
-    #         source_shift_um=self.source_shift_um,
-    #     )
+    def get_port_centers_um(self):
+        yoff = self.port_y_offset_um
+        return {
+            1: (self.x_port_left_um, +yoff),
+            2: (self.x_port_left_um, -yoff),
+            3: (self.x_port_right_um, +yoff),
+            4: (self.x_port_right_um, -yoff),
+        }
+    
+    def get_port_y_span_um(self):
+        return self.wg_width_um + 0.5 * self.gap_um
+    
+    def get_eps_and_cell(self):
+        """
+        Return the permittivity grid (ny, nx) and (cell_x, cell_y) without running a source.
 
-    #     # Run the normalization sim and get a_in_ref
-    #     _, _, _, _, a_in_ref, _ = swg.run_sim(decay_tol=decay_tol)
+        This builds a Simulation with no sources, initializes it, and extracts epsilon.
+        It's fast compared to a full time-domain run.
+        """
+        sim = mp.Simulation(
+            cell_size=self.cell,
+            resolution=self.resolution,
+            boundary_layers=[mp.PML(self.dpml)],
+            geometry=self.geometry,
+            default_material=self.clad_medium,
+            sources=[],
+        )
 
-    #     # Store reference amplitude for both input ports (symmetric device)
-    #     self.ref_amp[1] = a_in_ref
-    #     self.ref_amp[2] = a_in_ref
+        # Initialize fields / geometry discretization without advancing time
+        sim.init_sim()
 
-    #     print("=== Normalization run (straight waveguide) ===")
-    #     print(f"a_in_ref = {a_in_ref}")
-    #     print(f"|a_in_ref|^2 (reference incident power) = {abs(a_in_ref)**2}")
+        # Meep returns epsilon as [nx, ny]; transpose to match your run_sim outputs [ny, nx]
+        eps_2d = sim.get_epsilon()   # [nx, ny]
+        eps_mid = eps_2d.T           # [ny, nx]
 
+        # Free internal Meep state (helps avoid memory creep)
+        sim.reset_meep()
 
+        return eps_mid, (self.cell_x, self.cell_y)
+
+    
     def run_sim(self, input_port: int = 1, decay_tol: float = 1e-6):
         """
         Run Meep, excite either port 1 or 2, compute S_{•,input_port} and cache eps/Ez.

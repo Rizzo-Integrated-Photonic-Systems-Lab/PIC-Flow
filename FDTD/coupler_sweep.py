@@ -5,6 +5,8 @@ from scipy.stats import qmc
 
 from directional_coupler import DirectionalCoupler2D
 
+from conditioning_masks import make_source_mask
+
 import multiprocessing as mp
 from multiprocessing import cpu_count
 from tqdm import tqdm
@@ -22,9 +24,9 @@ wg_length_min, wg_length_max = 5.0, 15.0   # µm
 bend_length_min, bend_length_max = 5.0, 7.0  # µm
 wg_width_min, wg_width_max = 0.38, 0.60    # µm
 lambda_min, lambda_max = 1.40, 1.60        # µm
-lead_gap_min, lead_gap_max = 1.0, 2.0      # µm
+lead_gap_min, lead_gap_max = 1.0, 2.5      # µm
 
-N_GEO = 1250
+N_GEO = 10000
 
 # LHS sampler in 6D: [gap, coupler length, bend length, wg_width, wavelength, lead_extra_gap]
 sampler = qmc.LatinHypercube(d=6, seed=42)
@@ -48,11 +50,20 @@ def _quantize_01(x, x_min, x_max):
 wg_widths = _quantize_01(wg_widths, wg_width_min, wg_width_max)
 wavelengths = _quantize_01(wavelengths, lambda_min, lambda_max)
 
+
+# excitation sampling
+p_port1 = 0.5
+p_port2 = 0.5
+
+
+rng = np.random.default_rng(42)
+exc_ports = rng.choice([1, 2], size=N_GEO, p=[p_port1, p_port2])
+
 param_list = [
     # (wg_width, gap, coupler_length, bend_length, lead_extra_gap, wavelength)
-    (float(w), float(g), float(L), float(b), float(lead), float(lam))
-    for w, g, L, b, lead, lam in zip(
-        wg_widths, gaps, wg_lengths, bend_lengths, lead_gaps, wavelengths
+    (float(w), float(g), float(L), float(b), float(lead), float(lam), int(p))
+    for w, g, L, b, lead, lam, p in zip(
+        wg_widths, gaps, wg_lengths, bend_lengths, lead_gaps, wavelengths, exc_ports
     )
 ]
 
@@ -64,6 +75,7 @@ def run_fdtd_sim(
     bend_length: float,
     lead_extra_gap: float,
     wl: float,
+    input_port: int,
 ):
     dc = DirectionalCoupler2D(
         wg_width_um=wg_width,
@@ -78,15 +90,42 @@ def run_fdtd_sim(
         bend_n_segments=64,                # smoother S-bend
     )
 
-    eps, Ez, Hx, Hy, S, cell = dc.run_sim(input_port=1, decay_tol=1e-5)
-    # Only S/Ez/eps are saved downstream; Hx/Hy are discarded here.
-    return S, Ez, eps, cell
+    if input_port == 0:
+        eps, cell = dc.get_eps_and_cell()    # eps is [ny,nx]
+        ny, nx = eps.shape
+        Lx_um, Ly_um = cell
+
+        src_mask = make_source_mask(
+            input_port=0,
+            port_centers_um=dc.get_port_centers_um(),
+            y_span_um=dc.get_port_y_span_um(),
+            Lx_um=Lx_um,
+            Ly_um=Ly_um,
+            ny=ny,
+            nx=nx,
+        )
+        return None, None, eps, cell, src_mask
+
+    eps, Ez, Hx, Hy, S, cell = dc.run_sim(input_port=input_port, decay_tol=1e-5)
+    ny, nx = eps.shape
+    Lx_um, Ly_um = cell
+
+    src_mask = make_source_mask(
+        input_port=input_port,
+        port_centers_um=dc.get_port_centers_um(),
+        y_span_um=dc.get_port_y_span_um(),
+        Lx_um=Lx_um,
+        Ly_um=Ly_um,
+        ny=ny,
+        nx=nx,
+    )
+    return S, Ez, eps, cell, src_mask
 
 
 def worker(args):
-    wg_width, gap, wg_length, bend_length, lead_extra_gap, lam = args
+    wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, input_port = args
 
-    # Include width in the tag so different widths don't collide
+    # Include width + input port in the tag so different runs don't collide
     tag = (
         f"wgWidth{wg_width:.3f}"
         f"_gap{gap:.3f}"
@@ -94,36 +133,57 @@ def worker(args):
         f"_bendLength{bend_length:.1f}"
         f"_leadGap{lead_extra_gap:.2f}"
         f"_lam{lam:.2f}"
+        f"_inputPort{input_port}"
     )
     out_dir = OUT_DIR / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        S, Ez, eps, cell = run_fdtd_sim(
-            wg_width, gap, wg_length, bend_length, lead_extra_gap, lam
+        S, Ez, eps, cell, src_mask = run_fdtd_sim(
+            wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, input_port
         )
 
-        # ---- dict -> vector in fixed order ----
-        if isinstance(S, dict):
-            S_vec = np.array(
-                [S[(1, 1)], S[(2, 1)], S[(3, 1)], S[(4, 1)]],
-                dtype=np.complex128,
-            )
-        else:
-            S_vec = np.asarray(S, dtype=np.complex128)
+        # ---- S-params (handle dict + handle "no excitation") ----
+        S_vec = None
+        if S is not None:
+            if isinstance(S, dict):
+                # Vector is [S11, S21, S31, S41] but with the *actual* excited port
+                # i.e. S(out_port, input_port) for out_port in {1,2,3,4}
+                S_vec = np.array(
+                    [S[(1, input_port)], S[(2, input_port)], S[(3, input_port)], S[(4, input_port)]],
+                    dtype=np.complex128,
+                )
+            else:
+                S_vec = np.asarray(S, dtype=np.complex128)
 
         # 1) Save S-params + scalar metadata
-        np.savez(
-            out_dir / "sparams.npz",
-            gap_um=np.float32(gap),
-            Lc_um=np.float32(wg_length),
-            wg_width_um=np.float32(wg_width),
-            lead_extra_gap_um=np.float32(lead_extra_gap),
-            wavelength_um=np.float32(lam),
-            S_real=S_vec.real.astype(np.float32),
-            S_imag=S_vec.imag.astype(np.float32),
-            resolution=np.int32(30),  
-        )
+        # If input_port == 0 (or S is None), we store a source_off flag and omit S arrays.
+        if S_vec is not None:
+            np.savez(
+                out_dir / "sparams.npz",
+                input_port=np.int32(input_port),
+                source_off=np.int32(0),
+                gap_um=np.float32(gap),
+                Lc_um=np.float32(wg_length),
+                wg_width_um=np.float32(wg_width),
+                lead_extra_gap_um=np.float32(lead_extra_gap),
+                wavelength_um=np.float32(lam),
+                S_real=S_vec.real.astype(np.float32),
+                S_imag=S_vec.imag.astype(np.float32),
+                resolution=np.int32(RESOLUTION),
+            )
+        else:
+            np.savez(
+                out_dir / "sparams.npz",
+                input_port=np.int32(input_port),
+                source_off=np.int32(1),
+                gap_um=np.float32(gap),
+                Lc_um=np.float32(wg_length),
+                wg_width_um=np.float32(wg_width),
+                lead_extra_gap_um=np.float32(lead_extra_gap),
+                wavelength_um=np.float32(lam),
+                resolution=np.int32(RESOLUTION),
+            )
 
         # 2) Save fields (if returned)
         if Ez is not None:
@@ -137,22 +197,24 @@ def worker(args):
             np.save(out_dir / "eps.npy", eps.astype(np.float32))
 
         # 4) Save grid metadata from actual array shape
-        # Use the shape of the returned epsilon array to ensure exact match
-        ny, nx = eps.shape if eps is not None else (0, 0)
+        ny, nx = eps.shape if eps is not None else src_mask.shape
         Lx_um, Ly_um = cell
 
         dx = 1.0 / RESOLUTION
         dy = 1.0 / RESOLUTION
 
-        grid_meta = {
-            "dx": np.float32(dx),
-            "dy": np.float32(dy),
-            "nx": np.int32(nx),
-            "ny": np.int32(ny),
-            "Lx_um": np.float32(Lx_um),
-            "Ly_um": np.float32(Ly_um),
-        }
-        np.savez(out_dir / "grid_meta.npz", **grid_meta)
+        np.savez(
+            out_dir / "grid_meta.npz",
+            dx=np.float32(dx),
+            dy=np.float32(dy),
+            nx=np.int32(nx),
+            ny=np.int32(ny),
+            Lx_um=np.float32(Lx_um),
+            Ly_um=np.float32(Ly_um),
+        )
+
+        # 5) Save source mask
+        np.save(out_dir / "src_mask.npy", np.asarray(src_mask, dtype=np.float32))
 
         return tag
 
@@ -160,6 +222,7 @@ def worker(args):
         with open(out_dir / "error.txt", "w") as f:
             f.write(repr(e))
         return f"ERROR::{tag}"
+
 
 
 
