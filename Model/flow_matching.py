@@ -131,7 +131,9 @@ def cfm_loss_residual(
     w_min: float = 0.1,          # baseline weight everywhere
     eps_thr: float = 6.0,        # threshold in *physical* eps units
     dilate: int = 9,             # dilation kernel size (odd int recommended)
-    weight_residual: bool = True # if True, weight residual with same spatial weights
+    weight_residual: bool = True, # if True, weight residual with same spatial weights
+    compute_endpoint: bool = True,
+    compute_phase_grad: bool = True,
 ):
     """
     Conditional FM loss + physics residual + phase loss + endpoint loss.
@@ -252,10 +254,13 @@ def cfm_loss_residual(
     # -----------------------
     # 5.5) Endpoint loss (now gauge-invariant due to alignment)
     # -----------------------
-    diff_end = x1_fields_pred_aligned - fields_1  # both normalized, pred aligned
-    end_num = (w_fm * (diff_end ** 2)).sum(dim=(2, 3))  # [B,2]
-    end_den = w_fm.sum(dim=(2, 3)).clamp_min(1.0)       # [B,1]
-    endpoint_loss = (end_num / end_den).mean()
+    if compute_endpoint:
+        diff_end = x1_fields_pred_aligned - fields_1  # both normalized, pred aligned
+        end_num = (w_fm * (diff_end ** 2)).sum(dim=(2, 3))  # [B,2]
+        end_den = w_fm.sum(dim=(2, 3)).clamp_min(1.0)       # [B,1]
+        endpoint_loss = (end_num / end_den).mean()
+    else:
+        endpoint_loss = torch.tensor(0.0, device=device, dtype=dtype)
 
     # -----------------------
     # 6) Phase (phasor) loss (local phase), amplitude-weighted, device-focused
@@ -263,7 +268,10 @@ def cfm_loss_residual(
     E_pred = torch.complex(x1_fields_phys_aligned[:, 0], x1_fields_phys_aligned[:, 1])
     E_true = torch.complex(fields1_phys[:, 0], fields1_phys[:, 1])
 
-    phase_grad = phase_grad_loss(E_pred, E_true, m_focus)
+    if compute_phase_grad:
+        phase_grad = phase_grad_loss(E_pred, E_true, m_focus)
+    else:
+        phase_grad = torch.tensor(0.0, device=device, dtype=dtype)
 
     abs_pred = torch.abs(E_pred).clamp_min(1e-8)
     abs_true = torch.abs(E_true).clamp_min(1e-8)

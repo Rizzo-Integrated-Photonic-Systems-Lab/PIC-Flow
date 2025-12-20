@@ -302,6 +302,7 @@ def main(args):
     # -----------------------
     use_config = bool(args.use_residual)
     use_endpoint = args.lambda_endpoint > 0
+    use_phase_grad = args.lambda_phase_grad > 0
     config_failed = False
 
     lam_mean = float(stats["lambda_um_mean"])
@@ -334,8 +335,8 @@ def main(args):
         if args.endpoint_warmup_epochs > 0 and endpoint_weight > 0:
             endpoint_weight *= min(1.0, epoch / args.endpoint_warmup_epochs)
 
-        phase_grad_weight = args.lambda_phase_grad
-        if args.phase_grad_warmup_epochs > 0:
+        phase_grad_weight = args.lambda_phase_grad if use_phase_grad else 0.0
+        if use_phase_grad and args.phase_grad_warmup_epochs > 0:
             phase_grad_weight *= min(1.0, epoch / args.phase_grad_warmup_epochs)
 
         # device-focus schedule
@@ -383,6 +384,8 @@ def main(args):
                 eps_thr=args.eps_thr,
                 dilate=args.dilate,
                 weight_residual=True,
+                compute_endpoint=use_endpoint,
+                compute_phase_grad=use_phase_grad,
             )
 
             # scale residual to grid units
@@ -414,9 +417,12 @@ def main(args):
                 else:
                     g4 = torch.zeros_like(g1)
 
-                weighted_phase_grad_loss.backward(retain_graph=True)
-                g5 = get_gradient_vector(model.module).detach()
-                opt.zero_grad(set_to_none=True)
+                if use_phase_grad:
+                    weighted_phase_grad_loss.backward(retain_graph=True)
+                    g5 = get_gradient_vector(model.module).detach()
+                    opt.zero_grad(set_to_none=True)
+                else:
+                    g5 = torch.zeros_like(g1)
 
                 ddp_allreduce_mean_(g1)
                 ddp_allreduce_mean_(g2)
@@ -454,8 +460,9 @@ def main(args):
                     + weighted_residual_loss
                     + weighted_phase_loss
                     + weighted_endpoint_loss
-                    + weighted_phase_grad_loss
                 )
+                if use_phase_grad:
+                    total_loss = total_loss + weighted_phase_grad_loss
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -466,8 +473,10 @@ def main(args):
             running_fm_loss += fm_loss.item()
             running_residual_loss += residual_loss.item()
             running_phase_loss += phase_loss.item()
-            running_endpoint_loss += endpoint_loss.item()
-            running_phase_grad_loss += phase_grad_loss.item()
+            if use_endpoint:
+                running_endpoint_loss += endpoint_loss.item()
+            if use_phase_grad:
+                running_phase_grad_loss += phase_grad_loss.item()
             train_steps += 1
 
         # -----------------------
@@ -522,8 +531,10 @@ def main(args):
                     eval_fm += fm_v.item()
                     eval_res += res_v.item()
                     eval_phase += ph_v.item()
-                    eval_endpoint += end_v.item()
-                    eval_phase_grad += phg_v.item()
+                    if use_endpoint:
+                        eval_endpoint += end_v.item()
+                    if use_phase_grad:
+                        eval_phase_grad += phg_v.item()
                     eval_steps += 1
                     break  # keep it fast
 
@@ -536,14 +547,16 @@ def main(args):
                 ddp_allreduce_mean_(fm_t)
                 ddp_allreduce_mean_(res_t)
                 ddp_allreduce_mean_(ph_t)
-                ddp_allreduce_mean_(end_t)
-                ddp_allreduce_mean_(phg_t)
+                if use_endpoint:
+                    ddp_allreduce_mean_(end_t)
+                if use_phase_grad:
+                    ddp_allreduce_mean_(phg_t)
 
                 val_fm_loss = float(fm_t.item())
                 val_res_loss = float(res_t.item())
                 val_phase_loss = float(ph_t.item())
-                val_endpoint_loss = float(end_t.item())
-                val_phase_grad_loss = float(phg_t.item())
+                val_endpoint_loss = float(end_t.item()) if use_endpoint else 0.0
+                val_phase_grad_loss = float(phg_t.item()) if use_phase_grad else 0.0
 
             # -----------------------
             # Sample residual eval + images (rank 0 only)
@@ -705,43 +718,43 @@ def main(args):
 
                 sample_residual_mean = float(np.mean(residuals)) if residuals else 0.0
 
-                log_msg = (
-                    f"[epoch {epoch:04d}] val_fm={val_fm_loss:.4e}, val_res={val_res_loss:.4e}, "
-                    f"val_phase={val_phase_loss:.4e}, val_phase_grad={val_phase_grad_loss:.4e}, "
-                    f"sample_residual={sample_residual_mean:.4e}"
-                )
+            log_msg = (
+                f"[epoch {epoch:04d}] val_fm={val_fm_loss:.4e}, val_res={val_res_loss:.4e}, "
+                f"val_phase={val_phase_loss:.4e}"
+            )
+            if use_endpoint:
+                log_msg += f", val_endpoint={val_endpoint_loss:.4e}"
+            if use_phase_grad:
+                log_msg += f", val_phase_grad={val_phase_grad_loss:.4e}"
+            log_msg += f", sample_residual={sample_residual_mean:.4e}"
+            logger.info(log_msg)
+
+            with open(val_csv_path, "a", encoding="UTF8", newline="") as f_csv:
+                writer = csv.writer(f_csv)
+                row = [
+                    epoch,
+                    val_fm_loss,
+                    val_res_loss,
+                    val_phase_loss,
+                    val_endpoint_loss if use_endpoint else "",
+                    val_phase_grad_loss if use_phase_grad else "",
+                    sample_residual_mean
+                ]
+                writer.writerow(row)
+
+            if wandb_run is not None:
+                log_dict = {
+                    "epoch": epoch,
+                    "val/fm_loss": val_fm_loss,
+                    "val/residual_loss": val_res_loss,
+                    "val/phase_loss": val_phase_loss,
+                    "val/sample_residual": sample_residual_mean,
+                }
                 if use_endpoint:
-                    log_msg = log_msg.replace(
-                        "val_phase_grad",
-                        f"val_endpoint={val_endpoint_loss:.4e}, val_phase_grad"
-                    )
-                logger.info(log_msg)
-
-                with open(val_csv_path, "a", encoding="UTF8", newline="") as f_csv:
-                    writer = csv.writer(f_csv)
-                    row = [
-                        epoch,
-                        val_fm_loss,
-                        val_res_loss,
-                        val_phase_loss,
-                        val_endpoint_loss if use_endpoint else "",
-                        val_phase_grad_loss,
-                        sample_residual_mean
-                    ]
-                    writer.writerow(row)
-
-                if wandb_run is not None:
-                    log_dict = {
-                        "epoch": epoch,
-                        "val/fm_loss": val_fm_loss,
-                        "val/residual_loss": val_res_loss,
-                        "val/phase_loss": val_phase_loss,
-                        "val/phase_grad_loss": val_phase_grad_loss,
-                        "val/sample_residual": sample_residual_mean,
-                    }
-                    if use_endpoint:
-                        log_dict["val/endpoint_loss"] = val_endpoint_loss
-                    wandb_run.log(log_dict)
+                    log_dict["val/endpoint_loss"] = val_endpoint_loss
+                if use_phase_grad:
+                    log_dict["val/phase_grad_loss"] = val_phase_grad_loss
+                wandb_run.log(log_dict, step=epoch)
 
         # -----------------------
         # Train logging (DDP-averaged)
@@ -759,41 +772,41 @@ def main(args):
             ddp_allreduce_mean_(fm_mean)
             ddp_allreduce_mean_(res_mean)
             ddp_allreduce_mean_(ph_mean)
-            ddp_allreduce_mean_(end_mean)
-            ddp_allreduce_mean_(phg_mean)
+            if use_endpoint:
+                ddp_allreduce_mean_(end_mean)
+            if use_phase_grad:
+                ddp_allreduce_mean_(phg_mean)
 
-            if is_rank0():
-                msg = (
-                    f"(epoch={epoch:04d}) train_fm={fm_mean.item():.4e}, "
-                    f"train_residual={res_mean.item():.4e}, train_phase={ph_mean.item():.4e}, "
-                    f"train_phase_grad={phg_mean.item():.4e}, sec_per_epoch={sec_per_epoch:.3e}"
-                )
-                if use_endpoint:
-                    msg = msg.replace(
-                        "train_phase_grad",
-                        f"train_endpoint={end_mean.item():.4e}, train_phase_grad"
-                    )
-                logger.info(msg)
+        if is_rank0():
+            msg = (
+                f"(epoch={epoch:04d}) train_fm={fm_mean.item():.4e}, "
+                f"train_residual={res_mean.item():.4e}, train_phase={ph_mean.item():.4e}"
+            )
+            if use_endpoint:
+                msg += f", train_endpoint={end_mean.item():.4e}"
+            if use_phase_grad:
+                msg += f", train_phase_grad={phg_mean.item():.4e}"
+            msg += f", sec_per_epoch={sec_per_epoch:.3e}"
+            logger.info(msg)
 
-            if wandb_run is not None:
-                log_dict = {
-                    "epoch": epoch,
-                    "train/fm_loss": fm_mean.item(),
-                    "train/residual_loss": res_mean.item(),
-                    "train/phase_loss": ph_mean.item(),
-                    "train/phase_grad_loss": phg_mean.item(),
-                    "train/sec_per_epoch": sec_per_epoch,
-                    "train/lr": scheduler.get_last_lr()[0],
-                    "train/phase_weight": phase_weight,
-                    "train/residual_weight": residual_weight,
-                    "train/endpoint_weight": endpoint_weight,
-                    "train/phase_grad_weight": phase_grad_weight,
-                    "train/device_focus": device_focus,
-                    "train/use_config": int(use_config and (not config_failed)),
-                }
-                if use_endpoint:
-                    log_dict["train/endpoint_loss"] = end_mean.item()
-                wandb_run.log(log_dict)
+        if wandb_run is not None and is_rank0():
+            wandb_log_dict = {
+                "train/fm_loss": fm_mean.item(),
+                "train/residual_loss": res_mean.item(),
+                "train/phase_loss": ph_mean.item(),
+                "train/sec_per_epoch": sec_per_epoch,
+                "train/lr": scheduler.get_last_lr()[0],
+                "train/residual_weight": residual_weight,
+                "train/device_focus": device_focus,
+                "train/use_config": int(use_config and (not config_failed)),
+            }
+            if use_endpoint:
+                wandb_log_dict["train/endpoint_loss"] = end_mean.item()
+                wandb_log_dict["train/endpoint_weight"] = endpoint_weight
+            if use_phase_grad:
+                wandb_log_dict["train/phase_grad_loss"] = phg_mean.item()
+                wandb_log_dict["train/phase_grad_weight"] = phase_grad_weight
+            wandb_run.log(wandb_log_dict, step=epoch)
 
             start_time = time()
             running_fm_loss = 0.0
@@ -862,7 +875,7 @@ if __name__ == "__main__":
     parser.add_argument("--endpoint-warmup-epochs", type=int, default=0)
 
     # NEW: phase-gradient loss (kills drift)
-    parser.add_argument("--lambda-phase-grad", type=float, default=0.2)
+    parser.add_argument("--lambda-phase-grad", type=float, default=0.0)
     parser.add_argument("--phase-grad-warmup-epochs", type=int, default=100)
 
     parser.add_argument("--normalize-eps", type=bool, default=True, action=argparse.BooleanOptionalAction)
