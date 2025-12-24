@@ -159,7 +159,7 @@ def main():
 
     data_root = args.data_root
     out_root = args.out_root if args.out_root is not None else data_root / "shards"
-
+    
     index = pack_dataset(
         data_root=data_root,
         out_root=out_root,

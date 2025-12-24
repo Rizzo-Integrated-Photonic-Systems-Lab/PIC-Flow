@@ -49,6 +49,9 @@ def zero_module(module: nn.Module) -> nn.Module:
 def normalization(channels: int) -> nn.Module:
     """Simple GroupNorm used in many UNets."""
     num_groups = min(32, channels)
+    # Ensure num_groups divides channels (torch requirement). Walk down until it fits.
+    while channels % num_groups != 0 and num_groups > 1:
+        num_groups -= 1
     return nn.GroupNorm(num_groups=num_groups, num_channels=channels)
 
 
@@ -512,6 +515,10 @@ class PhaseFeatures2D(nn.Module):
         dphi_dx = imag_conjE_dE_dx * invA2
         dphi_dy = imag_conjE_dE_dy * invA2
 
+        kmax = 50.0  # tune; start 20–100
+        dphi_dx = torch.clamp(dphi_dx, -kmax, kmax)
+        dphi_dy = torch.clamp(dphi_dy, -kmax, kmax)
+
         return torch.cat([u_r, u_i, logA, dphi_dx, dphi_dy], dim=1)
 
 
@@ -756,10 +763,14 @@ class PhysicsUNet(nn.Module):
         t: torch.Tensor,
         cond: Optional[torch.Tensor] = None,
         lambda_um: Optional[torch.Tensor] = None,
+        phys_gate=1.0,
+        phase_gate=1.0,
     ) -> torch.Tensor:
-        # x: [B,3,H,W] = [Re(Ez), Im(Ez), eps] (typically normalized)
+        # x: [B,4,H,W] = [Re(Ez), Im(Ez), eps, src] (typically normalized)
         Ez  = x[:, 0:2]
         eps = x[:, 2:3]
+
+        # extra_maps = x[:, 3:self.base_in_channels]
 
         # per-sample k0 from physical lambda_um (um)
         k0 = None
@@ -788,25 +799,79 @@ class PhysicsUNet(nn.Module):
             pml_m[:, :, :, :p2] = 0
             pml_m[:, :, :, -p2:] = 0
 
-        # physics features
-        phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # already masked inside, but ok
+        B, _, H, W = x.shape
 
         # masked scale (avoid PML dominating)
         den = pml_m.float().sum(dim=(2,3), keepdim=True).clamp_min(1.0)
-        phys_scale = (phys_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
-        phys_scale = phys_scale.clamp_min(1e-6)
-        phys_feats = phys_feats / phys_scale
-        phys_feats = phys_feats * pml_m  # optional but recommended
 
-        # phase features
-        phase_feats = self.phase_features(Ez_phys)
-        phase_scale = (phase_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
-        phase_scale = phase_scale.clamp_min(1e-6)
-        phase_feats = phase_feats / phase_scale
-        phase_feats = phase_feats * pml_m  # optional but recommended
+        # --------------------
+        # Physics features (gated)
+        # --------------------
+        if phys_gate is None:
+            phys_gate = 1.0
+        phys_gate_f = float(phys_gate) if not torch.is_tensor(phys_gate) else phys_gate
 
+        if (not torch.is_tensor(phys_gate_f) and phys_gate_f <= 0.0):
+            phys_feats = torch.zeros((B, self.n_phys_feats, H, W), device=x.device, dtype=x.dtype)
+        else:
+            phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # (B,2,H,W)
+            phys_scale = (phys_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
+            phys_scale = phys_scale.clamp_min(1e-6)
+            phys_feats = (phys_feats / phys_scale) * pml_m  # mask
+
+            # apply gate (broadcastable)
+            if torch.is_tensor(phys_gate_f):
+                while phys_gate_f.dim() < 4:
+                    phys_gate_f = phys_gate_f.view(-1, 1, 1, 1)
+                phys_feats = phys_feats * phys_gate_f.to(device=x.device, dtype=phys_feats.dtype)
+            else:
+                phys_feats = phys_feats * float(phys_gate_f)
+
+            phys_feats = phys_feats.to(dtype=x.dtype)
+
+        # --------------------
+        # Phase features (gated)
+        # --------------------
+        if phase_gate is None:
+            phase_gate = 1.0
+        phase_gate_f = float(phase_gate) if not torch.is_tensor(phase_gate) else phase_gate
+
+        if (not torch.is_tensor(phase_gate_f) and phase_gate_f <= 0.0):
+            phase_feats = torch.zeros((B, self.n_phase_feats, H, W), device=x.device, dtype=x.dtype)
+        else:
+            phase_feats = self.phase_features(Ez_phys)  # (B,5,H,W)
+            phase_scale = (phase_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
+            phase_scale = phase_scale.clamp_min(1e-6)
+            phase_feats = (phase_feats / phase_scale) * pml_m
+
+            # OPTIONAL: time-gate phase features so "phase of noise" doesn't dominate.
+            # t is usually shaped [B,1,1,1] in your training code.
+            # This ramps phase features on for t >= ~0.2 and fully on by t~0.6.
+            if torch.is_tensor(t):
+                t4 = t
+                if t4.dim() == 2:      # [B,1] -> [B,1,1,1]
+                    t4 = t4.view(-1, 1, 1, 1)
+                elif t4.dim() == 1:    # [B] -> [B,1,1,1]
+                    t4 = t4.view(-1, 1, 1, 1)
+                t_gate = torch.clamp((t4 - 0.2) / 0.4, 0.0, 1.0)
+                phase_feats = phase_feats * t_gate.to(dtype=phase_feats.dtype)
+
+            # apply gate
+            if torch.is_tensor(phase_gate_f):
+                while phase_gate_f.dim() < 4:
+                    phase_gate_f = phase_gate_f.view(-1, 1, 1, 1)
+                phase_feats = phase_feats * phase_gate_f.to(device=x.device, dtype=phase_feats.dtype)
+            else:
+                phase_feats = phase_feats * float(phase_gate_f)
+
+            phase_feats = phase_feats.to(dtype=x.dtype)
+
+        # --------------------
+        # Augmented input (keep channel count constant!)
+        # --------------------
         x_masked = x * pml_m.to(dtype=x.dtype)
-        x_aug = torch.cat([x_masked, phys_feats.to(dtype=x.dtype), phase_feats.to(dtype=x.dtype)], dim=1)  # [B,10,H,W]
+        x_aug = torch.cat([x_masked, phys_feats, phase_feats], dim=1)  # [B, in+2+5, H, W]
+
 
         # timestep embedding wants [B]
         t_in = t.view(t.shape[0]) if t.dim() > 1 else t
@@ -835,7 +900,8 @@ class PhysicsUNet(nn.Module):
             h = module(h, emb)
 
         h = h.type(x.dtype)
-        return self.out(h)
+        out = self.out(h)
+        return out * pml_m.to(dtype=out.dtype)
 
 
 

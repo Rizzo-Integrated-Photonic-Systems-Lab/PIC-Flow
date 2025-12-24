@@ -3,7 +3,13 @@ import meep as mp
 import numpy as np
 
 from utils import neff_siwire_from_tables
-from devices_base import Device2DBase
+from devices_base import (
+    Device2DBase,
+    DEFAULT_CELL_X_UM,
+    DEFAULT_CELL_Y_UM,
+    DEFAULT_DPML_UM,
+    DEFAULT_RESOLUTION,
+)
 
 
 class YBranch2D(Device2DBase):
@@ -62,7 +68,8 @@ class YBranch2D(Device2DBase):
 
         self.wg_width_um = float(wg_width_um)
         self.wavelength_um = float(wavelength_um)
-        self.resolution = int(resolution)
+        # resolution is already set by Device2DBase; avoid int(None) when resolution is omitted
+        self.resolution = int(self.resolution)
 
         if n_core is None:
             self.n_core = neff_siwire_from_tables(self.wg_width_um, self.wavelength_um)
@@ -83,6 +90,12 @@ class YBranch2D(Device2DBase):
         self.bend_n_segments = int(bend_n_segments)
         self.junction_n_segments = int(junction_n_segments)
         self.port_y_span_um = port_y_span_um
+        self._port_y_span_um = None
+
+        # cached port y-locations (set in build_geometry)
+        self.y_port_1_um = 0.0
+        self.y_port_2_um = None
+        self.y_port_3_um = None
 
         # default junction widths: the Tidy3D notebook’s 13 widths, scaled by wg_width/0.5
         # (their w1=0.5 um in the example) :contentReference[oaicite:2]{index=2}
@@ -257,6 +270,8 @@ class YBranch2D(Device2DBase):
         # straight outputs from end of bends into right PML
         y_out_top = +y_base + self.h_bend_um
         y_out_bot = -y_base - self.h_bend_um
+        self.y_port_2_um = float(y_out_top)
+        self.y_port_3_um = float(y_out_bot)
 
         if x_out0 < x_pml_right:
             out_len = x_pml_right - x_out0
@@ -292,6 +307,7 @@ class YBranch2D(Device2DBase):
             port_y_span = w_in + 0.4
         else:
             port_y_span = float(self.port_y_span_um)
+        self._port_y_span_um = float(port_y_span)
         port_size = mp.Vector3(0, port_y_span, 0)
 
         self.port_1 = mp.Volume(center=mp.Vector3(port_x_left, 0.0, 0), size=port_size)
@@ -310,6 +326,62 @@ class YBranch2D(Device2DBase):
             center=mp.Vector3(0, 0),
             size=mp.Vector3(self.cell_x, self.cell_y, 0),
         )
+
+    def get_port_centers_um(self):
+        """
+        Return port centers as {port_id: (x_um, y_um)}.
+        Ports:
+          1: input (left)
+          2: top output (right)
+          3: bottom output (right)
+        """
+        if self.x_port_left_um is None or self.x_port_right_um is None:
+            raise RuntimeError("Ports have not been initialized; build_geometry() has not run.")
+        if self.y_port_2_um is None or self.y_port_3_um is None:
+            raise RuntimeError("Port y-locations have not been initialized; build_geometry() has not run.")
+
+        return {
+            1: (float(self.x_port_left_um), float(self.y_port_1_um)),
+            2: (float(self.x_port_right_um), float(self.y_port_2_um)),
+            3: (float(self.x_port_right_um), float(self.y_port_3_um)),
+        }
+
+    def get_port_y_span_um(self):
+        """
+        Cross-section height used for port monitors / source masks.
+        """
+        if self._port_y_span_um is None:
+            # conservative fallback
+            return float(self.wg_width_um + 0.4)
+        return float(self._port_y_span_um)
+
+    def get_eps_and_cell(self):
+        """
+        Return the permittivity grid (ny, nx) and (cell_x, cell_y) without running a source.
+
+        This builds a Simulation with no sources, initializes it, and extracts epsilon.
+        It's fast compared to a full time-domain run.
+        """
+        sim = mp.Simulation(
+            cell_size=self.cell,
+            resolution=self.resolution,
+            boundary_layers=[mp.PML(self.dpml)],
+            geometry=self.geometry,
+            default_material=self.clad_medium,
+            sources=[],
+        )
+
+        # Initialize fields / geometry discretization without advancing time
+        sim.init_sim()
+
+        # Meep returns epsilon as [nx, ny]; transpose to match run_sim outputs [ny, nx]
+        eps_2d = sim.get_epsilon()
+        eps_mid = eps_2d.T
+
+        # Free internal Meep state (helps avoid memory creep)
+        sim.reset_meep()
+
+        return eps_mid, (self.cell_x, self.cell_y)
 
     def run_sim(self, input_port: int = 1, decay_tol: float = 1e-6):
         """

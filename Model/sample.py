@@ -85,22 +85,86 @@ def _build_model_from_ckpt_args(ckpt_args, *, device: torch.device) -> PhysicsUN
     omega = 2.0 * np.pi / lam0
 
     model = PhysicsUNet(
-        in_channels=3,
+        in_channels=4,
         out_channels=2,
         model_channels=int(getattr(ckpt_args, "hidden_size")),
-        num_res_blocks=3,
+        num_res_blocks=5,
         channel_mult=(1, 2, 4, 8),
         attention_resolutions=(),
         dropout=0.0,
         dims=2,
         use_checkpoint=False,
         num_heads=1,
-        cond_dim=1,
+        cond_dim=int(getattr(ckpt_args, "cond_dim", 1)),
         dx=dx,
         dy=dx,
         omega=omega,
     ).to(device)
     return model
+
+
+def _infer_device_type_from_path(device_dir: Path) -> str:
+    p = str(device_dir).lower()
+    if "coupler" in p:
+        return "coupler"
+    if "y_branch" in p or "ybranch" in p:
+        return "y_branch"
+    return ""
+
+
+def _build_cond_vector_from_sparams(
+    device_dir: Path,
+    *,
+    stats: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Mirrors Model/dataset.py conditioning (Option A):
+      cond = [lambda_norm] + [param_norm...] + [param_mask...] + [device_type_onehot...]
+
+    Returns:
+      (cond[1,cond_dim], lambda_um[1,1])
+    """
+    sp_path = device_dir / "sparams.npz"
+    if not sp_path.is_file():
+        raise FileNotFoundError(f"Missing {sp_path}")
+    sp = np.load(sp_path, allow_pickle=True)
+
+    lam_um = float(sp["wavelength_um"])
+    lam_norm = (lam_um - float(stats["lambda_um_mean"])) / float(stats["lambda_um_std"])
+
+    param_names = list(stats.get("cond_param_names", []))
+    dev_types = list(stats.get("cond_device_type_names", []))
+    dev = _infer_device_type_from_path(device_dir)
+
+    p_vals: list[float] = []
+    p_masks: list[float] = []
+    for name in param_names:
+        if name not in sp:
+            p_vals.append(0.0)
+            p_masks.append(0.0)
+            continue
+        v = float(np.array(sp[name]).item())
+        if not np.isfinite(v):
+            p_vals.append(0.0)
+            p_masks.append(0.0)
+            continue
+        mean = float(stats.get(f"cond_param_{name}_mean", 0.0))
+        std = float(stats.get(f"cond_param_{name}_std", 1.0))
+        std = std if std > 0 else 1.0
+        p_vals.append((v - mean) / std)
+        p_masks.append(1.0)
+
+    onehot = [0.0] * len(dev_types)
+    for i, tname in enumerate(dev_types):
+        if dev == tname:
+            onehot[i] = 1.0
+
+    cond_1d = torch.tensor([lam_norm] + p_vals + p_masks + onehot, device=device, dtype=dtype)
+    cond = cond_1d[None, :]
+    lambda_um_t = torch.tensor([[lam_um]], device=device, dtype=dtype)
+    return cond, lambda_um_t
 
 def pml_mask_t(H, W, pml_cells=30, margin=2, device="cpu", dtype=torch.float32):
     p2 = min(pml_cells + margin, max(0, H // 2 - 1), max(0, W // 2 - 1))
@@ -248,6 +312,12 @@ def main():
     eps_np = np.load(device_dir / "eps.npy").astype(np.float32)  # [H,W]
     ezr_gt = np.load(device_dir / "Ez_real.npy").astype(np.float32)
     ezi_gt = np.load(device_dir / "Ez_imag.npy").astype(np.float32)
+    # source mask is optional for legacy folders; training expects it as a channel
+    src_path = device_dir / "src_mask.npy"
+    if src_path.is_file():
+        src_np = np.load(src_path).astype(np.float32)
+    else:
+        src_np = np.zeros_like(eps_np, dtype=np.float32)
     lam_um = _load_wavelength_um(device_dir)
     grid_dxdy = _load_grid_spacing_um(device_dir)
     timings["io_device_files_s"] = time.perf_counter() - t0
@@ -294,13 +364,20 @@ def main():
     else:
         eps_norm = eps_np
 
-    lam_norm = (lam_um - float(stats["lambda_um_mean"])) / float(stats["lambda_um_std"])
+    # src is always treated as binary mask in training
+    src_norm = (src_np > 0.5).astype(np.float32)
 
     # torch tensors
     H, W = eps_np.shape
-    cond_eps = torch.from_numpy(eps_norm)[None, None, :, :].to(device=device, dtype=torch.float32)  # [1,1,H,W]
-    cond = torch.tensor([[lam_norm]], device=device, dtype=torch.float32)  # [1,1]
-    lambda_um_t = torch.tensor([[lam_um]], device=device, dtype=torch.float32)  # [1,1] physical
+    eps_t = torch.from_numpy(eps_norm)[None, None, :, :].to(device=device, dtype=torch.float32)  # [1,1,H,W]
+    src_t = torch.from_numpy(src_norm)[None, None, :, :].to(device=device, dtype=torch.float32)  # [1,1,H,W]
+    cond_eps = torch.cat([eps_t, src_t], dim=1)  # [1,2,H,W] (matches train.py in_channels=4)
+    cond, lambda_um_t = _build_cond_vector_from_sparams(
+        device_dir,
+        stats=stats,
+        device=device,
+        dtype=torch.float32,
+    )
 
     # -----------------------
     # Sample fields
