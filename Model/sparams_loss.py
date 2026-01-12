@@ -23,7 +23,7 @@ def _resolve_in_idx(
     Resolve a 0-based input-port index.
 
     in_port_idx: optional int-like (0-based). If provided, used directly.
-    port_ids: optional tensor/array [P] of port numbers (e.g. [1,2,3,4]).
+    port_ids: optional tensor/array [P] of paort numbers (e.g. [1,2,3,4]).
              If in_port_idx is None, we fall back to the index of port_id==1 if present.
     """
     if in_port_idx is not None:
@@ -43,22 +43,18 @@ def _resolve_in_idx(
             return int(in_port_idx)
     if port_ids is not None:
         try:
-            pid = port_ids
-            if torch.is_tensor(pid):
-                pid_t = pid.detach()
-            else:
-                pid_t = torch.as_tensor(pid)
+            pid_t = port_ids.detach() if torch.is_tensor(port_ids) else torch.as_tensor(port_ids)
 
-            # pid_t can be [P] or [B,P]
             if pid_t.dim() == 1:
                 hits = (pid_t == 1).nonzero(as_tuple=False)
-            if hits.numel() > 0:
-                return int(hits[0].item())
-            elif pid_t.dim() == 2:
-                # per-sample: choose first match per row, fallback to 0
+                if hits.numel() > 0:
+                    return int(hits[0].item())
+                return 0
+
+            if pid_t.dim() == 2:
                 B, P = pid_t.shape
                 out = torch.zeros((B,), dtype=torch.long, device=pid_t.device)
-                hits = (pid_t == 1).nonzero(as_tuple=False)  # [K,2] with (b,p)
+                hits = (pid_t == 1).nonzero(as_tuple=False)  # [K,2] rows (b,p)
                 if hits.numel() > 0:
                     # first hit per batch item
                     seen = set()
@@ -68,9 +64,11 @@ def _resolve_in_idx(
                         out[b] = int(p)
                         seen.add(b)
                 return out
+
         except Exception:
             pass
     return 0
+
 
 
 def extract_sparams(
@@ -103,7 +101,13 @@ def extract_sparams(
         a_in = a.gather(1, idx).squeeze(1)            # [B]
     else:
         a_in = a[:, int(in_idx)]
-    a_in = a_in / torch.abs(a_in).clamp_min(eps) * torch.abs(a_in).clamp_min(eps)
+    # Make input amplitude safe to divide by:
+    # - preserve phase when possible
+    # - enforce |a_in| >= eps so we never divide by 0 (prevents inf/nan S)
+    mag = torch.abs(a_in)
+    unit = a_in / mag.clamp_min(eps)
+    unit = torch.where(mag >= eps, unit, torch.ones_like(unit))
+    a_in = unit * mag.clamp_min(eps)
 
     S = a / a_in.unsqueeze(1)
     return S
@@ -114,6 +118,7 @@ def sparam_loss(S_pred: torch.Tensor,
                 phase_w: float = 1.0,
                 tau: float = 1e-3,
                 eps: float = 1e-8,
+                port_valid: torch.Tensor | None = None,
                 in_port_idx=None,
                 port_ids=None) -> torch.Tensor:
     """
@@ -132,6 +137,15 @@ def sparam_loss(S_pred: torch.Tensor,
     L_phase = 1.0 - torch.real(u_p * torch.conj(u_t))
 
     gate = (mag_t > tau).to(L_mag.dtype)  # don't chase phase when transmission is ~0
+    if port_valid is not None:
+        pv = port_valid.to(dtype=gate.dtype, device=gate.device)
+        if pv.dim() == 1:
+            pv = pv.view(1, -1).expand_as(gate)
+        gate = gate * pv
     L = (mag_w * L_mag + phase_w * L_phase) * gate
-    return L.mean()
+    # IMPORTANT:
+    # Use a masked mean so padded/non-existent ports do not change the effective loss scale.
+    # (Dataset pads to max_ports=4 for batching; port_valid gates padded ports to 0.)
+    den = gate.sum().clamp_min(1.0)
+    return L.sum() / den
 

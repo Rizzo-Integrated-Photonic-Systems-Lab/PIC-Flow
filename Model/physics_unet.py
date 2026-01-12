@@ -322,14 +322,15 @@ class QKVAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
 
-        q = (q * scale).view(bs * self.n_heads, ch, length)
-        k = (k * scale).view(bs * self.n_heads, ch, length)
-        v = v.view(bs * self.n_heads, ch, length)
+        # NOTE: use reshape (not view) because chunked tensors may be non-contiguous.
+        q = (q * scale).reshape(bs * self.n_heads, ch, length)
+        k = (k * scale).reshape(bs * self.n_heads, ch, length)
+        v = v.reshape(bs * self.n_heads, ch, length)
 
         weight = torch.einsum("bct,bcs->bts", q, k)
         weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = torch.einsum("bts,bcs->bct", weight, v)
-        return a.view(bs, -1, length)
+        return a.reshape(bs, -1, length)
 
 
 class AttentionBlock(nn.Module):
@@ -412,7 +413,10 @@ class FiniteDiff2D(nn.Module):
 
     def _depthwise_conv3(self, x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         C = x.shape[1]
-        weight = k.expand(C, 1, 3, 3)
+        # IMPORTANT (autograd safety under heavy unrolling/DDP):
+        # Use a fresh, contiguous kernel tensor per call to avoid any in-place versioning
+        # issues with views of registered buffers being saved for backward.
+        weight = k.detach().clone().repeat(C, 1, 1, 1)
 
         # Explicit padding (avoids implicit zero outside the domain)
         xpad = F.pad(x, (1, 1, 1, 1), mode=self.pad_mode)
@@ -457,11 +461,12 @@ class HelmholtzResidual2D(nn.Module):
             B, C, H, W = R.shape
             p2 = min(p + 4, max(0, H // 2 - 1), max(0, W // 2 - 1))
             if p2 > 0:
-                m = torch.ones((B, 1, H, W), device=R.device, dtype=R.dtype)
-                m[:, :, :p2, :] = 0
-                m[:, :, -p2:, :] = 0
-                m[:, :, :, :p2] = 0
-                m[:, :, :, -p2:] = 0
+                # Create mask without inplace operations for autograd safety
+                y_coords = torch.arange(H, device=R.device, dtype=torch.float32).view(1, 1, H, 1)
+                x_coords = torch.arange(W, device=R.device, dtype=torch.float32).view(1, 1, 1, W)
+                m = ((y_coords >= p2) & (y_coords < H - p2) & 
+                     (x_coords >= p2) & (x_coords < W - p2)).to(dtype=R.dtype)
+                m = m.expand(B, 1, H, W)
                 R = R * m
 
         if self.normalize:
@@ -474,26 +479,43 @@ class PhaseFeatures2D(nn.Module):
     """
     Phase-aware, amplitude-robust features derived from complex field E = Er + j Ei.
 
-    Outputs (B, 5, H, W):
-      [u_r, u_i, log|E|, dphi_dx, dphi_dy]
+    Outputs (B, 8, H, W):
+      LOCAL PHASE (5 channels):
+        [u_r, u_i, log|E|, dphi_dx, dphi_dy]
+      GLOBAL PHASE (3 channels):
+        [coarse_phi_cos, coarse_phi_sin, relative_phase]
+      
     where u = E / (|E| + eps) and
       dphi = Im(conj(E) * dE) / (|E|^2 + eps)
+      coarse_phi = low-frequency phase envelope (captures global phase structure)
+      relative_phase = phase offset from source reference region
     """
-    def __init__(self, dx: float, dy: float, pad_mode: str = "replicate", eps: float = 1e-8):
+    N_FEATURES = 8  # class constant for external access
+    
+    def __init__(self, dx: float, dy: float, pad_mode: str = "replicate", eps: float = 1e-8,
+                 coarse_pool_size: int = 8):
         super().__init__()
         self.diff = FiniteDiff2D(dx=dx, dy=dy, pad_mode=pad_mode)
         self.eps = float(eps)
+        self.coarse_pool_size = int(coarse_pool_size)
 
-    def forward(self, E: torch.Tensor) -> torch.Tensor:
-        # E: (B, 2, H, W) => [Er, Ei]
+    def forward(self, E: torch.Tensor, source_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            E: (B, 2, H, W) => [Er, Ei]
+            source_mask: optional (B, 1, H, W) or (B, H, W) mask indicating source region for reference phase
+        Returns:
+            (B, 8, H, W) phase features
+        """
         Er = E[:, 0:1]
         Ei = E[:, 1:2]
+        B, _, H, W = Er.shape
 
         # amplitude
         A2 = Er * Er + Ei * Ei
         A  = torch.sqrt(A2 + self.eps)
 
-        # unit phasor (cos phi, sin phi)
+        # unit phasor (cos phi, sin phi) - LOCAL absolute phase
         invA = 1.0 / (A + self.eps)
         u_r = Er * invA
         u_i = Ei * invA
@@ -501,7 +523,9 @@ class PhaseFeatures2D(nn.Module):
         # log amplitude (stabilizes learning near small |E|)
         logA = torch.log(A + self.eps)
 
-        # spatial derivatives
+        # ============================================================
+        # LOCAL PHASE: spatial derivatives (wavevector)
+        # ============================================================
         dEr_dx = self.diff.diff_x(Er)
         dEi_dx = self.diff.diff_x(Ei)
         dEr_dy = self.diff.diff_y(Er)
@@ -519,7 +543,66 @@ class PhaseFeatures2D(nn.Module):
         dphi_dx = torch.clamp(dphi_dx, -kmax, kmax)
         dphi_dy = torch.clamp(dphi_dy, -kmax, kmax)
 
-        return torch.cat([u_r, u_i, logA, dphi_dx, dphi_dy], dim=1)
+        # ============================================================
+        # GLOBAL PHASE: coarse low-frequency phase structure
+        # ============================================================
+        # Compute phase angle
+        phi = torch.atan2(Ei, Er)  # (B, 1, H, W)
+        
+        # Low-frequency phase envelope via pooling + upsampling
+        # We pool cos/sin (not phi directly) to handle wrapping correctly
+        cos_phi = torch.cos(phi)
+        sin_phi = torch.sin(phi)
+        
+        pool_size = min(self.coarse_pool_size, H, W)
+        if pool_size > 1:
+            cos_coarse = F.avg_pool2d(cos_phi, pool_size, stride=pool_size)
+            sin_coarse = F.avg_pool2d(sin_phi, pool_size, stride=pool_size)
+            # Upsample back to original resolution
+            coarse_phi_cos = F.interpolate(cos_coarse, size=(H, W), mode='bilinear', align_corners=False)
+            coarse_phi_sin = F.interpolate(sin_coarse, size=(H, W), mode='bilinear', align_corners=False)
+        else:
+            coarse_phi_cos = cos_phi
+            coarse_phi_sin = sin_phi
+
+        # ============================================================
+        # GLOBAL PHASE: relative phase from source reference
+        # ============================================================
+        if source_mask is not None:
+            # Ensure mask is (B, 1, H, W)
+            if source_mask.dim() == 3:
+                source_mask = source_mask.unsqueeze(1)
+            sm = source_mask.to(dtype=Er.dtype, device=Er.device)
+            
+            # Weighted average of cos/sin in source region (handles wrapping)
+            denom = sm.sum(dim=(2, 3), keepdim=True).clamp_min(1.0)
+            ref_cos = (cos_phi * sm).sum(dim=(2, 3), keepdim=True) / denom  # (B,1,1,1)
+            ref_sin = (sin_phi * sm).sum(dim=(2, 3), keepdim=True) / denom
+            
+            # Reference phase angle
+            ref_phi = torch.atan2(ref_sin, ref_cos)  # (B,1,1,1)
+            
+            # Relative phase = phi - ref_phi, wrapped to [-pi, pi]
+            rel_phi = phi - ref_phi
+            # Wrap to [-pi, pi]
+            relative_phase = torch.atan2(torch.sin(rel_phi), torch.cos(rel_phi))
+        else:
+            # No source mask: use global mean phase as reference
+            mean_cos = cos_phi.mean(dim=(2, 3), keepdim=True)
+            mean_sin = sin_phi.mean(dim=(2, 3), keepdim=True)
+            ref_phi = torch.atan2(mean_sin, mean_cos)
+            rel_phi = phi - ref_phi
+            relative_phase = torch.atan2(torch.sin(rel_phi), torch.cos(rel_phi))
+        
+        # Normalize relative_phase to [-1, 1] for network input
+        relative_phase = relative_phase / math.pi
+
+        return torch.cat([
+            u_r, u_i, logA,              # amplitude & local phase (3)
+            dphi_dx, dphi_dy,             # local wavevector (2)
+            coarse_phi_cos, coarse_phi_sin,  # global phase structure (2)
+            relative_phase,               # phase relative to source (1)
+        ], dim=1)
 
 
 
@@ -559,9 +642,15 @@ class PhysicsUNet(nn.Module):
         use_scale_shift_norm: bool = False,
         resblock_updown: bool = False,
         cond_dim: int = 0,  # additional conditioning vector dim
+        enable_sparam_head: bool = False,
         dx: float = 1.0,
         dy: float = 1.0,
         omega: float = 1.0,
+        # Default to 0 because newer datasets are typically saved already-cropped to the non-PML window.
+        pml_cells: int = 0,
+        # Ablation flag: set False to disable all embedded physics features (Helmholtz + phase)
+        # and train a vanilla UNet for comparison.
+        enable_physics_features: bool = True,
     ):
         super().__init__()
 
@@ -580,19 +669,43 @@ class PhysicsUNet(nn.Module):
         self.dtype = torch.float16 if use_fp16 else torch.float32
         self.num_heads = num_heads
         self.cond_dim = cond_dim
+        # Ablation: enable/disable physics features (Helmholtz residual + phase features)
+        self.enable_physics_features = bool(enable_physics_features)
+        # S-parameter head (optional). IMPORTANT: if this head exists but S-param loss is disabled,
+        # DDP will error (unused parameters) when find_unused_parameters=False. So we only create
+        # the head when explicitly enabled by training.
+        self.enable_sparam_head = bool(enable_sparam_head)
+        # We pad aux to max_ports=4 in the dataset.
+        self.max_ports = 4
+        if self.enable_sparam_head:
+            # Input features: Re/Im of per-port complex amplitudes (2*P) + cond vector (cond_dim) + one-hot in_port (P)
+            sparam_in_dim = 2 * self.max_ports + int(cond_dim) + self.max_ports
+            hidden = max(64, model_channels)
+            self.sparam_head = nn.Sequential(
+                nn.Linear(sparam_in_dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, 2 * self.max_ports),  # Re/Im for S at each port
+            )
+        else:
+            self.sparam_head = None
 
-        # Physics module
-        pml_cells = int(round(1.0 * 30))
-        self.helmholtz = HelmholtzResidual2D(dx=dx, dy=dy, omega=omega, pml_cells=pml_cells)
-        self.n_phys_feats = 2 # R1, R2, R3 real/imag
+        # Physics module (Helmholtz residual features)
+        self.helmholtz = HelmholtzResidual2D(dx=dx, dy=dy, omega=omega, pml_cells=int(pml_cells))
+        self.n_phys_feats = 2  # Helmholtz residual real/imag
 
-        # phase features module
+        # Phase features module (local + global phase)
         self.phase_features = PhaseFeatures2D(dx=dx, dy=dy, pad_mode="replicate", eps=1e-8)
-        self.n_phase_feats = 5
+        self.n_phase_feats = PhaseFeatures2D.N_FEATURES  # 8: local (5) + global (3)
 
         # effective input channels seen by the UNet
         self.base_in_channels = in_channels
-        self.in_channels = in_channels + self.n_phys_feats + self.n_phase_feats
+        if self.enable_physics_features:
+            self.in_channels = in_channels + self.n_phys_feats + self.n_phase_feats
+        else:
+            # Vanilla UNet: no extra physics channels
+            self.in_channels = in_channels
         
         # time + conditioning embedding
         time_embed_dim = model_channels * 4
@@ -745,8 +858,116 @@ class PhysicsUNet(nn.Module):
         self.register_buffer("eps_mean",     torch.tensor(0.0))
         self.register_buffer("eps_std",      torch.tensor(1.0))
     
+    def predict_sparams(self, E_pred_phys_raw: torch.Tensor, aux: dict, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Predict S-parameters using a learned head trained against Meep targets.
+
+        This avoids the mismatch between Meep's eigenmode coefficient definition and
+        a simple stripe-average projection. The head consumes per-port projected
+        complex amplitudes + conditioning.
+
+        Args:
+          E_pred_phys_raw: complex tensor [B,H,W] (no label-based phase alignment)
+          aux: dict with at least 'port_masks' (float [B,P,H,W] or [P,H,W]) and optional 'in_port_idx'
+          cond: optional [B,cond_dim]
+
+        Returns:
+          complex tensor [B,max_ports]
+        """
+        if self.sparam_head is None:
+            raise RuntimeError(
+                "S-parameter head is disabled on this model (enable_sparam_head=False). "
+                "Enable it by running with --sparam-mode head and --lambda-sparam > 0."
+            )
+        pm = aux.get("port_masks", None)
+        # If port masks are missing for a sample/batch, fall back to zeros. This keeps the head
+        # DDP-safe (parameters still used) and avoids crashing on partially-supervised datasets.
+        if pm is None:
+            B = int(E_pred_phys_raw.shape[0])
+            a = torch.zeros((B, self.max_ports), device=E_pred_phys_raw.device, dtype=E_pred_phys_raw.dtype)
+            amps_real = a.real if torch.is_complex(a) else a
+            amps_imag = torch.zeros_like(amps_real)
+            # build in_port one-hot + cond as usual and run head
+            in_idx = aux.get("in_port_idx", None)
+            if in_idx is None:
+                in_idx = torch.zeros((B,), device=E_pred_phys_raw.device, dtype=torch.long)
+            elif torch.is_tensor(in_idx):
+                in_idx = in_idx.to(device=E_pred_phys_raw.device, dtype=torch.long).view(-1)
+                if in_idx.numel() == 1:
+                    in_idx = in_idx.expand(B)
+            else:
+                in_idx = torch.full((B,), int(in_idx), device=E_pred_phys_raw.device, dtype=torch.long)
+            in_idx = in_idx.clamp(min=0, max=self.max_ports - 1)
+            in_oh = torch.zeros((B, self.max_ports), device=E_pred_phys_raw.device, dtype=amps_real.dtype)
+            in_oh.scatter_(1, in_idx.view(B, 1), 1.0)
+
+            if cond is None or self.cond_dim <= 0:
+                cond_feat = torch.zeros((B, int(self.cond_dim)), device=E_pred_phys_raw.device, dtype=amps_real.dtype)
+            else:
+                cond_feat = cond.to(device=E_pred_phys_raw.device, dtype=amps_real.dtype)
+                if cond_feat.shape[1] < int(self.cond_dim):
+                    pad = torch.zeros((B, int(self.cond_dim) - cond_feat.shape[1]), device=E_pred_phys_raw.device, dtype=cond_feat.dtype)
+                    cond_feat = torch.cat([cond_feat, pad], dim=1)
+                elif cond_feat.shape[1] > int(self.cond_dim):
+                    cond_feat = cond_feat[:, : int(self.cond_dim)]
+
+            feat = torch.cat([amps_real, amps_imag, cond_feat, in_oh], dim=1)
+            out = self.sparam_head(feat)  # [B,2P]
+            S_re = out[:, : self.max_ports]
+            S_im = out[:, self.max_ports :]
+            return torch.complex(S_re, S_im)
+        if pm.dim() == 3:
+            pm = pm.unsqueeze(0).expand(E_pred_phys_raw.shape[0], -1, -1, -1)
+        B, P, _, _ = pm.shape
+        P = min(P, int(self.max_ports))
+
+        amps = []
+        for p in range(P):
+            w = pm[:, p].to(E_pred_phys_raw.real.dtype)
+            den = w.sum(dim=(1, 2)).clamp_min(1.0)
+            a = (w * E_pred_phys_raw).sum(dim=(1, 2)) / den
+            amps.append(a)
+        a = torch.stack(amps, dim=1)  # [B,P] complex
+
+        if P < self.max_ports:
+            pad = torch.zeros((B, self.max_ports - P), device=a.device, dtype=a.dtype)
+            a = torch.cat([a, pad], dim=1)
+
+        # in_port one-hot (0-based)
+        in_idx = aux.get("in_port_idx", None)
+        if in_idx is None:
+            in_idx = torch.zeros((B,), device=a.device, dtype=torch.long)
+        elif torch.is_tensor(in_idx):
+            in_idx = in_idx.to(device=a.device, dtype=torch.long).view(-1)
+            if in_idx.numel() == 1:
+                in_idx = in_idx.expand(B)
+        else:
+            in_idx = torch.full((B,), int(in_idx), device=a.device, dtype=torch.long)
+        in_idx = in_idx.clamp(min=0, max=self.max_ports - 1)
+        in_oh = torch.zeros((B, self.max_ports), device=a.device, dtype=a.real.dtype)
+        in_oh.scatter_(1, in_idx.view(B, 1), 1.0)
+
+        # cond (optional)
+        if cond is None or self.cond_dim <= 0:
+            cond_feat = torch.zeros((B, int(self.cond_dim)), device=a.device, dtype=a.real.dtype)
+        else:
+            cond_feat = cond.to(device=a.device, dtype=a.real.dtype)
+            if cond_feat.shape[1] < int(self.cond_dim):
+                pad = torch.zeros((B, int(self.cond_dim) - cond_feat.shape[1]), device=a.device, dtype=cond_feat.dtype)
+                cond_feat = torch.cat([cond_feat, pad], dim=1)
+            elif cond_feat.shape[1] > int(self.cond_dim):
+                cond_feat = cond_feat[:, : int(self.cond_dim)]
+
+        feat = torch.cat([a.real, a.imag, cond_feat, in_oh], dim=1)
+        out = self.sparam_head(feat)  # [B,2P]
+        S_re = out[:, : self.max_ports]
+        S_im = out[:, self.max_ports :]
+        return torch.complex(S_re, S_im)
+
+    @torch.no_grad()
     @torch.no_grad()
     def set_normalization_stats(self, stats: dict, normalize_eps: bool = True):
+        """Set normalization statistics from dataset stats dict."""
         self.normalize_inputs = True
         self.normalize_eps = bool(normalize_eps)
 
@@ -765,7 +986,11 @@ class PhysicsUNet(nn.Module):
         lambda_um: Optional[torch.Tensor] = None,
         phys_gate=1.0,
         phase_gate=1.0,
-    ) -> torch.Tensor:
+        # S-param head integration (DDP-safe): compute S_pred *inside* forward when requested.
+        return_sparams: bool = False,
+        aux: Optional[dict] = None,
+        sig_min: float = 0.0,
+    ):
         # x: [B,4,H,W] = [Re(Ez), Im(Ez), eps, src] (typically normalized)
         Ez  = x[:, 0:2]
         eps = x[:, 2:3]
@@ -781,96 +1006,139 @@ class PhysicsUNet(nn.Module):
         Ez_phys = Ez
         eps_phys = eps
         if getattr(self, "normalize_inputs", False):
-            Ez_phys = Ez.clone()
-            Ez_phys[:, 0] = Ez_phys[:, 0] * self.ez_real_std + self.ez_real_mean
-            Ez_phys[:, 1] = Ez_phys[:, 1] * self.ez_imag_std + self.ez_imag_mean
+            # Denormalize without inplace operations for autograd safety
+            Ez_phys = torch.stack([
+                Ez[:, 0] * self.ez_real_std + self.ez_real_mean,
+                Ez[:, 1] * self.ez_imag_std + self.ez_imag_mean,
+            ], dim=1)
 
             eps_phys = eps.clone()
             if getattr(self, "normalize_eps", False):
                 eps_phys = eps_phys * self.eps_std + self.eps_mean
         
         # build non-PML mask (same logic as elsewhere)
-        pml_m = torch.ones((x.shape[0], 1, Ez_phys.shape[-2], Ez_phys.shape[-1]), device=x.device, dtype=Ez_phys.dtype)
-        p = self.helmholtz.pml_cells
-        p2 = min(p + 4, max(0, Ez_phys.shape[-2] // 2 - 1), max(0, Ez_phys.shape[-1] // 2 - 1))
+        pml_m = torch.ones(
+            (x.shape[0], 1, Ez_phys.shape[-2], Ez_phys.shape[-1]),
+            device=x.device,
+            dtype=Ez_phys.dtype,
+        )
+        p = int(self.helmholtz.pml_cells)
+        # If pml_cells == 0, do NOT mask any border. (Datasets already cropped to non-PML should use pml_cells=0.)
+        p2 = 0
+        if p > 0:
+            p2 = min(
+                p + 4,
+                max(0, Ez_phys.shape[-2] // 2 - 1),
+                max(0, Ez_phys.shape[-1] // 2 - 1),
+            )
         if p2 > 0:
-            pml_m[:, :, :p2, :] = 0
-            pml_m[:, :, -p2:, :] = 0
-            pml_m[:, :, :, :p2] = 0
-            pml_m[:, :, :, -p2:] = 0
+            # Create mask without inplace operations for autograd safety
+            H_phys, W_phys = Ez_phys.shape[-2], Ez_phys.shape[-1]
+            y_coords = torch.arange(H_phys, device=x.device, dtype=torch.float32).view(1, 1, H_phys, 1)
+            x_coords = torch.arange(W_phys, device=x.device, dtype=torch.float32).view(1, 1, 1, W_phys)
+            pml_m = ((y_coords >= p2) & (y_coords < H_phys - p2) & 
+                    (x_coords >= p2) & (x_coords < W_phys - p2)).to(dtype=Ez_phys.dtype)
+            pml_m = pml_m.expand(x.shape[0], 1, H_phys, W_phys)
 
         B, _, H, W = x.shape
 
         # masked scale (avoid PML dominating)
         den = pml_m.float().sum(dim=(2,3), keepdim=True).clamp_min(1.0)
 
-        # --------------------
-        # Physics features (gated)
-        # --------------------
-        if phys_gate is None:
-            phys_gate = 1.0
-        phys_gate_f = float(phys_gate) if not torch.is_tensor(phys_gate) else phys_gate
+        # Extract source mask for global phase reference (channel 3 if available)
+        source_mask = None
+        if self.base_in_channels >= 4:
+            source_mask = x[:, 3:4]  # (B, 1, H, W)
 
-        if (not torch.is_tensor(phys_gate_f) and phys_gate_f <= 0.0):
-            phys_feats = torch.zeros((B, self.n_phys_feats, H, W), device=x.device, dtype=x.dtype)
+        # =====================================================
+        # ABLATION: Skip physics features for vanilla UNet
+        # =====================================================
+        if not self.enable_physics_features:
+            # Vanilla UNet: just use the raw input (no physics/phase features)
+            x_masked = x * pml_m.to(dtype=x.dtype)
+            x_aug = x_masked
         else:
-            phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # (B,2,H,W)
-            phys_scale = (phys_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
-            phys_scale = phys_scale.clamp_min(1e-6)
-            phys_feats = (phys_feats / phys_scale) * pml_m  # mask
+            # --------------------
+            # Physics features (gated)
+            # --------------------
+            if phys_gate is None:
+                phys_gate = 1.0
+            phys_gate_f = float(phys_gate) if not torch.is_tensor(phys_gate) else phys_gate
 
-            # apply gate (broadcastable)
-            if torch.is_tensor(phys_gate_f):
-                while phys_gate_f.dim() < 4:
-                    phys_gate_f = phys_gate_f.view(-1, 1, 1, 1)
-                phys_feats = phys_feats * phys_gate_f.to(device=x.device, dtype=phys_feats.dtype)
+            if (not torch.is_tensor(phys_gate_f) and phys_gate_f <= 0.0):
+                phys_feats = torch.zeros((B, self.n_phys_feats, H, W), device=x.device, dtype=x.dtype)
             else:
-                phys_feats = phys_feats * float(phys_gate_f)
+                phys_feats = self.helmholtz(Ez_phys, eps_phys, k0=k0)  # (B,2,H,W)
+                phys_scale = (phys_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
+                phys_scale = phys_scale.clamp_min(1e-6)
+                phys_scale = phys_scale.detach()
+                phys_feats = (phys_feats / phys_scale) * pml_m  # mask
 
-            phys_feats = phys_feats.to(dtype=x.dtype)
+                # Time-gate physics features so we don't feed "physics of pure noise" to the UNet.
+                # For FM, t=0 is x0 (noise) and t=1 is ~x1 (clean). Ramp physics on later in time.
+                if torch.is_tensor(t):
+                    t4 = t
+                    if t4.dim() == 2:      # [B,1] -> [B,1,1,1]
+                        t4 = t4.view(-1, 1, 1, 1)
+                    elif t4.dim() == 1:    # [B] -> [B,1,1,1]
+                        t4 = t4.view(-1, 1, 1, 1)
+                    phys_t_gate = torch.clamp((t4 - 0.2) / 0.4, 0.0, 1.0)
+                    phys_feats = phys_feats * phys_t_gate.to(dtype=phys_feats.dtype)
 
-        # --------------------
-        # Phase features (gated)
-        # --------------------
-        if phase_gate is None:
-            phase_gate = 1.0
-        phase_gate_f = float(phase_gate) if not torch.is_tensor(phase_gate) else phase_gate
+                # apply gate (broadcastable)
+                if torch.is_tensor(phys_gate_f):
+                    while phys_gate_f.dim() < 4:
+                        phys_gate_f = phys_gate_f.view(-1, 1, 1, 1)
+                    phys_feats = phys_feats * phys_gate_f.to(device=x.device, dtype=phys_feats.dtype)
+                else:
+                    phys_feats = phys_feats * float(phys_gate_f)
 
-        if (not torch.is_tensor(phase_gate_f) and phase_gate_f <= 0.0):
-            phase_feats = torch.zeros((B, self.n_phase_feats, H, W), device=x.device, dtype=x.dtype)
-        else:
-            phase_feats = self.phase_features(Ez_phys)  # (B,5,H,W)
-            phase_scale = (phase_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
-            phase_scale = phase_scale.clamp_min(1e-6)
-            phase_feats = (phase_feats / phase_scale) * pml_m
+                phys_feats = phys_feats.to(dtype=x.dtype)
 
-            # OPTIONAL: time-gate phase features so "phase of noise" doesn't dominate.
-            # t is usually shaped [B,1,1,1] in your training code.
-            # This ramps phase features on for t >= ~0.2 and fully on by t~0.6.
-            if torch.is_tensor(t):
-                t4 = t
-                if t4.dim() == 2:      # [B,1] -> [B,1,1,1]
-                    t4 = t4.view(-1, 1, 1, 1)
-                elif t4.dim() == 1:    # [B] -> [B,1,1,1]
-                    t4 = t4.view(-1, 1, 1, 1)
-                t_gate = torch.clamp((t4 - 0.2) / 0.4, 0.0, 1.0)
-                phase_feats = phase_feats * t_gate.to(dtype=phase_feats.dtype)
+            # --------------------
+            # Phase features (gated) - now with global phase support
+            # --------------------
+            if phase_gate is None:
+                phase_gate = 1.0
+            phase_gate_f = float(phase_gate) if not torch.is_tensor(phase_gate) else phase_gate
 
-            # apply gate
-            if torch.is_tensor(phase_gate_f):
-                while phase_gate_f.dim() < 4:
-                    phase_gate_f = phase_gate_f.view(-1, 1, 1, 1)
-                phase_feats = phase_feats * phase_gate_f.to(device=x.device, dtype=phase_feats.dtype)
+            if (not torch.is_tensor(phase_gate_f) and phase_gate_f <= 0.0):
+                phase_feats = torch.zeros((B, self.n_phase_feats, H, W), device=x.device, dtype=x.dtype)
             else:
-                phase_feats = phase_feats * float(phase_gate_f)
+                # Pass source_mask for global phase reference computation
+                phase_feats = self.phase_features(Ez_phys, source_mask=source_mask)  # (B,8,H,W)
+                phase_scale = (phase_feats.abs() * pml_m).sum(dim=(2,3), keepdim=True) / den
+                phase_scale = phase_scale.clamp_min(1e-6)
+                phase_scale = phase_scale.detach()
+                phase_feats = (phase_feats / phase_scale) * pml_m
 
-            phase_feats = phase_feats.to(dtype=x.dtype)
+                # OPTIONAL: time-gate phase features so "phase of noise" doesn't dominate.
+                # t is usually shaped [B,1,1,1] in your training code.
+                # This ramps phase features on for t >= ~0.2 and fully on by t~0.6.
+                if torch.is_tensor(t):
+                    t4 = t
+                    if t4.dim() == 2:      # [B,1] -> [B,1,1,1]
+                        t4 = t4.view(-1, 1, 1, 1)
+                    elif t4.dim() == 1:    # [B] -> [B,1,1,1]
+                        t4 = t4.view(-1, 1, 1, 1)
+                    t_gate = torch.clamp((t4 - 0.2) / 0.4, 0.0, 1.0)
+                    phase_feats = phase_feats * t_gate.to(dtype=phase_feats.dtype)
 
-        # --------------------
-        # Augmented input (keep channel count constant!)
-        # --------------------
-        x_masked = x * pml_m.to(dtype=x.dtype)
-        x_aug = torch.cat([x_masked, phys_feats, phase_feats], dim=1)  # [B, in+2+5, H, W]
+                # apply gate
+                if torch.is_tensor(phase_gate_f):
+                    while phase_gate_f.dim() < 4:
+                        phase_gate_f = phase_gate_f.view(-1, 1, 1, 1)
+                    phase_feats = phase_feats * phase_gate_f.to(device=x.device, dtype=phase_feats.dtype)
+                else:
+                    phase_feats = phase_feats * float(phase_gate_f)
+
+                phase_feats = phase_feats.to(dtype=x.dtype)
+
+            # --------------------
+            # Augmented input (keep channel count constant!)
+            # --------------------
+            x_masked = x * pml_m.to(dtype=x.dtype)
+            x_aug = torch.cat([x_masked, phys_feats, phase_feats], dim=1)  # [B, in+2+8, H, W]
 
 
         # timestep embedding wants [B]
@@ -901,7 +1169,43 @@ class PhysicsUNet(nn.Module):
 
         h = h.type(x.dtype)
         out = self.out(h)
-        return out * pml_m.to(dtype=out.dtype)
+        u_t_pred = out * pml_m.to(dtype=out.dtype)
+
+        if not return_sparams:
+            return u_t_pred
+
+        if self.sparam_head is None:
+            raise RuntimeError("return_sparams=True but sparam_head is disabled on this model.")
+        if aux is None:
+            raise ValueError("return_sparams=True requires aux dict (for port masks / in_port).")
+
+        # Compute the implied clean endpoint field x1 under the same FM path used in loss.
+        # This keeps the head tied to the main forward graph (DDP-safe).
+        # NOTE: x and u_t_pred are in *normalized* field units.
+        fields_t = x[:, 0:2]
+        t4 = t
+        if t4.dim() == 1:
+            t4 = t4.view(-1, 1, 1, 1)
+        elif t4.dim() == 2:
+            t4 = t4.view(-1, 1, 1, 1)
+        a = (1.0 - float(sig_min))
+        b = (1.0 - a * t4)
+        x1_fields_pred = a * fields_t + b * u_t_pred  # [B,2,H,W] normalized
+
+        # De-normalize to physical units for S-params. Run head math in fp32 for stability.
+        dev_type = x.device.type
+        with torch.autocast(dev_type, enabled=False):
+            x1f = x1_fields_pred.to(dtype=torch.float32)
+            if getattr(self, "normalize_inputs", False):
+                Er = x1f[:, 0] * self.ez_real_std.to(dtype=torch.float32) + self.ez_real_mean.to(dtype=torch.float32)
+                Ei = x1f[:, 1] * self.ez_imag_std.to(dtype=torch.float32) + self.ez_imag_mean.to(dtype=torch.float32)
+            else:
+                Er = x1f[:, 0]
+                Ei = x1f[:, 1]
+            E_pred_phys_raw = torch.complex(Er, Ei)  # [B,H,W]
+            S_pred = self.predict_sparams(E_pred_phys_raw, aux=aux, cond=cond)
+
+        return u_t_pred, S_pred
 
 
 

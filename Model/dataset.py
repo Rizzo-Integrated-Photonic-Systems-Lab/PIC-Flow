@@ -1,4 +1,20 @@
+# dataset.py
+"""
+FDTD dataset loader with:
+- optional shard (.npz) support
+- deterministic splitting (seeded) to avoid sweep-order bias
+- robust phase anchoring (mask-first, ROI fallback)
+- optional SDF features (raw/clip/exp/clip_exp)
+- optional PML cropping with safety checks
+- return_aux that is DataLoader-collate-safe (no None values)
+- port_masks are cropped consistently when crop_pml=True
+- subset selection is reproducible (stable hash; no Python hash randomization)
+
+Drop-in replacement for your current file.
+"""
+
 import json
+import zlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -6,20 +22,45 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+try:  # optional (fast path)
+    from scipy import ndimage as _scipy_ndimage  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    _scipy_ndimage = None
+
+_SDF_WARNED = False
+
 ShardRef = Tuple[Path, int, str]  # (shard_path, slot, tag)
 SampleRef = Union[Path, ShardRef]
 
-def phase_anchor_roi(ez_r, ez_i, eps_r=None, pml_cells=30, margin=2, roi_x=(40, 140), thr_eps=3.0, eps=1e-8):
+
+def phase_anchor_roi(
+    ez_r,
+    ez_i,
+    eps_r=None,
+    pml_cells=30,
+    margin=2,
+    roi_x=(40, 140),
+    thr_eps=3.0,
+    eps=1e-8,
+):
     """
     Anchor global phase using a stable ROI near the input waveguide.
     Optionally uses eps_r to restrict to core (eps_r > thr_eps).
     """
     H, W = ez_r.shape
-    p2 = min(pml_cells + margin, max(0, H//2 - 1), max(0, W//2 - 1))
+    p2 = min(pml_cells + margin, max(0, H // 2 - 1), max(0, W // 2 - 1))
 
     x0, x1 = roi_x
-    x0 = max(x0, p2); x1 = min(x1, W - p2)
+    x0 = max(x0, p2)
+    x1 = min(x1, W - p2)
     y0, y1 = p2, H - p2
+
+    # If ROI collapses (e.g. small cropped grids), fall back to a central window.
+    if x1 <= x0 + 4 or y1 <= y0 + 4:
+        x0 = max(p2, int(0.25 * W))
+        x1 = min(W - p2, int(0.55 * W))
+        y0 = max(p2, int(0.25 * H))
+        y1 = min(H - p2, int(0.75 * H))
 
     Ez = ez_r + 1j * ez_i
     roi = Ez[y0:y1, x0:x1]
@@ -31,12 +72,61 @@ def phase_anchor_roi(ez_r, ez_i, eps_r=None, pml_cells=30, margin=2, roi_x=(40, 
         m = np.ones_like(roi.real, dtype=np.float32)
 
     A = np.abs(roi)
-    # weight by A^2 but average unit phasors => stable phase estimate
     w = (A**2) * m
     u = roi / np.maximum(A, eps)
 
     c = np.sum(w * u)
-    phi = np.angle(c + 1j*0.0)
+    phi = np.angle(c + 1j * 0.0)
+
+    rot = np.exp(-1j * phi)
+    Ez2 = Ez * rot
+    return Ez2.real.astype(ez_r.dtype), Ez2.imag.astype(ez_i.dtype), float(phi)
+
+
+def phase_anchor_mask(
+    ez_r,
+    ez_i,
+    mask,
+    eps_r=None,
+    thr_eps=3.0,
+    eps=1e-8,
+):
+    """
+    Anchor global phase using a provided pixel mask (e.g. src_mask / input port mask).
+    Rotation-invariant (works if inputs rotate).
+
+    Strategy:
+      - compute unit phasors u = E / |E|
+      - weight by |E|^2 and by provided mask (and optionally core mask eps_r > thr_eps)
+      - choose phi = arg(sum(w * u)), rotate field by exp(-j phi)
+    """
+    Ez = ez_r + 1j * ez_i
+
+    if mask is None:
+        return Ez.real.astype(ez_r.dtype), Ez.imag.astype(ez_i.dtype), 0.0
+
+    m = np.asarray(mask)
+    if m.ndim != 2:
+        m = np.squeeze(m)
+    if m.ndim != 2 or m.shape != ez_r.shape:
+        return Ez.real.astype(ez_r.dtype), Ez.imag.astype(ez_i.dtype), 0.0
+
+    w = (m > 0.0).astype(np.float32)
+    if eps_r is not None:
+        w = w * (np.asarray(eps_r) > thr_eps).astype(np.float32)
+
+    if float(w.sum()) < 4.0:
+        return Ez.real.astype(ez_r.dtype), Ez.imag.astype(ez_i.dtype), 0.0
+
+    A = np.abs(Ez)
+    u = Ez / np.maximum(A, eps)
+    ww = (A**2) * w
+    c = np.sum(ww * u)
+
+    if np.abs(c) < eps:
+        phi = 0.0
+    else:
+        phi = float(np.angle(c + 1j * 0.0))
 
     rot = np.exp(-1j * phi)
     Ez2 = Ez * rot
@@ -45,9 +135,10 @@ def phase_anchor_roi(ez_r, ez_i, eps_r=None, pml_cells=30, margin=2, roi_x=(40, 
 
 class FDTDDataset(Dataset):
     """
-    Unified dataset that pulls samples from all sweep subdirectories under a root
-    (e.g., Data/ containing coupler_sweep/, y_branch_sweep/, ...), either as
-    per-sample folders or packed shard .npz files created by FDTD/pack_dataset.py.
+    Unified dataset that pulls samples from all sweep subdirectories under a root.
+    Supports:
+      - per-sample folders
+      - packed shard .npz files created by FDTD/pack_dataset.py
     """
 
     def __init__(
@@ -58,68 +149,89 @@ class FDTDDataset(Dataset):
         stats: Optional[Dict[str, float]] = None,
         normalize_eps: bool = True,
         use_double: bool = False,
+        include_sdf: bool = False,
+        normalize_sdf: bool = True,
+        sdf_thr_eps: float = 3.0,
+        sdf_dx_um: float = 1.0 / 30.0,
+        sdf_dy_um: Optional[float] = None,
+        sdf_feature: str = "raw",          # raw|exp|clip|clip_exp
+        sdf_sigma_nm: float = 100.0,
         include_sweeps: Optional[Iterable[str]] = None,
         use_shards: bool = False,
         shard_subdir: str = "shards",
         shard_index_name: str = "index.json",
         return_aux: bool = False,
-        # --- Optional deterministic subset selection (applied before train/val split) ---
-        # Specify desired *sample counts* per sweep for train/val, while selecting whole geometries
-        # (so coupler inPort1/inPort2 stay together).
+        # --- Optional deterministic subset selection (applied before split) ---
         subset_train_per_sweep: Optional[Dict[str, int]] = None,
         subset_val_per_sweep: Optional[Dict[str, int]] = None,
         subset_seed: int = 0,
+        # --- PML handling ---
+        crop_pml: bool = False,
+        pml_cells: Optional[int] = None,
+        # --- Determinism knobs ---
+        split_seed: int = 0,               # deterministic train/val split shuffle
+        stats_seed: Optional[int] = None,  # deterministic stats subset; defaults to split_seed if None
     ):
-        """
-        root_dir: path to Data (parent containing sweep subfolders).
-        include_sweeps: optional iterable of subfolder names to include (e.g., ["coupler_sweep", "y_branch_sweep"]);
-                        if None, include all immediate subdirectories.
-        use_shards: set True to read shard .npz files (default False uses per-sample folders).
-        shard_subdir: name of the shard directory inside each sweep (default: 'shards').
-        shard_index_name: filename of the shard index (default: 'index.json').
-        return_aux: if True, __getitem__ returns (x, cond, aux) where aux includes
-                    any available sparams / port mask supervision from the dataset.
-        """
         super().__init__()
         self.root = Path(root_dir)
         self.split = split
-        self.train_fraction = train_fraction
-        self.normalize_eps = normalize_eps
-        self.use_double = use_double
-        self.use_shards = use_shards
-        self.shard_subdir = shard_subdir
-        self.shard_index_name = shard_index_name
+        self.train_fraction = float(train_fraction)
+        self.normalize_eps = bool(normalize_eps)
+        self.use_double = bool(use_double)
+        self.use_shards = bool(use_shards)
+        self.shard_subdir = str(shard_subdir)
+        self.shard_index_name = str(shard_index_name)
         self.return_aux = bool(return_aux)
-        self._shard_cache: Dict[Path, np.lib.npyio.NpzFile] = {}
+
+        self.include_sdf = bool(include_sdf)
+        self.normalize_sdf = bool(normalize_sdf)
+        self.sdf_thr_eps = float(sdf_thr_eps)
+        self.sdf_dx_um = float(sdf_dx_um)
+        self.sdf_dy_um = float(sdf_dx_um if sdf_dy_um is None else sdf_dy_um)
+
+        self.sdf_feature = str(sdf_feature).strip().lower()
+        if self.sdf_feature not in ("raw", "exp", "clip", "clip_exp"):
+            raise ValueError(f"sdf_feature must be one of ['raw','exp','clip','clip_exp'], got: {sdf_feature}")
+        self.sdf_sigma_nm = float(sdf_sigma_nm)
+        if self.sdf_sigma_nm <= 0:
+            raise ValueError(f"sdf_sigma_nm must be > 0, got: {sdf_sigma_nm}")
+
         self.subset_train_per_sweep = subset_train_per_sweep
         self.subset_val_per_sweep = subset_val_per_sweep
         self.subset_seed = int(subset_seed)
 
-        # ------------------------------------------------------------------
-        # Conditioning (Option A): [lambda_norm] + [params_norm...] + [masks...] + [device_type_onehot...]
-        # ------------------------------------------------------------------
-        # Note: we intentionally keep wavelength separate as the first cond entry
-        # because parts of the training code derive physical lambda_um from cond[:,0].
-        self.cond_param_names: List[str] = [
-            # shared-ish
-            "wg_width_um",
-            # coupler-specific
-            "gap_um",
-            "Lc_um",
-            "bend_length_um",
-            "lead_extra_gap_um",
-            # y-branch-specific
-            "l_junction_um",
-            "l_bend_um",
-            "h_bend_um",
-            "l_out_um",
-        ]
-        # device types present in existing shard writers
-        self.device_type_names: List[str] = ["coupler", "y_branch"]
-        self.cond_dim: int = 1 + 2 * len(self.cond_param_names) + len(self.device_type_names)
+        self.crop_pml = bool(crop_pml)
+        self.pml_cells = 0 if pml_cells is None else int(pml_cells)
 
-        # Max number of ports across device families. Used to pad aux tensors so
-        # mixed-device batches collate cleanly (e.g., coupler has 4 ports, y-branch has 3).
+        self.split_seed = int(split_seed)
+        self.stats_seed = int(split_seed if stats_seed is None else stats_seed)
+
+        # Number of SDF channels appended after [Ezr, Ezi, eps, src]
+        self.sdf_n_channels: int = 0
+        self.sdf_feature_names: List[str] = []
+        if self.include_sdf:
+            if self.sdf_feature == "clip_exp":
+                self.sdf_n_channels = 2
+                self.sdf_feature_names = ["sdf_clip", "sdf_exp"]
+            elif self.sdf_feature == "raw":
+                self.sdf_n_channels = 1
+                self.sdf_feature_names = ["sdf_raw_nm"]
+            elif self.sdf_feature == "clip":
+                self.sdf_n_channels = 1
+                self.sdf_feature_names = ["sdf_clip"]
+            else:
+                self.sdf_n_channels = 1
+                self.sdf_feature_names = ["sdf_exp"]
+
+        self.x_channels: int = 4 + (self.sdf_n_channels if self.include_sdf else 0)
+
+        self._shard_cache: Dict[Path, np.lib.npyio.NpzFile] = {}
+
+        # Conditioning (Option A)
+        self.cond_param_names: List[str] = ["wg_width_um"]
+        self.device_type_names: List[str] = []  # not used
+        self.cond_dim: int = 2
+
         self.max_ports: int = 4
 
         if not self.root.is_dir():
@@ -141,6 +253,11 @@ class FDTDDataset(Dataset):
         else:
             all_refs = self._collect_folder_refs(sweep_dirs)
 
+        # Deterministic shuffle before split to avoid sweep-order bias.
+        rng = np.random.default_rng(self.split_seed)
+        perm = rng.permutation(len(all_refs))
+        all_refs = [all_refs[i] for i in perm]
+
         # Optional deterministic subset selection (applied before split).
         if (self.subset_train_per_sweep is not None) or (self.subset_val_per_sweep is not None):
             self.sample_refs = self._subset_refs_by_sweep(
@@ -152,7 +269,7 @@ class FDTDDataset(Dataset):
             )
         else:
             n_total = len(all_refs)
-            n_train = int(round(train_fraction * n_total))
+            n_train = int(round(self.train_fraction * n_total))
             if split == "train":
                 self.sample_refs = all_refs[:n_train]
             elif split == "val":
@@ -167,11 +284,11 @@ class FDTDDataset(Dataset):
             if split != "train":
                 raise ValueError("stats must be provided for non-train splits")
             print(f"[{split}] computing normalization stats from subset...")
-            self.stats = self._compute_stats()
+            self.stats = self._compute_stats(seed=self.stats_seed)
         else:
             self.stats = stats
 
-        # allow stats (from older checkpoints) to override if present
+        # Allow stats (from older checkpoints) to override if present
         try:
             self.cond_dim = int(self.stats.get("cond_dim", self.cond_dim))
         except Exception:
@@ -179,19 +296,18 @@ class FDTDDataset(Dataset):
 
         print(f"[{split}] dataset size = {len(self.sample_refs)}")
 
+    # -----------------------
+    # Helpers: refs + splits
+    # -----------------------
+
     def _infer_sweep_name_from_ref(self, ref: SampleRef) -> str:
-        """
-        Return the sweep folder name (e.g., 'coupler_sweep', 'y_branch_sweep') for a sample ref.
-        """
         if isinstance(ref, tuple):
             shard_path, _, _ = ref
-            # .../Data/<sweep>/shards/<shard>.npz
             try:
                 return shard_path.parent.parent.name
             except Exception:
                 return ""
         try:
-            # folder samples live under .../Data/<sweep>/<tag>/
             return Path(ref).parent.name
         except Exception:
             return ""
@@ -203,16 +319,13 @@ class FDTDDataset(Dataset):
         return Path(ref).name
 
     def _geom_key_from_tag(self, tag: str) -> str:
-        """
-        Geometry identifier used to keep related samples together.
-        - coupler_sweep: '<base>__inPort1'/'__inPort2' -> '<base>'
-        - y_branch_sweep: '<base>__inPort1' -> '<base>' (only one anyway)
-        Fallback: full tag.
-        """
         t = str(tag)
         if "__inPort" in t:
             return t.split("__inPort", 1)[0]
         return t
+
+    def _stable_hash_u32(self, s: str) -> int:
+        return int(zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF)
 
     def _subset_refs_by_sweep(
         self,
@@ -223,10 +336,6 @@ class FDTDDataset(Dataset):
         val_per_sweep: Dict[str, int],
         seed: int,
     ) -> List[SampleRef]:
-        """
-        Deterministically pick a subset per sweep with *sample count targets* for train/val,
-        while selecting whole geometries (so inPort pairs stay together).
-        """
         if split not in ("train", "val"):
             raise ValueError("split must be 'train' or 'val'")
 
@@ -238,7 +347,6 @@ class FDTDDataset(Dataset):
             gk = self._geom_key_from_tag(tag)
             by_sweep.setdefault(sweep, {}).setdefault(gk, []).append(r)
 
-        # If user didn't specify a sweep in train/val dicts, exclude it (explicit subset behavior).
         requested_sweeps = set(train_per_sweep.keys()) | set(val_per_sweep.keys())
         if not requested_sweeps:
             raise ValueError("subset_train_per_sweep/subset_val_per_sweep provided but empty; specify at least one sweep.")
@@ -248,9 +356,14 @@ class FDTDDataset(Dataset):
         for sweep in sorted(requested_sweeps):
             geom_map = by_sweep.get(sweep, {})
             if not geom_map:
-                raise RuntimeError(f"Requested subset sweep '{sweep}' not found under {self.root}. Available: {sorted(by_sweep.keys())}")
+                raise RuntimeError(
+                    f"Requested subset sweep '{sweep}' not found under {self.root}. Available: {sorted(by_sweep.keys())}"
+                )
 
-            rng = np.random.default_rng(int(seed) + (abs(hash(sweep)) % 1_000_000))
+            # Stable per-sweep RNG seed (no Python hash randomization).
+            sweep_seed = int(seed) + self._stable_hash_u32(sweep) % 1_000_000
+            rng = np.random.default_rng(sweep_seed)
+
             geom_keys = list(geom_map.keys())
             rng.shuffle(geom_keys)
 
@@ -298,14 +411,22 @@ class FDTDDataset(Dataset):
             for gk in chosen:
                 out_refs.extend(geom_map[gk])
 
-        # deterministic ordering for reproducibility
         out_refs.sort(key=lambda r: self._tag_from_ref(r))
         return out_refs
 
     def _collect_folder_refs(self, sweep_dirs: List[Path]) -> List[Path]:
         all_dirs: List[Path] = []
         for sdir in sweep_dirs:
-            all_dirs += [d for d in sorted(sdir.iterdir()) if d.is_dir()]
+            for d in sorted(sdir.iterdir()):
+                if not d.is_dir():
+                    continue
+                # Do not treat the shard folder as a sample when using folder-mode.
+                if d.name == self.shard_subdir:
+                    continue
+                # Basic sanity: prefer directories that look like samples.
+                # (If you have other non-sample dirs, this avoids accidental inclusion.)
+                if (d / "Ez_real.npy").is_file() or (d / "Ez_imag.npy").is_file() or (d / "eps.npy").is_file():
+                    all_dirs.append(d)
         if not all_dirs:
             raise RuntimeError(f"No sample subfolders found in sweeps {sweep_dirs}")
         return all_dirs
@@ -326,9 +447,12 @@ class FDTDDataset(Dataset):
                 refs.append((shard_path, slot, tag))
         if not refs:
             raise RuntimeError(f"No shard entries found under sweeps {sweep_dirs}")
-        # deterministic ordering
         refs.sort(key=lambda r: (r[2], r[0].name, r[1]))
         return refs
+
+    # -----------------------
+    # Shard IO
+    # -----------------------
 
     def _get_shard_file(self, shard_path: Path) -> np.lib.npyio.NpzFile:
         if shard_path not in self._shard_cache:
@@ -357,16 +481,136 @@ class FDTDDataset(Dataset):
         if src is None:
             src = np.zeros_like(eps)
 
-        lam_arr = get_arr("sparams/wavelength_um")
+        lam_arr = get_arr("sparams/wavelength_um", required=False)
+        if lam_arr is None:
+            lam_arr = get_arr("sparams/lambda_um", required=True)
         lam_um = float(lam_arr)
+
         return ez_r, ez_i, eps, src, lam_um
 
+    def _load_aux_from_shard(self, ref: ShardRef, dtype_np):
+        shard_path, slot, _ = ref
+        data = self._get_shard_file(shard_path)
+        prefix = f"s{slot}/"
+
+        def get_arr(key: str):
+            full_key = prefix + key
+            if full_key not in data:
+                return None
+            return data[full_key]
+
+        Sr = get_arr("sparams/S_real")
+        Si = get_arr("sparams/S_imag")
+        if Sr is not None and Si is not None:
+            Sr = Sr.astype(dtype_np)
+            Si = Si.astype(dtype_np)
+            sparams_true = (Sr + 1j * Si).astype(np.complex128 if dtype_np == np.float64 else np.complex64)
+        else:
+            sparams_true = None
+
+        port_masks = get_arr("ports/masks")
+        if port_masks is not None:
+            port_masks = port_masks.astype(dtype_np)
+
+        port_ids = get_arr("ports/ids")
+        if port_ids is not None:
+            port_ids = port_ids.astype(np.int32)
+
+        in_port_idx = None
+        in_port = get_arr("sparams/input_port")
+        if in_port is not None:
+            try:
+                in_port_val = int(np.array(in_port).item())
+            except Exception:
+                in_port_val = None
+            if in_port_val is not None:
+                if port_ids is not None:
+                    hits = np.where(port_ids == in_port_val)[0]
+                    if len(hits) > 0:
+                        in_port_idx = int(hits[0])
+                else:
+                    in_port_idx = int(in_port_val - 1)
+
+        return {
+            "sparams_true": sparams_true,
+            "in_port_idx": in_port_idx,
+            "port_masks": port_masks,
+            "port_ids": port_ids,
+        }
+
+    # -----------------------
+    # Folder IO
+    # -----------------------
+
+    def _load_raw_from_dir(self, d: Path, dtype_np):
+        ez_r = np.load(d / "Ez_real.npy").astype(dtype_np)
+        ez_i = np.load(d / "Ez_imag.npy").astype(dtype_np)
+        eps = np.load(d / "eps.npy").astype(dtype_np)
+
+        src_path = d / "src_mask.npy"
+        if src_path.is_file():
+            src = np.load(src_path).astype(dtype_np)
+        else:
+            src = np.zeros_like(eps)
+
+        sp = np.load(d / "sparams.npz")
+
+        if "wavelength_um" in sp:
+            lam_um = float(sp["wavelength_um"])
+        elif "lambda_um" in sp:
+            lam_um = float(sp["lambda_um"])
+        else:
+            raise KeyError("sparams.npz missing wavelength key (expected 'wavelength_um' or 'lambda_um')")
+
+        return ez_r, ez_i, eps, src, lam_um
+
+    def _load_aux_from_dir(self, d: Path, dtype_np):
+        aux = {"sparams_true": None, "in_port_idx": None, "port_masks": None, "port_ids": None}
+
+        sp_path = d / "sparams.npz"
+        if sp_path.is_file():
+            sp = np.load(sp_path)
+            if ("S_real" in sp) and ("S_imag" in sp):
+                Sr = sp["S_real"].astype(dtype_np)
+                Si = sp["S_imag"].astype(dtype_np)
+                aux["sparams_true"] = (Sr + 1j * Si).astype(np.complex128 if dtype_np == np.float64 else np.complex64)
+            elif ("s11" in sp) and ("s21" in sp):
+                s11 = sp["s11"].item()
+                s21 = sp["s21"].item()
+                sparams_vec = np.array([s11, s21], dtype=np.complex64)
+                aux["sparams_true"] = sparams_vec.astype(np.complex128 if dtype_np == np.float64 else np.complex64)
+
+            if "input_port" in sp:
+                try:
+                    aux["in_port_idx"] = int(sp["input_port"]) - 1
+                except Exception:
+                    aux["in_port_idx"] = None
+
+        pm_path = d / "port_masks.npy"
+        if pm_path.is_file():
+            aux["port_masks"] = np.load(pm_path).astype(dtype_np)
+
+        pid_path = d / "port_ids.npy"
+        if pid_path.is_file():
+            aux["port_ids"] = np.load(pid_path).astype(np.int32)
+
+        return aux
+
+    def _load_raw(self, ref: SampleRef, dtype_np):
+        if isinstance(ref, tuple):
+            return self._load_raw_from_shard(ref, dtype_np)
+        return self._load_raw_from_dir(ref, dtype_np)
+
+    def _load_aux(self, ref: SampleRef, dtype_np):
+        if isinstance(ref, tuple):
+            return self._load_aux_from_shard(ref, dtype_np)
+        return self._load_aux_from_dir(ref, dtype_np)
+
+    # -----------------------
+    # Device type + params
+    # -----------------------
+
     def _infer_device_type_from_ref(self, ref: SampleRef) -> str:
-        """
-        Best-effort device type inference.
-        - shard: prefer stored scalar 'dataset' key
-        - folder: infer from parent directory name (e.g., Data/coupler_sweep/...).
-        """
         if isinstance(ref, tuple):
             shard_path, slot, _ = ref
             data = self._get_shard_file(shard_path)
@@ -381,7 +625,6 @@ class FDTDDataset(Dataset):
                     item = item.decode("utf-8", errors="ignore")
                 return str(item)
             return ""
-        # folder-based
         try:
             parent = Path(ref).parent.name.lower()
         except Exception:
@@ -390,13 +633,11 @@ class FDTDDataset(Dataset):
             return "coupler"
         if "y_branch" in parent or "ybranch" in parent:
             return "y_branch"
+        if "euler" in parent or "zig" in parent or "bend" in parent:
+            return "euler_bend"
         return ""
 
     def _get_param_value_from_ref(self, ref: SampleRef, name: str) -> Optional[float]:
-        """
-        Load a geometry scalar parameter by name from either shard or folder sample.
-        Returns None if missing.
-        """
         key = f"sparams/{name}"
         if isinstance(ref, tuple):
             shard_path, slot, _ = ref
@@ -411,7 +652,6 @@ class FDTDDataset(Dataset):
                     return float(data[full_key])
                 except Exception:
                     return None
-        # folder-based: try sparams.npz
         d = Path(ref)
         sp_path = d / "sparams.npz"
         if not sp_path.is_file():
@@ -431,182 +671,277 @@ class FDTDDataset(Dataset):
                 return None
 
     def _build_cond_vector(self, ref: SampleRef, lam_um: float, dtype_np) -> np.ndarray:
-        """
-        Option A conditioning vector:
-          [lambda_norm] + [param_norm...] + [param_mask...] + [device_type_onehot...]
-        """
-        # wavelength (always expected)
-        lam_norm = (lam_um - self.stats["lambda_um_mean"]) / self.stats["lambda_um_std"]
+        # wavelength (always present)
+        lam_std = float(self.stats.get("lambda_um_std", 1.0))
+        if lam_std <= 0:
+            lam_std = 1.0
+        lam_norm = (float(lam_um) - float(self.stats["lambda_um_mean"])) / lam_std
 
-        # params + masks
-        p_vals = []
-        p_masks = []
-        for name in self.cond_param_names:
-            v = self._get_param_value_from_ref(ref, name)
-            if v is None or not np.isfinite(v):
-                p_vals.append(0.0)
-                p_masks.append(0.0)
-                continue
-            mean = float(self.stats.get(f"cond_param_{name}_mean", 0.0))
-            std = float(self.stats.get(f"cond_param_{name}_std", 1.0))
-            std = std if std > 0 else 1.0
-            p_vals.append((float(v) - mean) / std)
-            p_masks.append(1.0)
+        # waveguide width (if missing, default to mean => normalized 0.0)
+        name = "wg_width_um"
+        v = self._get_param_value_from_ref(ref, name)
+        mean = float(self.stats.get(f"cond_param_{name}_mean", 0.0))
+        std = float(self.stats.get(f"cond_param_{name}_std", 1.0))
+        if std <= 0:
+            std = 1.0
 
-        # device type one-hot
-        dtype = self._infer_device_type_from_ref(ref)
-        onehot = [0.0] * len(self.device_type_names)
-        for i, tname in enumerate(self.device_type_names):
-            if dtype == tname:
-                onehot[i] = 1.0
+        if v is None or (not np.isfinite(v)):
+            wg_norm = 0.0
+        else:
+            wg_norm = (float(v) - mean) / std
 
-        cond = np.array([lam_norm] + p_vals + p_masks + onehot, dtype=dtype_np)
+        cond = np.array([lam_norm, wg_norm], dtype=dtype_np)
         return cond
 
-    def _load_aux_from_shard(self, ref: ShardRef, dtype_np):
-        """
-        Optional aux loader for shard datasets.
 
-        Returns dict with keys (when present):
-          - sparams_true: np.complex64/128 array [P]
-          - in_port_idx: int (0-based index into ports)
-          - port_masks: np.float32/64 array [P, H, W]
-          - port_ids: np.int32 array [P]
-        Missing keys are returned as None.
-        """
-        shard_path, slot, _ = ref
-        data = self._get_shard_file(shard_path)
-        prefix = f"s{slot}/"
 
-        def get_arr(key: str):
-            full_key = prefix + key
-            if full_key not in data:
-                return None
-            return data[full_key]
+    # -----------------------
+    # PML cropping utilities
+    # -----------------------
 
-        # S-params (stored as real/imag vectors)
-        Sr = get_arr("sparams/S_real")
-        Si = get_arr("sparams/S_imag")
-        if Sr is not None and Si is not None:
-            Sr = Sr.astype(dtype_np)
-            Si = Si.astype(dtype_np)
-            sparams_true = (Sr + 1j * Si).astype(np.complex128 if dtype_np == np.float64 else np.complex64)
-        else:
-            sparams_true = None
+    def _pml_px_from_ref(self, ref: SampleRef) -> int:
+        if not self.crop_pml:
+            return 0
+        try:
+            if isinstance(ref, tuple):
+                shard_path, slot, _ = ref
+                data = self._get_shard_file(shard_path)
+                key = f"s{slot}/grid/pml_px"
+                if key in data:
+                    return int(np.array(data[key]).item())
+            else:
+                gm_path = Path(ref) / "grid_meta.npz"
+                if gm_path.is_file():
+                    gm = np.load(gm_path, allow_pickle=True)
+                    if "pml_px" in gm:
+                        return int(np.array(gm["pml_px"]).item())
+        except Exception:
+            pass
+        return int(self.pml_cells)
 
-        # Ports (optional; present for coupler shards, not necessarily for others)
-        port_masks = get_arr("ports/masks")
-        if port_masks is not None:
-            port_masks = port_masks.astype(dtype_np)
-        port_ids = get_arr("ports/ids")
-        if port_ids is not None:
-            port_ids = port_ids.astype(np.int32)
+    def _safe_crop_slice(self, H: int, W: int, pml_px: int) -> Optional[Tuple[slice, slice]]:
+        if pml_px <= 0:
+            return None
+        # Need at least 1 pixel after cropping.
+        if (H <= 2 * pml_px + 1) or (W <= 2 * pml_px + 1):
+            return None
+        return (slice(pml_px, H - pml_px), slice(pml_px, W - pml_px))
 
-        # Input port index (0-based). Prefer explicit input_port scalar if present.
-        in_port_idx = None
-        in_port = get_arr("sparams/input_port")
-        if in_port is not None:
-            try:
-                in_port_val = int(np.array(in_port).item())
-            except Exception:
-                in_port_val = None
-            if in_port_val is not None:
-                if port_ids is not None:
-                    hits = np.where(port_ids == in_port_val)[0]
-                    if len(hits) > 0:
-                        in_port_idx = int(hits[0])
-                else:
-                    # Common convention: ports are 1..P in order => idx = port-1
-                    in_port_idx = int(in_port_val - 1)
+    def _maybe_crop_pml_arrays(self, pml_px: int, *arrays: Optional[np.ndarray]):
+        if (not self.crop_pml) or pml_px <= 0:
+            return arrays
+        out = []
+        for a in arrays:
+            if a is None:
+                out.append(None)
+                continue
+            if a.ndim == 2:
+                sl = self._safe_crop_slice(a.shape[0], a.shape[1], pml_px)
+                out.append(a if sl is None else a[sl[0], sl[1]])
+            elif a.ndim == 3:
+                sl = self._safe_crop_slice(a.shape[1], a.shape[2], pml_px)
+                out.append(a if sl is None else a[:, sl[0], sl[1]])
+            else:
+                out.append(a)
+        return tuple(out)
 
-        return {
-            "sparams_true": sparams_true,
-            "in_port_idx": in_port_idx,
-            "port_masks": port_masks,
-            "port_ids": port_ids,
-        }
+    # -----------------------
+    # Grid spacing and SDF
+    # -----------------------
 
-    def _load_raw_from_dir(self, d: Path, dtype_np):
-        ez_r = np.load(d / "Ez_real.npy").astype(dtype_np)
-        ez_i = np.load(d / "Ez_imag.npy").astype(dtype_np)
-        eps = np.load(d / "eps.npy").astype(dtype_np)
-        src = np.load(d / "src_mask.npy").astype(dtype_np)
-        sp = np.load(d / "sparams.npz")
-        lam_um = float(sp["wavelength_um"])
-        return ez_r, ez_i, eps, src, lam_um
+    def _grid_spacing_um_from_ref(self, ref: SampleRef) -> Tuple[float, float]:
+        dx_um = None
+        dy_um = None
 
-    def _load_aux_from_dir(self, d: Path, dtype_np):
-        """
-        Optional aux loader for per-sample folder datasets.
+        if isinstance(ref, tuple):
+            shard_path, slot, _ = ref
+            data = self._get_shard_file(shard_path)
+            prefix = f"s{slot}/"
 
-        Returns dict with keys (when present):
-          - sparams_true: np.complex64/128 array [P]
-          - in_port_idx: int (0-based)
-          - port_masks: np array [P,H,W] (only if present on disk)
-          - port_ids: np.int32 array [P] (only if present on disk)
-        """
-        aux = {"sparams_true": None, "in_port_idx": None, "port_masks": None, "port_ids": None}
-
-        sp_path = d / "sparams.npz"
-        if sp_path.is_file():
-            sp = np.load(sp_path)
-            if ("S_real" in sp) and ("S_imag" in sp):
-                Sr = sp["S_real"].astype(dtype_np)
-                Si = sp["S_imag"].astype(dtype_np)
-                aux["sparams_true"] = (Sr + 1j * Si).astype(np.complex128 if dtype_np == np.float64 else np.complex64)
-            if "input_port" in sp:
+            def get_scalar(key: str):
+                full_key = prefix + key
+                if full_key not in data:
+                    return None
                 try:
-                    aux["in_port_idx"] = int(sp["input_port"]) - 1
+                    return float(np.array(data[full_key]).item())
                 except Exception:
-                    aux["in_port_idx"] = None
+                    try:
+                        return float(data[full_key])
+                    except Exception:
+                        return None
 
-        # Optional: if you ever save these alongside folders (not currently in older sweeps)
-        pm_path = d / "port_masks.npy"
-        if pm_path.is_file():
-            aux["port_masks"] = np.load(pm_path).astype(dtype_np)
-        pid_path = d / "port_ids.npy"
-        if pid_path.is_file():
-            aux["port_ids"] = np.load(pid_path).astype(np.int32)
+            dx_um = get_scalar("grid/dx")
+            dy_um = get_scalar("grid/dy")
+            if dx_um is None or dy_um is None:
+                Lx_um = get_scalar("grid/Lx_um")
+                Ly_um = get_scalar("grid/Ly_um")
+                nx = get_scalar("grid/nx")
+                ny = get_scalar("grid/ny")
+                if (Lx_um is not None) and (Ly_um is not None) and (nx is not None) and (ny is not None):
+                    try:
+                        dx_um = float(Lx_um) / float(nx)
+                        dy_um = float(Ly_um) / float(ny)
+                    except Exception:
+                        dx_um = None
+                        dy_um = None
+        else:
+            d = Path(ref)
+            gm_path = d / "grid_meta.npz"
+            if gm_path.is_file():
+                try:
+                    gm = np.load(gm_path, allow_pickle=True)
+                    if "dx" in gm and "dy" in gm:
+                        dx_um = float(np.array(gm["dx"]).item())
+                        dy_um = float(np.array(gm["dy"]).item())
+                    elif ("Lx_um" in gm and "Ly_um" in gm and "nx" in gm and "ny" in gm):
+                        Lx_um = float(np.array(gm["Lx_um"]).item())
+                        Ly_um = float(np.array(gm["Ly_um"]).item())
+                        nx = float(np.array(gm["nx"]).item())
+                        ny = float(np.array(gm["ny"]).item())
+                        dx_um = float(Lx_um) / float(nx)
+                        dy_um = float(Ly_um) / float(ny)
+                except Exception:
+                    dx_um = None
+                    dy_um = None
 
-        return aux
+        if (
+            dx_um is None
+            or dy_um is None
+            or (not np.isfinite(dx_um))
+            or (not np.isfinite(dy_um))
+            or dx_um <= 0
+            or dy_um <= 0
+        ):
+            return self.sdf_dx_um, self.sdf_dy_um
+        return float(dx_um), float(dy_um)
 
-    def _load_raw(self, ref: SampleRef, dtype_np):
-        if isinstance(ref, tuple):
-            return self._load_raw_from_shard(ref, dtype_np)
-        return self._load_raw_from_dir(ref, dtype_np)
+    def _distance_to_feature_nm(self, feature: np.ndarray, *, dx_nm: float, dy_nm: float) -> np.ndarray:
+        global _SDF_WARNED
+        if _scipy_ndimage is not None:
+            return _scipy_ndimage.distance_transform_edt(~feature, sampling=(dy_nm, dx_nm)).astype(np.float32)
 
-    def _load_aux(self, ref: SampleRef, dtype_np):
-        if isinstance(ref, tuple):
-            return self._load_aux_from_shard(ref, dtype_np)
-        return self._load_aux_from_dir(ref, dtype_np)
+        if not _SDF_WARNED:
+            print("[dataset.py] WARNING: SciPy not available; using chamfer DT fallback for SDF (slower, approximate).")
+            _SDF_WARNED = True
 
-    def _compute_stats(self) -> Dict[str, float]:
+        H, W = feature.shape
+        inf = np.float32(1e30)
+        dist = np.full((H, W), inf, dtype=np.float32)
+        dist[feature.astype(bool, copy=False)] = 0.0
+
+        w_x = np.float32(dx_nm)
+        w_y = np.float32(dy_nm)
+        w_d = np.float32(np.sqrt(dx_nm * dx_nm + dy_nm * dy_nm))
+
+        for i in range(H):
+            for j in range(W):
+                v = dist[i, j]
+                if i > 0:
+                    v = min(v, dist[i - 1, j] + w_y)
+                    if j > 0:
+                        v = min(v, dist[i - 1, j - 1] + w_d)
+                    if j + 1 < W:
+                        v = min(v, dist[i - 1, j + 1] + w_d)
+                if j > 0:
+                    v = min(v, dist[i, j - 1] + w_x)
+                dist[i, j] = v
+
+        for i in range(H - 1, -1, -1):
+            for j in range(W - 1, -1, -1):
+                v = dist[i, j]
+                if i + 1 < H:
+                    v = min(v, dist[i + 1, j] + w_y)
+                    if j > 0:
+                        v = min(v, dist[i + 1, j - 1] + w_d)
+                    if j + 1 < W:
+                        v = min(v, dist[i + 1, j + 1] + w_d)
+                if j + 1 < W:
+                    v = min(v, dist[i, j + 1] + w_x)
+                dist[i, j] = v
+
+        return dist
+
+    def _signed_distance_nm_from_eps(self, eps_phys: np.ndarray, *, ref: SampleRef) -> np.ndarray:
+        dx_um, dy_um = self._grid_spacing_um_from_ref(ref)
+        dx_nm = 1000.0 * float(dx_um)
+        dy_nm = 1000.0 * float(dy_um)
+
+        inside = (eps_phys > self.sdf_thr_eps)
+        d_out = self._distance_to_feature_nm(inside, dx_nm=dx_nm, dy_nm=dy_nm)
+        d_in = self._distance_to_feature_nm(~inside, dx_nm=dx_nm, dy_nm=dy_nm)
+        phi = d_out - d_in  # negative inside, positive outside
+        return phi.astype(np.float32, copy=False)
+
+    def _sdf_features_from_phi_nm(self, phi_nm: np.ndarray) -> np.ndarray:
+        phi_nm = phi_nm.astype(np.float32, copy=False)
+        s = float(self.sdf_sigma_nm)
+        if s <= 0:
+            s = 1.0
+
+        clip = np.clip(phi_nm / s, -1.0, 1.0).astype(np.float32, copy=False)
+        exp = (np.sign(phi_nm) * np.exp(-np.abs(phi_nm) / s)).astype(np.float32, copy=False)
+
+        if self.sdf_feature == "raw":
+            return phi_nm[None, ...]
+        if self.sdf_feature == "clip":
+            return clip[None, ...]
+        if self.sdf_feature == "exp":
+            return exp[None, ...]
+        if self.sdf_feature == "clip_exp":
+            return np.stack([clip, exp], axis=0).astype(np.float32, copy=False)
+        raise ValueError(f"Unknown sdf_feature={self.sdf_feature}")
+
+    # -----------------------
+    # Stats
+    # -----------------------
+
+    def _compute_stats(self, seed: int = 0) -> Dict[str, float]:
         subset_size = min(len(self.sample_refs), 500)
-        idxs = np.random.choice(len(self.sample_refs), subset_size, replace=False)
+
+        rng = np.random.default_rng(int(seed))
+        idxs = rng.choice(len(self.sample_refs), subset_size, replace=False)
 
         ez_r_all = []
         ez_i_all = []
         eps_all = []
+        sdf_raw_all = []
+        sdf_feat_ch: List[List[np.ndarray]] = [[] for _ in range(int(self.sdf_n_channels))]
         lam_all = []
-        # conditioning param stats (presence-aware)
         param_vals: Dict[str, List[float]] = {k: [] for k in self.cond_param_names}
 
         for i in idxs:
-            ref = self.sample_refs[i]
-            ez_r, ez_i, eps, _, lam = self._load_raw(ref, dtype_np=np.float32)
-            ez_r, ez_i, _ = phase_anchor_roi(ez_r, ez_i, eps_r=eps, pml_cells=30, margin=2)
+            ref = self.sample_refs[int(i)]
+            ez_r, ez_i, eps, src, lam = self._load_raw(ref, dtype_np=np.float32)
+
+            # Phase anchoring: mask-first, ROI fallback.
+            ez_r2, ez_i2, _ = phase_anchor_mask(ez_r, ez_i, (src > 0.5), eps_r=eps, thr_eps=3.0)
+            if (
+                (src is None)
+                or float((src > 0.5).sum()) < 4.0
+                or (np.allclose(ez_r2, ez_r) and np.allclose(ez_i2, ez_i))
+            ):
+                ez_r2, ez_i2, _ = phase_anchor_roi(ez_r, ez_i, eps_r=eps, pml_cells=int(self.pml_cells), margin=2)
+            ez_r, ez_i = ez_r2, ez_i2
 
             ez_r_all.append(ez_r)
             ez_i_all.append(ez_i)
             eps_all.append(eps)
             lam_all.append(lam)
 
-            # collect geometry params if present (exclude NaNs/missing)
+            if self.include_sdf:
+                try:
+                    phi_nm = self._signed_distance_nm_from_eps(eps, ref=ref)
+                    sdf_raw_all.append(phi_nm)
+                    feats = self._sdf_features_from_phi_nm(phi_nm)  # [C,H,W]
+                    if feats.ndim == 3 and feats.shape[0] == int(self.sdf_n_channels):
+                        for c in range(int(self.sdf_n_channels)):
+                            sdf_feat_ch[c].append(feats[c])
+                except Exception:
+                    pass
+
             for name in self.cond_param_names:
                 v = self._get_param_value_from_ref(ref, name)
-                if v is None:
-                    continue
-                if not np.isfinite(v):
+                if v is None or (not np.isfinite(v)):
                     continue
                 param_vals[name].append(float(v))
 
@@ -626,7 +961,24 @@ class FDTDDataset(Dataset):
             lambda_um_std=float(lam_arr.std()) + 1e-8,
         )
 
-        # param normalization stats (mean/std over present values)
+        if self.include_sdf and len(sdf_raw_all) > 0:
+            sdf_nm_cat = np.stack(sdf_raw_all)
+            stats["sdf_nm_mean"] = float(sdf_nm_cat.mean())
+            stats["sdf_nm_std"] = float(sdf_nm_cat.std()) + 1e-8
+        else:
+            stats["sdf_nm_mean"] = 0.0
+            stats["sdf_nm_std"] = 1.0
+
+        if self.include_sdf and int(self.sdf_n_channels) > 0:
+            for c in range(int(self.sdf_n_channels)):
+                if len(sdf_feat_ch[c]) > 0:
+                    cat = np.stack(sdf_feat_ch[c])
+                    stats[f"sdf_feat{c}_mean"] = float(cat.mean())
+                    stats[f"sdf_feat{c}_std"] = float(cat.std()) + 1e-8
+                else:
+                    stats[f"sdf_feat{c}_mean"] = 0.0
+                    stats[f"sdf_feat{c}_std"] = 1.0
+
         for name in self.cond_param_names:
             xs = np.array(param_vals[name], dtype=np.float64)
             if xs.size == 0:
@@ -638,12 +990,17 @@ class FDTDDataset(Dataset):
                 stats[f"cond_param_{name}_std"] = float(xs.std()) + 1e-8
                 stats[f"cond_param_{name}_present_frac"] = float(xs.size / subset_size)
 
-        # record conditioning layout for downstream consumers
         stats["cond_dim"] = int(self.cond_dim)
         stats["cond_param_names"] = list(self.cond_param_names)
         stats["cond_device_type_names"] = list(self.device_type_names)
+        stats["x_channels"] = int(self.x_channels)
+        stats["include_sdf"] = bool(self.include_sdf)
+        stats["sdf_thr_eps"] = float(self.sdf_thr_eps)
+        stats["sdf_feature"] = str(self.sdf_feature)
+        stats["sdf_sigma_nm"] = float(self.sdf_sigma_nm)
+        stats["sdf_n_channels"] = int(self.sdf_n_channels)
+        stats["sdf_feature_names"] = list(self.sdf_feature_names)
 
-        # Pretty-print: round floats, keep other metadata as-is
         pretty = {}
         for k, v in stats.items():
             if isinstance(v, (float, np.floating)):
@@ -653,59 +1010,94 @@ class FDTDDataset(Dataset):
         print("Stats:", pretty)
         return stats
 
+    # -----------------------
+    # Dataset API
+    # -----------------------
+
     def __len__(self) -> int:
         return len(self.sample_refs)
 
     def __getitem__(self, idx: int):
         dtype_np = np.float64 if self.use_double else np.float32
         ref = self.sample_refs[idx]
+
         ez_r, ez_i, eps, src, lam_um = self._load_raw(ref, dtype_np=dtype_np)
 
+        # Optional: crop PML out of arrays before downstream processing.
+        pml_px = self._pml_px_from_ref(ref)
+        ez_r, ez_i, eps, src = self._maybe_crop_pml_arrays(pml_px, ez_r, ez_i, eps, src)
 
-        ### Phase anchor ###
-        ez_r, ez_i, phi = phase_anchor_roi(
-            ez_r, ez_i,
-            eps_r=eps,
-            pml_cells=30,
-            margin=2,
-            roi_x=(40, 140),
-            thr_eps=3.0,
-        )
+        # Phase anchor (mask-first, ROI fallback).
+        ez_r2, ez_i2, _ = phase_anchor_mask(ez_r, ez_i, (src > 0.5), eps_r=eps, thr_eps=3.0)
+        if (src is None) or (float((src > 0.5).sum()) < 4.0):
+            ez_r2, ez_i2, _ = phase_anchor_roi(
+                ez_r,
+                ez_i,
+                eps_r=eps,
+                pml_cells=int(self.pml_cells),
+                margin=2,
+                roi_x=(40, 140),
+                thr_eps=3.0,
+            )
+        ez_r, ez_i = ez_r2, ez_i2
 
-        ### Normalize ###
+        # Normalize
         ez_r = (ez_r - self.stats["ez_real_mean"]) / self.stats["ez_real_std"]
         ez_i = (ez_i - self.stats["ez_imag_mean"]) / self.stats["ez_imag_std"]
+
+        eps_phys = eps
         if self.normalize_eps:
-            eps = (eps - self.stats["eps_mean"]) / self.stats["eps_std"]
-        
+            eps = (eps_phys - self.stats["eps_mean"]) / self.stats["eps_std"]
+
         src = (src > 0.5).astype(dtype_np)
 
-        # conditioning (Option A)
+        # Conditioning (Option A)
         cond_np = self._build_cond_vector(ref, lam_um=lam_um, dtype_np=dtype_np)
 
-        sample = np.stack([ez_r, ez_i, eps, src], axis=0)
+        # Optional SDF channels
+        if self.include_sdf:
+            phi_nm = self._signed_distance_nm_from_eps(
+                eps_phys.astype(np.float32, copy=False),
+                ref=ref,
+            ).astype(np.float32, copy=False)
+            phi_feat = self._sdf_features_from_phi_nm(phi_nm).astype(dtype_np, copy=False)  # [C,H,W]
+
+            if self.normalize_sdf:
+                C = int(phi_feat.shape[0])
+                for c in range(C):
+                    if self.sdf_feature == "raw":
+                        mu = float(self.stats.get("sdf_nm_mean", 0.0))
+                        sig = float(self.stats.get("sdf_nm_std", 1.0))
+                    else:
+                        mu = float(self.stats.get(f"sdf_feat{c}_mean", 0.0))
+                        sig = float(self.stats.get(f"sdf_feat{c}_std", 1.0))
+                    sig = sig if sig > 0 else 1.0
+                    phi_feat[c] = (phi_feat[c] - mu) / sig
+
+            sample = np.concatenate([np.stack([ez_r, ez_i, eps, src], axis=0), phi_feat], axis=0)
+        else:
+            sample = np.stack([ez_r, ez_i, eps, src], axis=0)
+
         x = torch.from_numpy(sample)
         cond = torch.from_numpy(cond_np).to(dtype=x.dtype)
 
         if not self.return_aux:
             return x, cond
 
+        # -----------------------
+        # Aux (collate-safe)
+        # -----------------------
         aux_np = self._load_aux(ref, dtype_np=dtype_np)
-        aux = {
-            "in_port_idx": aux_np.get("in_port_idx", None),
-            "port_ids": None,
-            "port_masks": None,
-            "sparams_true": None,
-            "n_ports": None,
-            "port_valid": None,
-        }
-
-        # ---- Pad aux port-related tensors to self.max_ports so DataLoader can stack mixed devices ----
         port_ids_np = aux_np.get("port_ids", None)
         port_masks_np = aux_np.get("port_masks", None)
         sparams_true_np = aux_np.get("sparams_true", None)
+        in_port_idx_np = aux_np.get("in_port_idx", None)
 
-        # infer P (number of valid ports in this sample)
+        # Crop port masks consistently if crop_pml=True.
+        if port_masks_np is not None:
+            (port_masks_np,) = self._maybe_crop_pml_arrays(pml_px, port_masks_np)
+
+        # Infer P (#ports)
         P = None
         if port_ids_np is not None:
             P = int(np.asarray(port_ids_np).shape[0])
@@ -714,32 +1106,42 @@ class FDTDDataset(Dataset):
         elif sparams_true_np is not None:
             P = int(np.asarray(sparams_true_np).shape[0])
 
-        if P is not None:
-            P = min(P, int(self.max_ports))
-            aux["n_ports"] = int(P)
-            pv = np.zeros((self.max_ports,), dtype=np.float32)
-            pv[:P] = 1.0
-            aux["port_valid"] = torch.from_numpy(pv).to(x.dtype)
+        if P is None:
+            P = 0
+        P = min(int(P), int(self.max_ports))
 
-        if port_ids_np is not None and P is not None:
+        # Build collate-safe tensors with sentinel defaults.
+        aux = {
+            "n_ports": torch.tensor(P, dtype=torch.long),
+            "in_port_idx": torch.tensor(-1 if in_port_idx_np is None else int(in_port_idx_np), dtype=torch.long),
+            "port_valid": torch.zeros((self.max_ports,), dtype=x.dtype),
+            "port_ids": torch.full((self.max_ports,), -1, dtype=torch.long),
+            "port_masks": torch.zeros((self.max_ports, x.shape[1], x.shape[2]), dtype=x.dtype),
+            "sparams_true": torch.zeros((self.max_ports,), dtype=(torch.complex128 if self.use_double else torch.complex64)),
+        }
+
+        if P > 0:
+            aux["port_valid"][:P] = 1.0
+
+        if port_ids_np is not None and P > 0:
             pid = np.asarray(port_ids_np).astype(np.int64).reshape(-1)
             pid_pad = np.full((self.max_ports,), -1, dtype=np.int64)
             pid_pad[:P] = pid[:P]
             aux["port_ids"] = torch.from_numpy(pid_pad)
 
-        if port_masks_np is not None and P is not None:
+        if port_masks_np is not None and P > 0:
             pm = np.asarray(port_masks_np).astype(dtype_np)  # [P,H,W]
-            pm_pad = np.zeros((self.max_ports, pm.shape[1], pm.shape[2]), dtype=dtype_np)
-            pm_pad[:P] = pm[:P]
-            aux["port_masks"] = torch.from_numpy(pm_pad).to(x.dtype)
+            # If pm spatial dims do not match x (should not happen after cropping), fall back to zeros.
+            if pm.ndim == 3 and pm.shape[1] == x.shape[1] and pm.shape[2] == x.shape[2]:
+                pm_pad = np.zeros((self.max_ports, pm.shape[1], pm.shape[2]), dtype=dtype_np)
+                pm_pad[:P] = pm[:P]
+                aux["port_masks"] = torch.from_numpy(pm_pad).to(x.dtype)
 
-        if sparams_true_np is not None and P is not None:
-            s = np.asarray(sparams_true_np).reshape(-1)  # [P]
-            # pad complex vector to max_ports; keep padded entries at 0
-            s_pad = np.zeros((self.max_ports,), dtype=np.complex128 if dtype_np == np.float64 else np.complex64)
+        if sparams_true_np is not None and P > 0:
+            s = np.asarray(sparams_true_np).reshape(-1)
+            s_pad = np.zeros((self.max_ports,), dtype=(np.complex128 if dtype_np == np.float64 else np.complex64))
             s_pad[:P] = s[:P].astype(s_pad.dtype, copy=False)
-            s_t = torch.from_numpy(s_pad)
-            aux["sparams_true"] = s_t.to(torch.complex128 if self.use_double else torch.complex64)
+            aux["sparams_true"] = torch.from_numpy(s_pad).to(aux["sparams_true"].dtype)
 
         return x, cond, aux
 

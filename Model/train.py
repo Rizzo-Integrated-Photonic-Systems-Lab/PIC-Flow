@@ -1,30 +1,44 @@
-# train_physics_unet_pbfm_ddp.py
+# train.py  (train_physics_unet_pbfm_ddp.py)
 
 import argparse
 import csv
 import logging
-import os
 import math
+import os
 from collections import OrderedDict
 from copy import deepcopy
 from time import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.amp import autocast, GradScaler
+
+try:
+    from torch.amp import GradScaler as _GradScaler
+    from torch.amp import autocast
+    _AMP_NEW_API = True
+except Exception:
+    from torch.cuda.amp import GradScaler as _GradScaler  # type: ignore
+    from torch.cuda.amp import autocast  # type: ignore
+    _AMP_NEW_API = False
 
 import wandb
 
 from dataset import FDTDDataset
 from physics_unet import PhysicsUNet, HelmholtzResidual2D
-from flow_matching import psi_t, u_t, sample_t, cfm_loss_residual, sample as fm_sample
+from complex_physics_unet import ComplexPhysicsUNet
+from flow_matching import psi_t, u_t, sample_t, cfm_loss_residual, sample as fm_sample, SIG_MIN
+from sparams_loss import extract_sparams
 
+# Optional (rank0 sample plots)
+import matplotlib
+matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 
@@ -66,14 +80,12 @@ def create_logger(logging_dir: str | None):
             ],
         )
         return logging.getLogger(__name__)
-    else:
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-        return logger
+    logger = logging.getLogger(__name__)
+    logger.addHandler(logging.NullHandler())
+    return logger
 
 
 def ddp_allreduce_mean_(x: torch.Tensor) -> torch.Tensor:
-    """In-place mean across ranks."""
     if dist.is_initialized():
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
         x /= dist.get_world_size()
@@ -81,10 +93,6 @@ def ddp_allreduce_mean_(x: torch.Tensor) -> torch.Tensor:
 
 
 def ddp_barrier(device: torch.device | None = None):
-    """
-    Barrier with explicit device_ids when using NCCL.
-    This avoids NCCL hangs/errors when rank->GPU mapping is heterogeneous.
-    """
     if not dist.is_initialized():
         return
     try:
@@ -93,12 +101,10 @@ def ddp_barrier(device: torch.device | None = None):
         else:
             dist.barrier()
     except TypeError:
-        # Older torch versions don't accept device_ids
         dist.barrier()
 
 
 def broadcast_object(obj, src=0):
-    """Broadcast a picklable python object from src to all ranks."""
     if not dist.is_initialized():
         return obj
     obj_list = [obj] if dist.get_rank() == src else [None]
@@ -108,14 +114,24 @@ def broadcast_object(obj, src=0):
 
 def ramp_linear(epoch: int, start_epoch: int, warmup_epochs: int) -> float:
     """
-    Linear ramp from 0 to 1 starting at start_epoch (exclusive),
-    reaching 1 after warmup_epochs.
+    Linear ramp from 0->1 over warmup_epochs, starting at start_epoch.
+
+    Fix: use epoch < start_epoch (not <=) so "start_epoch=N" activates on epoch N.
     """
     if warmup_epochs <= 0:
         return 1.0
-    if epoch <= start_epoch:
+    if epoch < start_epoch:
         return 0.0
     return min(1.0, (epoch - start_epoch) / float(warmup_epochs))
+
+
+def _phase_start_epoch(phase: str, N1: int, N2: int) -> int:
+    p = str(phase).strip().upper()
+    if p == "A":
+        return 0
+    if p == "B":
+        return int(N1)
+    return int(N2)
 
 
 def _norm(a: torch.Tensor) -> float:
@@ -132,50 +148,161 @@ def _cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> float:
     return float((torch.dot(a.flatten(), b.flatten()) / (na * nb)).item())
 
 
+def compute_grad_vector(
+    loss: torch.Tensor,
+    model: torch.nn.Module,
+    *,
+    retain_graph: bool,
+    create_graph: bool = False,
+) -> torch.Tensor:
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        return torch.zeros(0, device=loss.device, dtype=loss.dtype)
+
+    grads = torch.autograd.grad(
+        outputs=loss,
+        inputs=params,
+        retain_graph=retain_graph,
+        create_graph=create_graph,
+        allow_unused=True,
+    )
+    vecs: list[torch.Tensor] = []
+    for p, g in zip(params, grads):
+        if g is None:
+            vecs.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
+        else:
+            vecs.append(g.detach().reshape(-1))
+    return torch.cat(vecs, dim=0)
+
+
+def apply_gradient_vector_local(model: torch.nn.Module, grad_vec: torch.Tensor) -> None:
+    offset = 0
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        n = p.numel()
+        g = grad_vec[offset: offset + n].view_as(p).to(device=p.device, dtype=p.dtype)
+        if p.grad is None:
+            p.grad = g.clone()
+        else:
+            p.grad.detach().copy_(g)
+        offset += n
+    if offset != int(grad_vec.numel()):
+        raise ValueError("apply_gradient_vector_local: size mismatch")
+
+
+def pcgrad_update(grads: list[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+    if len(grads) == 0:
+        raise ValueError("pcgrad_update: empty grads")
+    if len(grads) == 1:
+        return grads[0]
+
+    base = [g.double() for g in grads]
+    proj = [g.clone() for g in base]
+    n = len(proj)
+
+    idx = list(range(n))
+    for i in range(n):
+        order = idx[i + 1:] + idx[:i]
+        for j in order:
+            gij = torch.dot(proj[i], base[j])
+            if not torch.isfinite(gij):
+                continue
+            if gij.item() < 0.0:
+                denom = torch.dot(base[j], base[j]).clamp_min(eps)
+                proj[i] = proj[i] - (gij / denom) * base[j]
+
+    g_out = torch.zeros_like(proj[0])
+    for g in proj:
+        if torch.isfinite(g).all():
+            g_out += g
+    return g_out.float()
+
+
+def ddp_broadcast_amp_scale(scaler: _GradScaler, device: torch.device) -> float:
+    """
+    Ensures identical GradScaler scale on all ranks when doing manual grad allreduce.
+    Returns 1.0 if AMP is disabled.
+    """
+    if (scaler is None) or (not scaler.is_enabled()):
+        return 1.0
+    s = torch.tensor([float(scaler.get_scale())], device=device, dtype=torch.float32)
+    if dist.is_initialized():
+        dist.broadcast(s, src=0)
+    return float(s.item())
+
+
 def _move_aux_to_device(aux, device: torch.device):
-    """
-    aux comes from DataLoader collate. Depending on how the dataset returns fields,
-    dict values might be tensors, lists, numpy arrays, or None.
-    We normalize it to a dict with tensors on device where applicable.
-    """
     if not isinstance(aux, dict):
         return None
-
     out = dict(aux)
 
-    # port_masks: float tensor [B, P, H, W] (or None)
-    if out.get("port_masks", None) is not None:
-        if not torch.is_tensor(out["port_masks"]):
-            out["port_masks"] = torch.as_tensor(out["port_masks"])
-        out["port_masks"] = out["port_masks"].to(device, dtype=dtype, non_blocking=True)
+    def _to(x, *, dt=None):
+        if x is None:
+            return None
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        if dt is not None:
+            return x.to(device, dtype=dt, non_blocking=True)
+        return x.to(device, non_blocking=True)
 
-    # port_ids: typically long [B, P] or similar
-    if out.get("port_ids", None) is not None:
-        if not torch.is_tensor(out["port_ids"]):
-            out["port_ids"] = torch.as_tensor(out["port_ids"])
-        out["port_ids"] = out["port_ids"].to(device, non_blocking=True)
+    out["port_masks"] = _to(out.get("port_masks", None), dt=dtype)
+    out["port_ids"] = _to(out.get("port_ids", None))
+    out["sparams_true"] = _to(out.get("sparams_true", None))
+    out["port_valid"] = _to(out.get("port_valid", None), dt=dtype)
 
-    # sparams_true: complex [B, ...]
-    if out.get("sparams_true", None) is not None:
-        if not torch.is_tensor(out["sparams_true"]):
-            out["sparams_true"] = torch.as_tensor(out["sparams_true"])
-        out["sparams_true"] = out["sparams_true"].to(device, non_blocking=True)
-
-    # in_port_idx: should be per-sample; collate might produce list[int] -> make tensor [B]
     if out.get("in_port_idx", None) is not None:
         if torch.is_tensor(out["in_port_idx"]):
             out["in_port_idx"] = out["in_port_idx"].to(device, non_blocking=True)
         else:
-            # could be list[int] or numpy
             out["in_port_idx"] = torch.as_tensor(out["in_port_idx"], dtype=torch.long, device=device)
 
     return out
 
 
+def _format_sparams_compact(S_true_1d, S_pred_1d, port_valid_1d=None, max_ports=4) -> str:
+    if S_true_1d is None or S_pred_1d is None:
+        return ""
+    S_true_1d = S_true_1d.reshape(-1)[:max_ports]
+    S_pred_1d = S_pred_1d.reshape(-1)[:max_ports]
+    keep = None
+    if port_valid_1d is not None:
+        pv = port_valid_1d.reshape(-1)[:max_ports].detach().cpu()
+        keep = (pv > 0.5).numpy()
+
+    mags_t = torch.abs(S_true_1d).detach().cpu().numpy()
+    mags_p = torch.abs(S_pred_1d).detach().cpu().numpy()
+    ph_t = torch.angle(S_true_1d).detach().cpu().numpy()
+    ph_p = torch.angle(S_pred_1d).detach().cpu().numpy()
+    parts = []
+    for i in range(min(len(mags_t), len(mags_p), max_ports)):
+        if keep is not None and (i >= len(keep) or not bool(keep[i])):
+            continue
+        parts.append(f"p{i}: |S| {mags_t[i]:.3f}->{mags_p[i]:.3f}, ∠ {ph_t[i]:+.2f}->{ph_p[i]:+.2f}")
+    return " ; ".join(parts)
+
+
+def _ensure_model_pml_cells(model_like, pml_cells: int) -> None:
+    """
+    Ensure flow_matching.py can reliably read model.(module).helmholtz.pml_cells for PML masking.
+    """
+    try:
+        m = getattr(model_like, "module", model_like)
+        if hasattr(m, "helmholtz") and (getattr(m, "helmholtz") is not None):
+            h = getattr(m, "helmholtz")
+            if hasattr(h, "pml_cells"):
+                try:
+                    h.pml_cells = int(pml_cells)
+                    return
+                except Exception:
+                    pass
+        # fallback: attach a minimal object
+        m.helmholtz = SimpleNamespace(pml_cells=int(pml_cells))
+    except Exception:
+        pass
+
+
 def main(args):
-    # -----------------------
-    # DDP init
-    # -----------------------
     assert torch.cuda.is_available(), "Need CUDA GPUs for DDP training."
     dist.init_process_group(backend="nccl")
 
@@ -185,31 +312,26 @@ def main(args):
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    # Deterministic-ish seeding per rank
     seed = args.global_seed * world + rank
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # -----------------------
-    # experiment dirs / logging (rank 0 only)
-    # -----------------------
     results_dir = "logs_physics_unet_pbfm"
     experiment_dir = os.path.join(results_dir, args.version)
     ckpt_dir = os.path.join(experiment_dir, "checkpoints")
+    samples_dir = os.path.join(experiment_dir, "samples")
 
     if is_rank0():
         os.makedirs(results_dir, exist_ok=True)
-
         if (not args.resume_from) and os.path.exists(experiment_dir):
-            # clear old artifacts
             for root, dirs, files in os.walk(experiment_dir, topdown=False):
                 for name in files:
                     os.remove(os.path.join(root, name))
                 for name in dirs:
                     os.rmdir(os.path.join(root, name))
-
         os.makedirs(experiment_dir, exist_ok=True)
         os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(samples_dir, exist_ok=True)
 
     ddp_barrier(device)
     logger = create_logger(experiment_dir if is_rank0() else None)
@@ -217,7 +339,6 @@ def main(args):
         logger.info(f"DDP: rank={rank}/{world}, local_rank={local_rank}, device={device}")
     logger.info(f"Experiment dir: {experiment_dir}")
 
-    # CSV header (rank 0 only)
     val_csv_path = os.path.join(experiment_dir, "validation.csv")
     if is_rank0():
         mode = "a" if (args.resume_from and os.path.exists(val_csv_path)) else "w"
@@ -235,7 +356,6 @@ def main(args):
                     "sample_residual_mean",
                 ])
 
-    # wandb (rank 0 only)
     wandb_run = None
     if args.use_wandb and is_rank0():
         wandb_run = wandb.init(
@@ -245,12 +365,15 @@ def main(args):
             config=vars(args),
         )
 
-    # -----------------------
-    # Dataset + stats broadcast
-    # -----------------------
     include_sweeps = None
     if args.include_sweeps:
         include_sweeps = [s.strip() for s in args.include_sweeps.split(",") if s.strip()]
+
+    # sdf sigma px -> nm
+    sdf_sigma_px = float(getattr(args, "sdf_sigma_px", 0.0) or 0.0)
+    if sdf_sigma_px and sdf_sigma_px > 0:
+        dx_um = float(getattr(args, "dx", 1.0 / 24.0))
+        args.sdf_sigma_nm = float(sdf_sigma_px) * dx_um * 1000.0
 
     def _parse_kv_ints(s: str) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -271,17 +394,13 @@ def main(args):
     subset_val = _parse_kv_ints(getattr(args, "subset_val_per_sweep", ""))
     subset_seed = int(getattr(args, "subset_seed", 0))
 
-    # If user specifies train subset but not val, derive val per sweep by ratio.
     if subset_train and (not subset_val):
         val_total = int(getattr(args, "subset_val_total", 0))
         train_total = sum(subset_train.values())
         if val_total <= 0:
-            # default to 25% of train (matches 4000->1000)
             val_total = max(1, int(round(0.25 * train_total)))
-        # preserve per-sweep ratios
         for k, n in subset_train.items():
             subset_val[k] = int(round(val_total * (n / max(train_total, 1))))
-        # fix rounding drift so totals match exactly
         drift = val_total - sum(subset_val.values())
         if drift != 0 and subset_val:
             keys = sorted(subset_val.keys())
@@ -296,6 +415,13 @@ def main(args):
             split="train",
             train_fraction=args.train_fraction,
             normalize_eps=args.normalize_eps,
+            include_sdf=bool(getattr(args, "include_sdf", False)),
+            normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
+            sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
+            sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
+            sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
+            sdf_feature=str(getattr(args, "sdf_feature", "raw")),
+            sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
             use_shards=args.use_shards,
             shard_subdir=args.shard_subdir,
             shard_index_name=args.shard_index_name,
@@ -303,6 +429,9 @@ def main(args):
             subset_train_per_sweep=subset_train if subset_train else None,
             subset_val_per_sweep=subset_val if subset_train or subset_val else None,
             subset_seed=subset_seed,
+            crop_pml=bool(getattr(args, "crop_pml", False)),
+            pml_cells=int(getattr(args, "pml_cells", 0)),
+            return_aux=True,
         )
         stats = train_ds_tmp.get_stats()
     stats = broadcast_object(stats, src=0)
@@ -313,6 +442,13 @@ def main(args):
         train_fraction=args.train_fraction,
         stats=stats,
         normalize_eps=args.normalize_eps,
+        include_sdf=bool(getattr(args, "include_sdf", False)),
+        normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
+        sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
+        sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
+        sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
+        sdf_feature=str(getattr(args, "sdf_feature", "raw")),
+        sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
         use_shards=args.use_shards,
         shard_subdir=args.shard_subdir,
         shard_index_name=args.shard_index_name,
@@ -321,6 +457,8 @@ def main(args):
         subset_train_per_sweep=subset_train if subset_train else None,
         subset_val_per_sweep=subset_val if subset_train or subset_val else None,
         subset_seed=subset_seed,
+        crop_pml=bool(getattr(args, "crop_pml", False)),
+        pml_cells=int(getattr(args, "pml_cells", 0)),
     )
     val_ds = FDTDDataset(
         root_dir=args.data_root,
@@ -328,6 +466,13 @@ def main(args):
         train_fraction=args.train_fraction,
         stats=stats,
         normalize_eps=args.normalize_eps,
+        include_sdf=bool(getattr(args, "include_sdf", False)),
+        normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
+        sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
+        sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
+        sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
+        sdf_feature=str(getattr(args, "sdf_feature", "raw")),
+        sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
         use_shards=args.use_shards,
         shard_subdir=args.shard_subdir,
         shard_index_name=args.shard_index_name,
@@ -336,6 +481,8 @@ def main(args):
         subset_train_per_sweep=subset_train if subset_train else None,
         subset_val_per_sweep=subset_val if subset_train or subset_val else None,
         subset_seed=subset_seed,
+        crop_pml=bool(getattr(args, "crop_pml", False)),
+        pml_cells=int(getattr(args, "pml_cells", 0)),
     )
 
     train_sampler = DistributedSampler(
@@ -345,7 +492,6 @@ def main(args):
         val_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False
     )
 
-    # GLOBAL batch size semantics
     assert args.batch_size % world == 0, f"--batch-size (global) must be divisible by world_size={world}"
     per_gpu_batch = args.batch_size // world
 
@@ -382,26 +528,48 @@ def main(args):
     # -----------------------
     # Model / DDP
     # -----------------------
-    dx = args.dx
-    lam0 = args.lambda_um
+    dx = float(args.dx)
+    lam0 = float(args.lambda_um)
     omega = 2.0 * math.pi / lam0
 
-    base_model = PhysicsUNet(
-        in_channels=4,
+    in_channels = int(getattr(train_ds, "x_channels", int(stats.get("x_channels", 4))))
+    enable_physics = bool(getattr(args, "physics_features", True))
+    use_complex = bool(getattr(args, "complex_unet", False))
+
+    if is_rank0():
+        logger.info("Using ComplexPhysicsUNet" if use_complex else "Using PhysicsUNet")
+        logger.info("Physics features ENABLED" if enable_physics else "Physics features DISABLED (vanilla UNet ablation)")
+        try:
+            x0, _ = train_ds[0]
+            h, w = int(x0.shape[-2]), int(x0.shape[-1])
+            logger.info(f"Data resolution: {h}x{w} (attention at ds=8 => {h//8}x{w//8} tokens)")
+        except Exception as exc:  # pragma: no cover
+            logger.info(f"Data resolution: <unknown> (probe failed: {exc})")
+
+    model_kwargs = dict(
+        in_channels=in_channels,
         out_channels=2,
         model_channels=args.hidden_size,
         num_res_blocks=4,
-        channel_mult=(1, 2, 4, 8),
-        attention_resolutions=(),
+        channel_mult=(1, 2, 4, 8, 8),
+        attention_resolutions=(8,),
         dropout=0.0,
         dims=2,
-        use_checkpoint=False,
-        num_heads=1,
+        num_heads=4,
         cond_dim=int(getattr(train_ds, "cond_dim", 1)),
+        enable_sparam_head=(args.lambda_sparam > 0 and str(getattr(args, "sparam_mode", "project")) == "head"),
         dx=dx,
         dy=dx,
         omega=omega,
-    ).to(device)
+        pml_cells=int(getattr(args, "pml_cells", 0)),
+        enable_physics_features=enable_physics,
+        use_checkpoint=bool(getattr(args, "use_checkpoint", False)),
+    )
+
+    if use_complex:
+        base_model = ComplexPhysicsUNet(**model_kwargs).to(device)
+    else:
+        base_model = PhysicsUNet(**model_kwargs).to(device)
 
     base_model.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
@@ -410,13 +578,34 @@ def main(args):
         p.requires_grad = False
     ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
-    model = DDP(base_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    enable_head = bool(getattr(base_model, "enable_sparam_head", False))
+    ddp_find_unused = bool(
+        enable_head and (
+            int(getattr(args, "sparam_every", 1)) != 1
+            or (not bool(getattr(args, "sparam_from_start", False)))
+        )
+    )
+
+    model = DDP(
+        base_model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=ddp_find_unused,
+        broadcast_buffers=False,
+    )
 
     if is_rank0():
         logger.info(f"Model params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
-    scaler = GradScaler("cuda", enabled=bool(getattr(args, "amp", True)))
+
+    amp_enabled = bool(getattr(args, "amp", True))
+    if _AMP_NEW_API:
+        scaler = _GradScaler("cuda", enabled=amp_enabled)
+        autocast_device_type = "cuda"
+    else:
+        scaler = _GradScaler(enabled=amp_enabled)
+        autocast_device_type = "cuda"
     amp_enabled = scaler.is_enabled()
 
     def optimizer_step():
@@ -426,28 +615,25 @@ def main(args):
         else:
             opt.step()
 
-    # Smooth LR schedule: linear warmup -> cosine decay (no phase jumps).
     warmup_epochs = int(getattr(args, "warmup_epochs", 0))
-    min_lr = float(getattr(args, "min_lr", 5e-6))
-    min_lr = max(min_lr, 0.0)
-
+    min_lr = max(float(getattr(args, "min_lr", 5e-6)), 0.0)
     if warmup_epochs > 0:
-        # Ramp from warmup_start_factor * lr to lr over warmup_epochs epochs.
         warmup_start_factor = float(getattr(args, "warmup_start_factor", 0.1))
         warmup_start_factor = min(max(warmup_start_factor, 1e-6), 1.0)
         warmup = LinearLR(opt, start_factor=warmup_start_factor, total_iters=warmup_epochs)
-
-        # Cosine over the remaining epochs, starting after warmup.
         cos_T = max(1, args.epochs - warmup_epochs)
         cosine = CosineAnnealingLR(opt, T_max=cos_T, eta_min=min_lr)
         scheduler = SequentialLR(opt, schedulers=[warmup, cosine], milestones=[warmup_epochs])
     else:
         scheduler = CosineAnnealingLR(opt, T_max=args.epochs, eta_min=min_lr)
 
-    pml_cells = 30
+    pml_cells = int(getattr(args, "pml_cells", 0))
     helmholtz_op = HelmholtzResidual2D(
-        dx=args.dx, dy=args.dx, omega=omega, pml_cells=pml_cells, normalize=False
+        dx=dx, dy=dx, omega=omega, pml_cells=pml_cells, normalize=False
     ).to(device)
+
+    _ensure_model_pml_cells(model, pml_cells=pml_cells)
+    _ensure_model_pml_cells(ema, pml_cells=pml_cells)
 
     update_ema(ema, model.module, decay=0.0)
 
@@ -459,12 +645,18 @@ def main(args):
         if is_rank0():
             logger.info(f"Resuming from {args.resume_from}")
             checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
-            model.module.load_state_dict(checkpoint["model"], strict=True)
-            ema.load_state_dict(checkpoint["ema"], strict=True)
+            m_ret = model.module.load_state_dict(checkpoint["model"], strict=False)
+            e_ret = ema.load_state_dict(checkpoint["ema"], strict=False)
+            if m_ret.missing_keys or m_ret.unexpected_keys:
+                logger.info(f"Resume(model) missing={len(m_ret.missing_keys)} unexpected={len(m_ret.unexpected_keys)}")
+            if e_ret.missing_keys or e_ret.unexpected_keys:
+                logger.info(f"Resume(ema) missing={len(e_ret.missing_keys)} unexpected={len(e_ret.unexpected_keys)}")
             opt.load_state_dict(checkpoint["opt"])
-
             model.module.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
             ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+
+            _ensure_model_pml_cells(model, pml_cells=pml_cells)
+            _ensure_model_pml_cells(ema, pml_cells=pml_cells)
 
         try:
             ckpt_name = os.path.basename(args.resume_from)
@@ -475,47 +667,37 @@ def main(args):
         scheduler.last_epoch = last_epoch
 
     # -----------------------
-    # Train settings
+    # Training settings
     # -----------------------
     use_config = bool(args.config)
+    config_method = str(getattr(args, "config_method", "pcgrad")).strip().lower()
+    config_start_epoch = max(1, int(getattr(args, "config_start_epoch", 1)))
     use_endpoint = args.lambda_endpoint > 0
     use_residual = args.lambda_residual > 0
     use_phase = args.lambda_phase > 0
     use_phase_grad = args.lambda_phase_grad > 0
     use_sparam = args.lambda_sparam > 0
 
-    # Optional dependency: conflictfree (only needed when --config is enabled).
     ConFIG_update = None
-    apply_gradient_vector = None
-    get_gradient_vector = None
-    if use_config:
+    if use_config and config_method == "config":
         try:
             from conflictfree.grad_operator import ConFIG_update as _ConFIG_update
-            from conflictfree.utils import apply_gradient_vector as _apply_gradient_vector
-            from conflictfree.utils import get_gradient_vector as _get_gradient_vector
             ConFIG_update = _ConFIG_update
-            apply_gradient_vector = _apply_gradient_vector
-            get_gradient_vector = _get_gradient_vector
         except Exception as e:
             if is_rank0():
-                logger.warning(
-                    f"--config enabled but 'conflictfree' is not available ({type(e).__name__}: {e}). "
-                    "Disabling ConFIG; continuing with standard weighted loss."
-                )
-            use_config = False
+                logger.warning(f"'conflictfree' not available ({type(e).__name__}: {e}); falling back to pcgrad.")
+            config_method = "pcgrad"
 
     config_failed = False
 
     lam_mean = float(stats["lambda_um_mean"])
     lam_std = float(stats["lambda_um_std"])
 
-    # persist conditioning shape for checkpoint consumers (e.g., Model/sample.py)
     try:
         args.cond_dim = int(getattr(train_ds, "cond_dim", 1))
     except Exception:
         args.cond_dim = 1
 
-    # running averages (epoch-local)
     running_fm_loss = 0.0
     running_residual_loss = 0.0
     running_phase_loss = 0.0
@@ -526,97 +708,102 @@ def main(args):
     phase_grad_steps_epoch = 0
     sparam_steps_epoch = 0
     start_time = time()
-
     global_step = 0
 
     if is_rank0():
         logger.info(f"Training for {args.epochs} epochs, starting at epoch {start_epoch}")
         logger.info(f"Schedule: PhaseA<= {args.phaseA_epochs}, PhaseB<= {args.phaseB_epochs}, PhaseC> {args.phaseB_epochs}")
-        logger.info(f"ConFIG enabled: {use_config}")
+        cfg_log = f"enabled={use_config} start_epoch={config_start_epoch}" if use_config else "disabled"
+        logger.info(f"Conflict-free grads: {cfg_log} method={config_method if use_config else 'off'}")
+
+    detect_anomaly = bool(getattr(args, "detect_anomaly", False))
+    if detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+        if is_rank0():
+            logger.info("Autograd anomaly detection ENABLED (--detect-anomaly).")
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_sampler.set_epoch(epoch)
 
-        # -----------------------
-        # Curriculum schedule (A/B/C)
-        # -----------------------
-        N1 = args.phaseA_epochs
-        N2 = args.phaseB_epochs
+        N1 = int(args.phaseA_epochs)
+        N2 = int(args.phaseB_epochs)
 
-        # Endpoint weight
-        endpoint_weight = args.lambda_endpoint
-        if args.endpoint_warmup_epochs > 0 and endpoint_weight > 0:
-            endpoint_weight *= min(1.0, epoch / args.endpoint_warmup_epochs)
+        endpoint_weight = float(args.lambda_endpoint)
+        if int(args.endpoint_warmup_epochs) > 0 and endpoint_weight > 0:
+            endpoint_weight *= min(1.0, epoch / float(args.endpoint_warmup_epochs))
 
-        # Residual weight
-        if use_residual and epoch > N1:
-            residual_weight = args.lambda_residual * ramp_linear(epoch, start_epoch=N1, warmup_epochs=args.residual_warmup_epochs)
+        if use_residual:
+            residual_start = 0 if getattr(args, "residual_start_phase", "B") == "A" else N1
+            residual_weight = float(args.lambda_residual) * ramp_linear(
+                epoch, start_epoch=residual_start, warmup_epochs=int(args.residual_warmup_epochs)
+            )
         else:
             residual_weight = 0.0
 
-        # Phase weight
-        if use_phase and epoch > N2:
-            phase_weight = args.lambda_phase * ramp_linear(epoch, start_epoch=N2, warmup_epochs=args.phase_warmup_epochs)
+        if use_phase:
+            phase_start = _phase_start_epoch(getattr(args, "phase_start_phase", "C"), N1=N1, N2=N2)
+            phase_weight = float(args.lambda_phase) * ramp_linear(
+                epoch, start_epoch=phase_start, warmup_epochs=int(args.phase_warmup_epochs)
+            )
         else:
             phase_weight = 0.0
 
-        # Feature gates (0..1)
         phys_gate = 0.0
-        if args.lambda_residual > 0:
-            phys_gate = float(residual_weight / args.lambda_residual)
+        if float(args.lambda_residual) > 0:
+            phys_gate = float(residual_weight / float(args.lambda_residual))
             phys_gate = max(0.0, min(1.0, phys_gate))
 
         phase_gate = 0.0
-        if args.lambda_phase > 0:
-            phase_gate = float(phase_weight / args.lambda_phase)
+        if float(args.lambda_phase) > 0:
+            phase_gate = float(phase_weight / float(args.lambda_phase))
             phase_gate = max(0.0, min(1.0, phase_gate))
 
-        # Phase-grad weight (sparse)
-        if use_phase_grad and epoch > N2:
-            phase_grad_weight = args.lambda_phase_grad * ramp_linear(epoch, start_epoch=N2, warmup_epochs=args.phase_grad_warmup_epochs)
+        if use_phase_grad:
+            phase_grad_start = _phase_start_epoch(getattr(args, "phase_grad_start_phase", "C"), N1=N1, N2=N2)
+            phase_grad_weight = float(args.lambda_phase_grad) * ramp_linear(
+                epoch, start_epoch=phase_grad_start, warmup_epochs=int(args.phase_grad_warmup_epochs)
+            )
         else:
             phase_grad_weight = 0.0
 
         compute_phase_epoch = (phase_weight > 0.0)
 
-        # S-parameter weight (sparse)
         if use_sparam:
-            if args.sparam_start_phase == "B":
-                sparam_start = N1
-            else:
-                sparam_start = N2
-
-            if epoch > sparam_start:
-                sparam_weight = args.lambda_sparam * ramp_linear(
-                    epoch, start_epoch=sparam_start, warmup_epochs=args.sparam_warmup_epochs
+            if bool(getattr(args, "sparam_from_start", False)):
+                sparam_weight = float(args.lambda_sparam) * ramp_linear(
+                    epoch, start_epoch=0, warmup_epochs=int(args.sparam_warmup_epochs)
                 )
             else:
-                sparam_weight = 0.0
+                sp_phase = str(getattr(args, "sparam_start_phase", "C")).strip().upper()
+                if sp_phase == "A":
+                    sparam_start = 0
+                elif sp_phase == "B":
+                    sparam_start = N1
+                else:
+                    sparam_start = N2
+                sparam_weight = float(args.lambda_sparam) * ramp_linear(
+                    epoch, start_epoch=sparam_start, warmup_epochs=int(args.sparam_warmup_epochs)
+                )
         else:
             sparam_weight = 0.0
 
-        # device-focus schedule
         focus_start = 1.0
         focus_end = 1.0
-        if args.device_focus_warmup_epochs > 0:
-            ramp = min(1.0, epoch / args.device_focus_warmup_epochs)
+        if int(args.device_focus_warmup_epochs) > 0:
+            ramp = min(1.0, epoch / float(args.device_focus_warmup_epochs))
         else:
             ramp = 1.0
-        device_focus = focus_start + (args.device_focus_max - focus_start) * ramp
-
-        if args.device_focus_hold_epochs > 0:
-            if epoch <= args.device_focus_warmup_epochs + args.device_focus_hold_epochs:
-                device_focus = args.device_focus_max
-        if args.device_focus_decay_epochs > 0:
-            e0 = args.device_focus_warmup_epochs + args.device_focus_hold_epochs
+        device_focus = focus_start + (float(args.device_focus_max) - focus_start) * ramp
+        if int(args.device_focus_hold_epochs) > 0:
+            if epoch <= int(args.device_focus_warmup_epochs) + int(args.device_focus_hold_epochs):
+                device_focus = float(args.device_focus_max)
+        if int(args.device_focus_decay_epochs) > 0:
+            e0 = int(args.device_focus_warmup_epochs) + int(args.device_focus_hold_epochs)
             if epoch > e0:
-                frac = min(1.0, (epoch - e0) / args.device_focus_decay_epochs)
+                frac = min(1.0, (epoch - e0) / float(args.device_focus_decay_epochs))
                 device_focus = device_focus * (1.0 - frac) + focus_end * frac
 
-        # -----------------------
-        # Train loop
-        # -----------------------
         for x_full, cond, aux in train_loader:
             x_full = x_full.to(device, dtype=dtype, non_blocking=True)
             cond = cond.to(device, dtype=dtype, non_blocking=True)
@@ -625,256 +812,186 @@ def main(args):
             fields_1 = x_full[:, 0:2]
             eps = x_full[:, 2:3]
             src = x_full[:, 3:4]
-            # cond[0] is lambda_norm by construction (see Model/dataset.py)
+            extra_maps = x_full[:, 4:] if x_full.shape[1] > 4 else None
+
             lambda_um = cond[:, 0:1] * lam_std + lam_mean  # [B,1] physical
 
             x0_fields = torch.randn_like(fields_1)
-            with autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-                t = sample_t(fields_1)  # [B,1,1,1]
-                x_t_fields = psi_t(x0_fields, fields_1, t)
-                v_t_fields = u_t(x0_fields, fields_1)
+            t = sample_t(fields_1)  # [B,1,1,1]
+            x_t_fields = psi_t(x0_fields, fields_1, t)
+            v_t_fields = u_t(x0_fields, fields_1)
+
+            if extra_maps is not None:
+                x_t_input = torch.cat([x_t_fields, eps, src, extra_maps], dim=1)
+            else:
                 x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
 
-                compute_phase_grad_step = (phase_grad_weight > 0.0) and (global_step % args.phase_grad_every == 0)
-                compute_sparam_step = (sparam_weight > 0.0) and (global_step % args.sparam_every == 0)
-                compute_residual_step = (residual_weight > 0.0)
+            compute_phase_grad_step = (phase_grad_weight > 0.0) and (global_step % int(args.phase_grad_every) == 0)
+            compute_sparam_step = (sparam_weight > 0.0) and (global_step % int(args.sparam_every) == 0)
+            compute_residual_step = (residual_weight > 0.0)
 
-                fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad_loss, sparam_loss = cfm_loss_residual(
-                    model,
-                    x_t_input,
-                    t,
-                    v_t_fields,
-                    helmholtz_op,
-                    stats,
-                    args.normalize_eps,
-                    fields_1,
-                    cond=cond,
-                    lambda_um=lambda_um,
-                    aux=aux,
-                    compute_sparam=compute_sparam_step,
-                    device_focus=device_focus,
-                    w_min=args.w_min,
-                    eps_thr=args.eps_thr,
-                    dilate=args.dilate,
-                    weight_residual=True,
-                    compute_endpoint=use_endpoint,
-                    compute_phase=compute_phase_epoch,
-                    compute_phase_grad=compute_phase_grad_step,
-                    phys_gate=phys_gate,
-                    phase_gate=phase_gate,
-                    compute_residual=compute_residual_step,
-                )
+            fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad_loss, sparam_loss = cfm_loss_residual(
+                model,
+                x_t_input,
+                t,
+                v_t_fields,
+                helmholtz_op,
+                stats,
+                args.normalize_eps,
+                fields_1,
+                cond=cond,
+                lambda_um=lambda_um,
+                aux=aux,
+                compute_sparam=compute_sparam_step,
+                device_focus=device_focus,
+                w_min=args.w_min,
+                eps_thr=args.eps_thr,
+                dilate=args.dilate,
+                weight_residual=True,
+                compute_endpoint=use_endpoint,
+                compute_phase=compute_phase_epoch,
+                compute_phase_grad=compute_phase_grad_step,
+                phys_gate=phys_gate,
+                phase_gate=phase_gate,
+                compute_residual=compute_residual_step,
+                unroll_steps=int(getattr(args, "unroll_steps", 0)),
+                unroll_phase=bool(getattr(args, "unroll_phase", False)),
+                phase_amp_tau=float(getattr(args, "phase_amp_tau", 0.2)),
+                amp_enabled=amp_enabled,
+                amp_device_type=autocast_device_type,
+                amp_dtype=torch.float16,
+                sparam_mode=str(getattr(args, "sparam_mode", "project")),
+            )
 
-                # scale residual to grid units
-                residual_loss = residual_loss * (args.dx ** 4)
+            residual_loss = residual_loss * (dx ** 4)
 
             # -----------------------
-            # Backprop
+            # Step
             # -----------------------
-            if use_config and (not config_failed):
+            opt.zero_grad(set_to_none=True)
+
+            config_active = bool(use_config) and (epoch >= config_start_epoch) and (not config_failed)
+            if config_active:
                 eps_cfg = float(args.config_eps)
 
-                opt.zero_grad(set_to_none=True)
-                if scaler.is_enabled():
-                    scaler.scale(fm_loss).backward(retain_graph=True)
-                    scaler.unscale_(opt)
-                else:
-                    fm_loss.backward(retain_graph=True)
-                g_fm = get_gradient_vector(model.module).detach()
-                opt.zero_grad(set_to_none=True)
+                # One synchronized AMP scale per step
+                scale_val = ddp_broadcast_amp_scale(scaler, device)
 
+                loss_items: list[tuple[str, torch.Tensor, float]] = [("fm", fm_loss, 1.0)]
                 if residual_weight > 0.0:
-                    if scaler.is_enabled():
-                        scaler.scale(residual_loss).backward(retain_graph=True)
-                        scaler.unscale_(opt)
-                    else:
-                        residual_loss.backward(retain_graph=True)
-                    g_res = get_gradient_vector(model.module).detach()
-                else:
-                    g_res = None
-                opt.zero_grad(set_to_none=True)
-
+                    loss_items.append(("res", residual_loss, float(residual_weight)))
                 if phase_weight > 0.0:
-                    if scaler.is_enabled():
-                        scaler.scale(phase_loss).backward(retain_graph=True)
-                        scaler.unscale_(opt)
-                    else:
-                        phase_loss.backward(retain_graph=True)
-                    g_phase = get_gradient_vector(model.module).detach()
-                else:
-                    g_phase = None
-                opt.zero_grad(set_to_none=True)
-
+                    loss_items.append(("phase", phase_loss, float(phase_weight)))
                 if endpoint_weight > 0.0:
-                    if scaler.is_enabled():
-                        scaler.scale(endpoint_loss).backward(retain_graph=True)
-                        scaler.unscale_(opt)
-                    else:
-                        endpoint_loss.backward(retain_graph=True)
-                    g_end = get_gradient_vector(model.module).detach()
-                else:
-                    g_end = None
-                opt.zero_grad(set_to_none=True)
+                    loss_items.append(("end", endpoint_loss, float(endpoint_weight)))
+                if compute_phase_grad_step and phase_grad_weight > 0.0:
+                    loss_items.append(("phg", phase_grad_loss, float(phase_grad_weight)))
+                if compute_sparam_step and sparam_weight > 0.0:
+                    loss_items.append(("sp", sparam_loss, float(sparam_weight)))
 
-                if compute_phase_grad_step and (phase_grad_weight > 0.0):
-                    if scaler.is_enabled():
-                        scaler.scale(phase_grad_loss).backward(retain_graph=True)
-                        scaler.unscale_(opt)
-                    else:
-                        phase_grad_loss.backward(retain_graph=True)
-                    g_phg = get_gradient_vector(model.module).detach()
-                else:
-                    g_phg = None
-                opt.zero_grad(set_to_none=True)
+                grad_vecs_unscaled: dict[str, torch.Tensor] = {}
+                for i, (name, L, w) in enumerate(loss_items):
+                    retain = (i != len(loss_items) - 1)
 
-                if compute_sparam_step and (sparam_weight > 0.0):
-                    if scaler.is_enabled():
-                        scaler.scale(sparam_loss).backward(retain_graph=True)
-                        scaler.unscale_(opt)
-                    else:
-                        sparam_loss.backward(retain_graph=True)
-                    g_sp = get_gradient_vector(model.module).detach()
-                else:
-                    g_sp = None
-                opt.zero_grad(set_to_none=True)
+                    L_for_grad = (L * scale_val) if (scale_val != 1.0) else L
+                    g_scaled = compute_grad_vector(L_for_grad, model.module, retain_graph=retain)
 
-                # DDP-average
-                ddp_allreduce_mean_(g_fm)
-                if g_res is not None:
-                    ddp_allreduce_mean_(g_res)
-                if g_phase is not None:
-                    ddp_allreduce_mean_(g_phase)
-                if g_end is not None:
-                    ddp_allreduce_mean_(g_end)
-                if g_phg is not None:
-                    ddp_allreduce_mean_(g_phg)
-                if g_sp is not None:
-                    ddp_allreduce_mean_(g_sp)
+                    # Unscale before collective
+                    g = (g_scaled / scale_val) if (scale_val != 1.0) else g_scaled
+                    ddp_allreduce_mean_(g)
+                    grad_vecs_unscaled[name] = g
 
-                # ConFIG diagnostics
-                do_cfg_log = (is_rank0() and (global_step % int(args.config_log_every) == 0))
+                do_cfg_log = is_rank0() and (global_step % int(args.config_log_every) == 0)
                 if do_cfg_log:
-                    grad_dict = {"fm": g_fm, "res": g_res, "phase": g_phase, "end": g_end, "phg": g_phg, "sp": g_sp}
-                    w_dict = {
-                        "fm": 1.0,
-                        "res": float(residual_weight),
-                        "phase": float(phase_weight),
-                        "end": float(endpoint_weight),
-                        "phg": float(phase_grad_weight),
-                        "sp": float(sparam_weight),
-                    }
-
                     lines = []
-                    for name, g in grad_dict.items():
+                    for name, _, w in loss_items:
+                        g = grad_vecs_unscaled.get(name, None)
                         if g is None:
                             lines.append(f"{name}: None")
                             continue
-                        n = _norm(g)
-                        ff = _finite_frac(g)
-                        mx = float(g.abs().max().item())
-                        mn = float(g.abs().mean().item())
                         lines.append(
-                            f"{name}: w={w_dict[name]:.3g} ||g||={n:.3e} finite={ff:.3f} |g|max={mx:.3e} |g|mean={mn:.3e}"
+                            f"{name}: w={w:.3g} ||g||={_norm(g):.3e} finite={_finite_frac(g):.3f} "
+                            f"|g|max={float(g.abs().max().item()):.3e} |g|mean={float(g.abs().mean().item()):.3e}"
                         )
-
                     cos_lines = []
+                    g_fm = grad_vecs_unscaled["fm"]
                     for name in ["res", "phase", "end", "phg", "sp"]:
-                        g = grad_dict.get(name, None)
-                        if g is None:
-                            continue
-                        cos_lines.append(f"cos(fm,{name})={_cos(g_fm, g):+.3f}")
-
+                        if name in grad_vecs_unscaled:
+                            cos_lines.append(f"cos(fm,{name})={_cos(g_fm, grad_vecs_unscaled[name]):+.3f}")
                     logger.info(
-                        "[ConFIG dbg] "
-                        f"epoch={epoch} step={global_step} "
-                        f"compute_phg={int(compute_phase_grad_step)} compute_sp={int(compute_sparam_step)} "
-                        f"weights: res={residual_weight:.3g} phase={phase_weight:.3g} end={endpoint_weight:.3g} "
-                        f"phg={phase_grad_weight:.3g} sp={sparam_weight:.3g} | "
+                        f"[CFG dbg] epoch={epoch} step={global_step} "
+                        f"phg={int(compute_phase_grad_step)} sp={int(compute_sparam_step)} | "
                         + " | ".join(lines)
                         + (" | " + " ".join(cos_lines) if cos_lines else "")
                     )
 
-                # Build active task list
-                tasks = [("fm", g_fm, 1.0)]  # anchor
-
-                def _maybe_add(name, g, weight):
+                tasks: list[tuple[str, torch.Tensor, float]] = []
+                for name, _, w in loss_items:
+                    g = grad_vecs_unscaled.get(name, None)
                     if g is None:
-                        return
+                        continue
                     if not torch.isfinite(g).all():
-                        return
+                        continue
                     n = torch.linalg.norm(g)
-                    if not torch.isfinite(n) or n.item() < eps_cfg:
-                        return
-                    if float(weight) <= 0.0:
-                        return
-                    tasks.append((name, g, float(weight)))
+                    if (not torch.isfinite(n)) or (n.item() < eps_cfg):
+                        continue
+                    if float(w) <= 0.0:
+                        continue
+                    tasks.append((name, g, float(w)))
 
-                _maybe_add("res", g_res, residual_weight)
-                _maybe_add("phase", g_phase, phase_weight)
-                _maybe_add("end", g_end, endpoint_weight)
-                _maybe_add("phg", g_phg, phase_grad_weight)
-                _maybe_add("sp", g_sp, sparam_weight)
+                if len(tasks) == 0:
+                    tasks = [("fm", grad_vecs_unscaled["fm"], 1.0)]
 
-                if do_cfg_log:
-                    kept = [(n, _norm(g), w) for (n, g, w) in tasks]
-                    logger.info(f"[ConFIG dbg] kept_tasks={kept} eps_cfg={eps_cfg:.1e} normalize={int(args.config_normalize)}")
+                grads_unscaled: list[torch.Tensor] = []
+                for _, g, w in tasks:
+                    if bool(args.config_normalize):
+                        g = g / torch.linalg.norm(g).clamp_min(eps_cfg)
+                    grads_unscaled.append(g * w)
 
-                if len(tasks) == 1:
-                    apply_gradient_vector(model.module, tasks[0][1])
-                    if scaler.is_enabled():
-                        scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    optimizer_step()
-                else:
-                    grads = []
-                    weights = []
-                    norms = []
-                    for _, g, w in tasks:
-                        grads.append(g)
-                        weights.append(w)
-                        norms.append(torch.linalg.norm(g).clamp_min(eps_cfg))
-
-                    if args.config_normalize:
-                        grads = [(g / n) for g, n in zip(grads, norms)]
-                    grads = [g * w for g, w in zip(grads, weights)]
-
-                    try:
-                        grads64 = [g.double() for g in grads]
-                        g_cfg = ConFIG_update(grads64).float()
-
-                        if do_cfg_log:
-                            logger.info(f"[ConFIG dbg] g_cfg ||g||={_norm(g_cfg):.3e} finite={_finite_frac(g_cfg):.3f}")
-
-                        if not torch.isfinite(g_cfg).all():
-                            raise ValueError("ConFIG produced non-finite grad")
-
-                        apply_gradient_vector(model.module, g_cfg)
-
-                    except Exception as e:
-                        if is_rank0():
-                            logger.warning(f"ConFIG step failed: {type(e).__name__}: {e} | fallback=sum(grads)")
-
-                        g_sum = torch.zeros_like(g_fm)
-                        for g in grads:
+                try:
+                    if config_method == "pcgrad":
+                        g_cfg_unscaled = pcgrad_update(grads_unscaled)
+                    elif config_method == "sum":
+                        g_cfg_unscaled = torch.zeros_like(grads_unscaled[0])
+                        for g in grads_unscaled:
                             if torch.isfinite(g).all():
-                                g_sum += g
-                        apply_gradient_vector(model.module, g_sum)
+                                g_cfg_unscaled += g
+                    else:
+                        if ConFIG_update is None:
+                            raise RuntimeError("ConFIG_update unavailable")
+                        grads64 = [g.double() for g in grads_unscaled]
+                        g_cfg_unscaled = ConFIG_update(grads64).float()
 
-                        if not hasattr(main, "_cfg_fail_count"):
-                            main._cfg_fail_count = 0
-                        main._cfg_fail_count += 1
-                        if main._cfg_fail_count >= int(args.config_fail_max):
-                            if is_rank0():
-                                logger.warning("ConFIG failed too many times; disabling permanently.")
-                            config_failed = True
+                    if not torch.isfinite(g_cfg_unscaled).all():
+                        raise ValueError("config-method produced non-finite grad")
 
-                    if scaler.is_enabled():
-                        scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    optimizer_step()
+                except Exception as e:
+                    if is_rank0():
+                        logger.warning(
+                            f"Conflict-free step failed ({config_method}): {type(e).__name__}: {e} | fallback=sum"
+                        )
+                    g_cfg_unscaled = torch.zeros_like(grads_unscaled[0])
+                    for g in grads_unscaled:
+                        if torch.isfinite(g).all():
+                            g_cfg_unscaled += g
+                    if not hasattr(main, "_cfg_fail_count"):
+                        main._cfg_fail_count = 0
+                    main._cfg_fail_count += 1
+                    if main._cfg_fail_count >= int(args.config_fail_max):
+                        if is_rank0():
+                            logger.warning("Conflict-free method failed too many times; disabling permanently.")
+                        config_failed = True
+
+                # Scale once at the end so scaler.unscale_(opt) works
+                g_cfg_scaled = (g_cfg_unscaled * scale_val) if (scale_val != 1.0) else g_cfg_unscaled
+                apply_gradient_vector_local(model.module, g_cfg_scaled)
+
+                if scaler.is_enabled():
+                    scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer_step()
 
             else:
-                opt.zero_grad(set_to_none=True)
                 total_loss = fm_loss
                 if endpoint_weight > 0.0:
                     total_loss = total_loss + endpoint_weight * endpoint_loss
@@ -882,43 +999,55 @@ def main(args):
                     total_loss = total_loss + residual_weight * residual_loss
                 if phase_weight > 0.0:
                     total_loss = total_loss + phase_weight * phase_loss
-                if compute_phase_grad_step and (phase_grad_weight > 0.0):
+                if compute_phase_grad_step and phase_grad_weight > 0.0:
                     total_loss = total_loss + phase_grad_weight * phase_grad_loss
-                if compute_sparam_step and (sparam_weight > 0.0):
+                if compute_sparam_step and sparam_weight > 0.0:
                     total_loss = total_loss + sparam_weight * sparam_loss
 
-                if scaler.is_enabled():
-                    scaler.scale(total_loss).backward()
-                    scaler.unscale_(opt)
-                else:
-                    total_loss.backward()
+                try:
+                    if scaler.is_enabled():
+                        scaler.scale(total_loss).backward()
+                        scaler.unscale_(opt)
+                    else:
+                        total_loss.backward()
+                except RuntimeError as e:
+                    if is_rank0():
+                        logger.error(
+                            "Backward failed. Context:\n"
+                            f"  epoch={epoch} global_step={global_step}\n"
+                            f"  weights: w_res={residual_weight:.6g} w_phase={phase_weight:.6g} "
+                            f"w_end={endpoint_weight:.6g} w_phg={phase_grad_weight:.6g} w_sp={sparam_weight:.6g}\n"
+                            f"  compute: residual={compute_residual_step} phase={compute_phase_epoch} "
+                            f"phg_step={compute_phase_grad_step} sp_step={compute_sparam_step}\n"
+                            f"  amp={bool(scaler.is_enabled())} detect_anomaly={bool(detect_anomaly)}\n"
+                            f"  error: {type(e).__name__}: {e}"
+                        )
+                    raise
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer_step()
 
             update_ema(ema, model.module)
 
-            # -----------------------
-            # Logging accumulation
-            # -----------------------
-            running_fm_loss += fm_loss.item()
-            running_residual_loss += residual_loss.item()
-            running_phase_loss += phase_loss.item()
+            running_fm_loss += float(fm_loss.item())
+            running_residual_loss += float(residual_loss.item())
+            if phase_weight > 0.0:
+                running_phase_loss += float(phase_loss.item())
             if use_endpoint:
-                running_endpoint_loss += endpoint_loss.item()
+                running_endpoint_loss += float(endpoint_loss.item())
             if compute_phase_grad_step:
-                running_phase_grad_loss += phase_grad_loss.item()
+                running_phase_grad_loss += float(phase_grad_loss.item())
                 phase_grad_steps_epoch += 1
             if compute_sparam_step:
-                running_sparam_loss += sparam_loss.item()
+                running_sparam_loss += float(sparam_loss.item())
                 sparam_steps_epoch += 1
 
             train_steps_epoch += 1
             global_step += 1
 
         # -----------------------
-        # Validation (DDP-averaged)
+        # Validation
         # -----------------------
-        if epoch % args.eval_every == 0:
+        if epoch % int(args.eval_every) == 0:
             model.eval()
             ema.eval()
 
@@ -930,69 +1059,130 @@ def main(args):
                 eval_phase_grad = 0.0
                 eval_sparam = 0.0
                 eval_steps = 0
+                sparams_example = None
 
-                max_val_batches = args.val_batches
+                max_val_batches = int(args.val_batches)
 
                 for i, (x_full, cond, aux) in enumerate(val_loader):
                     x_full = x_full.to(device, dtype=dtype, non_blocking=True)
                     cond = cond.to(device, dtype=dtype, non_blocking=True)
                     aux = _move_aux_to_device(aux, device)
 
-                    with autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-                        fields_1 = x_full[:, 0:2]
-                        eps = x_full[:, 2:3]
-                        src = x_full[:, 3:4]
-                        lambda_um = cond[:, 0:1] * lam_std + lam_mean
+                    fields_1 = x_full[:, 0:2]
+                    eps = x_full[:, 2:3]
+                    src = x_full[:, 3:4]
+                    extra_maps = x_full[:, 4:] if x_full.shape[1] > 4 else None
+                    lambda_um = cond[:, 0:1] * lam_std + lam_mean
 
-                        x0_fields = torch.randn_like(fields_1)
-                        t = sample_t(fields_1)
-                        x_t_fields = psi_t(x0_fields, fields_1, t)
-                        v_t_fields = u_t(x0_fields, fields_1)
+                    x0_fields = torch.randn_like(fields_1)
+                    t = sample_t(fields_1)
+                    x_t_fields = psi_t(x0_fields, fields_1, t)
+                    v_t_fields = u_t(x0_fields, fields_1)
+
+                    if extra_maps is not None:
+                        x_t_input = torch.cat([x_t_fields, eps, src, extra_maps], dim=1)
+                    else:
                         x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
 
-                        compute_phase_grad_val = (phase_grad_weight > 0.0)
-                        compute_residual_val = (residual_weight > 0.0)
+                    compute_phase_grad_val = (phase_grad_weight > 0.0)
+                    compute_residual_val = (residual_weight > 0.0)
+                    compute_sparam_val = (sparam_weight > 0.0)
 
-                        # In val, you can compute sparam every batch (cheap) or keep it gated:
-                        compute_sparam_val = (sparam_weight > 0.0)
+                    fm_v, res_v, ph_v, end_v, phg_v, sp_v = cfm_loss_residual(
+                        ema,
+                        x_t_input,
+                        t,
+                        v_t_fields,
+                        helmholtz_op,
+                        stats,
+                        args.normalize_eps,
+                        fields_1,
+                        cond=cond,
+                        lambda_um=lambda_um,
+                        aux=aux,
+                        compute_sparam=compute_sparam_val,
+                        device_focus=device_focus,
+                        w_min=args.w_min,
+                        eps_thr=args.eps_thr,
+                        dilate=args.dilate,
+                        weight_residual=True,
+                        compute_endpoint=use_endpoint,
+                        compute_phase=compute_phase_epoch,
+                        compute_phase_grad=compute_phase_grad_val,
+                        phys_gate=phys_gate,
+                        phase_gate=phase_gate,
+                        compute_residual=compute_residual_val,
+                        unroll_steps=int(getattr(args, "unroll_steps", 0)),
+                        unroll_phase=bool(getattr(args, "unroll_phase", False)),
+                        phase_amp_tau=float(getattr(args, "phase_amp_tau", 0.2)),
+                        amp_enabled=amp_enabled,
+                        amp_device_type=autocast_device_type,
+                        amp_dtype=torch.float16,
+                        sparam_mode=str(getattr(args, "sparam_mode", "project")),
+                    )
 
-                        fm_v, res_v, ph_v, end_v, phg_v, sp_v = cfm_loss_residual(
-                            ema,
-                            x_t_input,
-                            t,
-                            v_t_fields,
-                            helmholtz_op,
-                            stats,
-                            args.normalize_eps,
-                            fields_1,
-                            cond=cond,
-                            lambda_um=lambda_um,
-                            aux=aux,
-                            compute_sparam=compute_sparam_val,
-                            device_focus=device_focus,
-                            w_min=args.w_min,
-                            eps_thr=args.eps_thr,
-                            dilate=args.dilate,
-                            weight_residual=True,
-                            compute_endpoint=use_endpoint,
-                            compute_phase=compute_phase_epoch,
-                            compute_phase_grad=compute_phase_grad_val,
-                            phys_gate=phys_gate,
-                            phase_gate=phase_gate,
-                            compute_residual=compute_residual_val,
-                        )
+                    res_v = res_v * (dx ** 4)
 
-                        res_v = res_v * (args.dx ** 4)
-
-                    eval_fm += fm_v.item()
-                    eval_res += res_v.item()
-                    eval_phase += ph_v.item()
+                    eval_fm += float(fm_v.item())
+                    eval_res += float(res_v.item())
+                    if phase_weight > 0.0:
+                        eval_phase += float(ph_v.item())
                     if use_endpoint:
-                        eval_endpoint += end_v.item()
+                        eval_endpoint += float(end_v.item())
                     if compute_phase_grad_val:
-                        eval_phase_grad += phg_v.item()
+                        eval_phase_grad += float(phg_v.item())
                     if compute_sparam_val:
-                        eval_sparam += sp_v.item()
+                        eval_sparam += float(sp_v.item())
+
+                    if (
+                        is_rank0()
+                        and (sparams_example is None)
+                        and compute_sparam_val
+                        and (aux is not None)
+                        and (aux.get("sparams_true", None) is not None)
+                        and (aux.get("port_masks", None) is not None)
+                    ):
+                        B = int(x_t_input.shape[0])
+                        t_vec = t.view(B) if t.dim() > 1 else t
+                        if str(getattr(args, "sparam_mode", "project")) == "head":
+                            _, S_pred = ema(
+                                x_t_input,
+                                t_vec,
+                                cond=cond,
+                                lambda_um=lambda_um,
+                                phys_gate=phys_gate,
+                                phase_gate=phase_gate,
+                                return_sparams=True,
+                                aux=aux,
+                                sig_min=SIG_MIN,
+                            )
+                        else:
+                            u_t_pred = ema(
+                                x_t_input,
+                                t_vec,
+                                cond=cond,
+                                lambda_um=lambda_um,
+                                phys_gate=phys_gate,
+                                phase_gate=phase_gate,
+                            )
+                            fields_t = x_t_input[:, 0:2]
+                            t4 = t_vec.view(B, 1, 1, 1)
+                            a = (1.0 - float(SIG_MIN))
+                            b = (1.0 - a * t4)
+                            x1_fields_pred = a * fields_t + b * u_t_pred  # normalized
+                            Er = x1_fields_pred[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                            Ei = x1_fields_pred[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                            E_pred_phys_raw = torch.complex(Er, Ei)
+                            S_pred = extract_sparams(
+                                E_pred_phys_raw,
+                                aux["port_masks"],
+                                in_port_idx=aux.get("in_port_idx", None),
+                                port_ids=aux.get("port_ids", None),
+                            )
+                        S_true = aux["sparams_true"]
+                        pv0 = aux.get("port_valid", None)
+                        pv0 = pv0[0].detach() if pv0 is not None else None
+                        sparams_example = (S_true[0].detach(), S_pred[0].detach(), pv0)
 
                     eval_steps += 1
                     if max_val_batches > 0 and (i + 1) >= max_val_batches:
@@ -1007,7 +1197,8 @@ def main(args):
 
                 ddp_allreduce_mean_(fm_t)
                 ddp_allreduce_mean_(res_t)
-                ddp_allreduce_mean_(ph_t)
+                if phase_weight > 0.0:
+                    ddp_allreduce_mean_(ph_t)
                 if use_endpoint:
                     ddp_allreduce_mean_(end_t)
                 if phase_grad_weight > 0.0:
@@ -1017,222 +1208,268 @@ def main(args):
 
                 val_fm_loss = float(fm_t.item())
                 val_res_loss = float(res_t.item())
-                val_phase_loss = float(ph_t.item())
+                val_phase_loss = float(ph_t.item()) if (phase_weight > 0.0) else 0.0
                 val_endpoint_loss = float(end_t.item()) if use_endpoint else 0.0
                 val_phase_grad_loss = float(phg_t.item()) if (phase_grad_weight > 0.0) else 0.0
                 val_sparam_loss = float(sp_t.item()) if (sparam_weight > 0.0) else 0.0
 
-            # -----------------------
-            # Sample residual eval + images (rank 0 only)
-            # -----------------------
+            # Sample eval (rank0 only)
             sample_residual_mean = 0.0
+            sample_amp_err_mean = 0.0
+            sample_phase_err_mean = 0.0
             if is_rank0():
                 residuals = []
+                amp_errs = []
+                phase_errs = []
                 with torch.no_grad():
-                    n_samples = min(len(train_ds), args.sample_eval_limit)
+                    n_samples = min(len(val_ds), int(args.sample_eval_limit))
                     for s in range(n_samples):
-                        x_full_s, cond_s, aux_s = train_ds[s]
+                        x_full_s, cond_s, aux_s = val_ds[s]
                         x_full_s = x_full_s.unsqueeze(0).to(device, dtype=dtype)
                         cond_s = cond_s.unsqueeze(0).to(device, dtype=dtype)
 
-                        with autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
-                            eps_s = x_full_s[:, 2:3]
-                            src_s = x_full_s[:, 3:4]
-                            x0_fields_s = torch.randn_like(x_full_s[:, 0:2])
+                        eps_s = x_full_s[:, 2:3]
+                        src_s = x_full_s[:, 3:4]
+                        extra_maps_s = x_full_s[:, 4:] if x_full_s.shape[1] > 4 else None
+                        x0_fields_s = torch.randn_like(x_full_s[:, 0:2])
+                        lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean
 
-                            # cond[0] is lambda_norm by construction (see Model/dataset.py)
-                            lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean  # [B,1] physical
-                            cond_maps_s = torch.cat([eps_s, src_s], dim=1)  # [B,2,H,W]
+                        if extra_maps_s is not None:
+                            cond_maps_s = torch.cat([eps_s, src_s, extra_maps_s], dim=1)
+                        else:
+                            cond_maps_s = torch.cat([eps_s, src_s], dim=1)
 
-                            x1_fields_pred = fm_sample(
-                                ema,
-                                x0_fields_s,
-                                num_steps=args.fm_steps,
-                                use_stoc_samp=args.use_stoc_samp,
-                                cond_maps=cond_maps_s,
-                                cond=cond_s,
-                                lambda_um=lambda_um_s,
-                                phys_gate=phys_gate,
-                                phase_gate=phase_gate,
-                            )
-                            x1_pred = torch.cat([x1_fields_pred, eps_s], dim=1)
-
-                        # denorm to physical
-                        x1_pred[:, 0] = x1_pred[:, 0] * stats["ez_real_std"] + stats["ez_real_mean"]
-                        x1_pred[:, 1] = x1_pred[:, 1] * stats["ez_imag_std"] + stats["ez_imag_mean"]
+                        x1_fields_pred = fm_sample(
+                            ema,
+                            x0_fields_s,
+                            num_steps=int(args.fm_steps),
+                            use_stoc_samp=bool(args.use_stoc_samp),
+                            cond_maps=cond_maps_s,
+                            cond=cond_s,
+                            lambda_um=lambda_um_s,
+                            phys_gate=1.0,
+                            phase_gate=1.0,
+                            sig_min=SIG_MIN,
+                        )
+                        x1_pred = torch.cat([x1_fields_pred, eps_s], dim=1)
+                        x1_pred[:, 0] = x1_pred[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                        x1_pred[:, 1] = x1_pred[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
                         if args.normalize_eps:
-                            x1_pred[:, 2] = x1_pred[:, 2] * stats["eps_std"] + stats["eps_mean"]
+                            x1_pred[:, 2] = x1_pred[:, 2] * float(stats["eps_std"]) + float(stats["eps_mean"])
 
                         B = x1_pred.shape[0]
                         k0 = (2.0 * torch.pi) / lambda_um_s.view(B)
-
                         R = helmholtz_op(x1_pred[:, 0:2], x1_pred[:, 2:3], k0=k0)
-                        res_mag = torch.sqrt(R[:, 0:1] ** 2 + R[:, 1:2] ** 2 + 1e-12) * (args.dx ** 2)
-                        residuals.append(res_mag.mean().item())
+                        res_mag = torch.sqrt(R[:, 0:1] ** 2 + R[:, 1:2] ** 2 + 1e-12) * (dx ** 2)
+                        residuals.append(float(res_mag.mean().item()))
 
-                        if s == 0:
-                            sample_dir = os.path.join(experiment_dir, "samples")
-                            os.makedirs(sample_dir, exist_ok=True)
+                        ezr_gt_s = x_full_s[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                        ezi_gt_s = x_full_s[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                        mag_gt_s = torch.sqrt(ezr_gt_s ** 2 + ezi_gt_s ** 2 + 1e-12)
+                        mag_pred_s = torch.sqrt(x1_pred[:, 0:1] ** 2 + x1_pred[:, 1:2] ** 2 + 1e-12)
 
-                            x_gt = x_full_s.clone()
-                            x_gt[:, 0] = x_gt[:, 0] * stats["ez_real_std"] + stats["ez_real_mean"]
-                            x_gt[:, 1] = x_gt[:, 1] * stats["ez_imag_std"] + stats["ez_imag_mean"]
-                            if args.normalize_eps:
-                                x_gt[:, 2] = x_gt[:, 2] * stats["eps_std"] + stats["eps_mean"]
+                        eps_phys_s = x1_pred[:, 2:3]
+                        m = (eps_phys_s > float(args.eps_thr)).to(dtype=torch.float32)
+                        k = int(getattr(args, "dilate", 1))
+                        if k > 1:
+                            m = F.max_pool2d(m, kernel_size=k, stride=1, padding=k // 2).clamp(0.0, 1.0)
+                        denom = float(m.sum().item())
+                        if denom < 1.0:
+                            m = torch.ones_like(m)
 
-                            eps_img = x_gt[0, 2].detach().cpu().numpy()
-                            ezr_gt_img = x_gt[0, 0].detach().cpu().numpy()
-                            ezi_gt_img = x_gt[0, 1].detach().cpu().numpy()
+                        amp_err_map_s = torch.abs(mag_pred_s - mag_gt_s)
+                        amp_errs.append(float((amp_err_map_s * m).sum().item() / (m.sum().item() + 1e-12)))
 
-                            ezr_pred_img = x1_pred[0, 0].detach().cpu().numpy()
-                            ezi_pred_img = x1_pred[0, 1].detach().cpu().numpy()
-
-                            mag_gt = np.sqrt(ezr_gt_img ** 2 + ezi_gt_img ** 2)
-                            mag_pred = np.sqrt(ezr_pred_img ** 2 + ezi_pred_img ** 2)
-                            mag_err = np.sqrt((ezr_pred_img - ezr_gt_img) ** 2 + (ezi_pred_img - ezi_gt_img) ** 2)
-
-                            res_img = res_mag[0, 0].detach().cpu().numpy()
-
-                            Hh, Ww = res_img.shape
-                            p2 = min(pml_cells + 2, max(0, Hh // 2 - 1), max(0, Ww // 2 - 1))
-                            mask = np.ones((Hh, Ww), dtype=np.float32)
-                            if p2 > 0:
-                                mask[:p2, :] = 0
-                                mask[-p2:, :] = 0
-                                mask[:, :p2] = 0
-                                mask[:, -p2:] = 0
-                            res_masked = np.ma.masked_where(mask <= 0.0, res_img)
-                            vals = res_masked.compressed()
-                            if vals.size > 0:
-                                v_hi = float(np.quantile(vals, 0.99))
-                                v_lo = float(np.quantile(vals, 0.05))
-                                v_hi = max(v_hi, 1e-12)
-                                v_lo = max(min(v_lo, v_hi * 0.5), v_hi * 1e-4, 1e-12)
-                            else:
-                                v_hi, v_lo = 1.0, 1e-6
-
-                            extent = (0.0, Ww * args.dx, 0.0, Hh * args.dx)
-
-                            def _imshow(ax, arr, title, cmap="magma", norm=None, vmin=None, vmax=None):
-                                h = ax.imshow(
-                                    arr,
-                                    origin="lower",
-                                    extent=extent,
-                                    aspect="equal",
-                                    cmap=cmap,
-                                    norm=norm,
-                                    vmin=vmin,
-                                    vmax=vmax,
-                                )
-                                ax.set_title(title, fontsize=10)
-                                ax.set_xlabel("x (µm)")
-                                ax.set_ylabel("y (µm)")
-                                ax.set_xticks([extent[0], extent[1]])
-                                ax.set_yticks([extent[2], extent[3]])
-                                return h
-
-                            vmax_ezr = float(max(np.max(np.abs(ezr_gt_img)), np.max(np.abs(ezr_pred_img)), 1e-12))
-                            vmax_ezi = float(max(np.max(np.abs(ezi_gt_img)), np.max(np.abs(ezi_pred_img)), 1e-12))
-
-                            fig, axes = plt.subplots(2, 5, figsize=(18, 7))
-                            axes = axes.reshape(2, 5)
-                            fig.suptitle(
-                                f"epoch {epoch:04d} | sample={s} | λ={float(lambda_um_s.item()):.4f} µm",
-                                fontsize=11,
-                            )
-
-                            h0 = _imshow(axes[0, 0], eps_img, "eps (input)", cmap="viridis")
-                            h1 = _imshow(axes[0, 1], ezr_gt_img, "Ez_real (GT)", cmap="RdBu", vmin=-vmax_ezr, vmax=vmax_ezr)
-                            h2 = _imshow(axes[0, 2], ezi_gt_img, "Ez_imag (GT)", cmap="RdBu", vmin=-vmax_ezi, vmax=vmax_ezi)
-                            h3 = _imshow(axes[0, 3], mag_gt, "|Ez| (GT)", cmap="magma")
-                            h4 = _imshow(axes[0, 4], res_masked, "|R(Ez, eps)| (pred)", cmap="magma", norm=LogNorm(vmin=v_lo, vmax=v_hi))
-
-                            h5 = _imshow(axes[1, 0], ezr_pred_img, "Ez_real (pred)", cmap="RdBu", vmin=-vmax_ezr, vmax=vmax_ezr)
-                            h6 = _imshow(axes[1, 1], ezi_pred_img, "Ez_imag (pred)", cmap="RdBu", vmin=-vmax_ezi, vmax=vmax_ezi)
-                            h7 = _imshow(axes[1, 2], mag_pred, "|Ez| (pred)", cmap="magma")
-                            h8 = _imshow(axes[1, 3], mag_err, "|err|", cmap="magma")
-                            axes[1, 4].axis("off")
-
-                            for ax, h in [
-                                (axes[0, 0], h0),
-                                (axes[0, 1], h1),
-                                (axes[0, 2], h2),
-                                (axes[0, 3], h3),
-                                (axes[0, 4], h4),
-                                (axes[1, 0], h5),
-                                (axes[1, 1], h6),
-                                (axes[1, 2], h7),
-                                (axes[1, 3], h8),
-                            ]:
-                                fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
-
-                            fig.tight_layout(rect=[0, 0.02, 1, 0.95])
-                            plt.savefig(os.path.join(sample_dir, f"sample_epoch_{epoch:04d}.png"), dpi=200)
-                            plt.close(fig)
-
-                            np.savez_compressed(
-                                os.path.join(sample_dir, f"sample_epoch_{epoch:04d}.npz"),
-                                eps=eps_img,
-                                ez_real_gt=ezr_gt_img,
-                                ez_imag_gt=ezi_gt_img,
-                                ez_real_pred=ezr_pred_img,
-                                ez_imag_pred=ezi_pred_img,
-                                mag_gt=mag_gt,
-                                mag_pred=mag_pred,
-                                mag_err=mag_err,
-                                residual_mag=res_img,
-                                dx=float(args.dx),
-                                wavelength_um=float(lambda_um_s.item()),
-                            )
+                        phase_gt_s = torch.atan2(ezi_gt_s, ezr_gt_s)
+                        phase_pred_s = torch.atan2(x1_pred[:, 1:2], x1_pred[:, 0:1])
+                        phase_err_s = torch.atan2(torch.sin(phase_pred_s - phase_gt_s), torch.cos(phase_pred_s - phase_gt_s))
+                        phase_errs.append(float((torch.abs(phase_err_s) * m).sum().item() / (m.sum().item() + 1e-12)))
 
                 sample_residual_mean = float(np.mean(residuals)) if residuals else 0.0
+                sample_amp_err_mean = float(np.mean(amp_errs)) if amp_errs else 0.0
+                sample_phase_err_mean = float(np.mean(phase_errs)) if phase_errs else 0.0
 
-            log_msg = (
-                f"[epoch {epoch:04d}] val_fm={val_fm_loss:.4e}, val_res={val_res_loss:.4e}, val_phase={val_phase_loss:.4e}"
-            )
-            if use_endpoint:
-                log_msg += f", val_endpoint={val_endpoint_loss:.4e}"
-            if phase_grad_weight > 0.0:
-                log_msg += f", val_phase_grad={val_phase_grad_loss:.4e}"
-            if sparam_weight > 0.0:
-                log_msg += f", val_sparam={val_sparam_loss:.4e}"
-            log_msg += f", sample_residual={sample_residual_mean:.4e}"
-            logger.info(log_msg)
+            # Save sample visualization (rank0 only)
+            if is_rank0():
+                with torch.no_grad():
+                    x_full_s, cond_s, aux_s = val_ds[0]
+                    x_full_s = x_full_s.unsqueeze(0).to(device, dtype=dtype)
+                    cond_s = cond_s.unsqueeze(0).to(device, dtype=dtype)
 
-            with open(val_csv_path, "a", encoding="UTF8", newline="") as f_csv:
-                writer = csv.writer(f_csv)
-                row = [
-                    epoch,
-                    val_fm_loss,
-                    val_res_loss,
-                    val_phase_loss,
-                    val_endpoint_loss if use_endpoint else "",
-                    val_phase_grad_loss if (phase_grad_weight > 0.0) else "",
-                    val_sparam_loss if (sparam_weight > 0.0) else "",
-                    sample_residual_mean,
-                ]
-                writer.writerow(row)
+                    eps_s = x_full_s[:, 2:3]
+                    src_s = x_full_s[:, 3:4]
+                    extra_maps_s = x_full_s[:, 4:] if x_full_s.shape[1] > 4 else None
+                    fields_1_s = x_full_s[:, 0:2]
+                    x0_fields_s = torch.randn_like(fields_1_s)
+                    lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean
 
-            if wandb_run is not None:
-                log_dict = {
-                    "epoch": epoch,
-                    "val/fm_loss": val_fm_loss,
-                    "val/residual_loss": val_res_loss,
-                    "val/phase_loss": val_phase_loss,
-                    "val/sample_residual": sample_residual_mean,
-                }
+                    if extra_maps_s is not None:
+                        cond_maps_s = torch.cat([eps_s, src_s, extra_maps_s], dim=1)
+                    else:
+                        cond_maps_s = torch.cat([eps_s, src_s], dim=1)
+
+                    x1_fields_pred = fm_sample(
+                        ema,
+                        x0_fields_s,
+                        num_steps=int(args.fm_steps),
+                        use_stoc_samp=bool(args.use_stoc_samp),
+                        cond_maps=cond_maps_s,
+                        cond=cond_s,
+                        lambda_um=lambda_um_s,
+                        phys_gate=1.0,
+                        phase_gate=1.0,
+                        sig_min=SIG_MIN,
+                    )
+
+                    ezr_pred = x1_fields_pred[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                    ezi_pred = x1_fields_pred[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                    ezr_gt = fields_1_s[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                    ezi_gt = fields_1_s[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                    eps_np = eps_s[0, 0].cpu().numpy()
+                    if args.normalize_eps:
+                        eps_np = eps_np * float(stats["eps_std"]) + float(stats["eps_mean"])
+
+                    ezr_pred_np = ezr_pred[0].cpu().numpy()
+                    ezi_pred_np = ezi_pred[0].cpu().numpy()
+                    ezr_gt_np = ezr_gt[0].cpu().numpy()
+                    ezi_gt_np = ezi_gt[0].cpu().numpy()
+
+                    mag_gt = np.sqrt(ezr_gt_np ** 2 + ezi_gt_np ** 2)
+                    mag_pred = np.sqrt(ezr_pred_np ** 2 + ezi_pred_np ** 2)
+                    mag_err = np.sqrt((ezr_pred_np - ezr_gt_np) ** 2 + (ezi_pred_np - ezi_gt_np) ** 2)
+                    amp_err_map = np.abs(mag_pred - mag_gt)
+
+                    phase_gt = np.arctan2(ezi_gt_np, ezr_gt_np)
+                    phase_pred = np.arctan2(ezi_pred_np, ezr_pred_np)
+                    phase_err = phase_pred - phase_gt
+                    phase_err = np.arctan2(np.sin(phase_err), np.cos(phase_err))
+
+                    fig, axes = plt.subplots(2, 6, figsize=(24, 7))
+                    axes = axes.reshape(2, 6)
+
+                    fig.suptitle(f"Epoch {epoch:04d} | λ={lambda_um_s[0, 0].item():.4f} µm", fontsize=11)
+
+                    def im(ax, arr, title, cmap="magma", vmin=None, vmax=None):
+                        h = ax.imshow(arr, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax, interpolation="nearest")
+                        ax.set_title(title, fontsize=10)
+                        ax.set_xticks([0, arr.shape[1]])
+                        ax.set_yticks([0, arr.shape[0]])
+                        return h
+
+                    im0 = im(axes[0, 0], eps_np, "eps (input)", cmap="viridis")
+                    im1 = im(axes[0, 1], ezr_gt_np, "Ez_real (GT)", cmap="RdBu")
+                    im2 = im(axes[0, 2], ezi_gt_np, "Ez_imag (GT)", cmap="RdBu")
+                    im3 = im(axes[0, 3], mag_gt, "|Ez| (GT)", cmap="magma")
+                    im4 = im(axes[0, 4], phase_gt, "∠Ez (GT)", cmap="hsv", vmin=-np.pi, vmax=np.pi)
+                    im5 = im(axes[0, 5], mag_pred, "|Ez| (pred)", cmap="magma")
+
+                    im6 = im(axes[1, 0], ezr_pred_np, "Ez_real (pred)", cmap="RdBu")
+                    im7 = im(axes[1, 1], ezi_pred_np, "Ez_imag (pred)", cmap="RdBu")
+                    im8 = im(axes[1, 2], mag_pred, "|Ez| (pred)", cmap="magma")
+                    im9 = im(axes[1, 3], mag_err, "|err|", cmap="magma")
+                    im10 = im(axes[1, 4], amp_err_map, "||Ez|-|GT||", cmap="magma")
+                    im11 = im(axes[1, 5], phase_err, "∠err (rad)", cmap="RdBu", vmin=-np.pi, vmax=np.pi)
+
+                    for ax in axes.ravel():
+                        ax.set_xlabel("x (grid)")
+                        ax.set_ylabel("y (grid)")
+
+                    for ax, h in zip(
+                        axes.ravel(),
+                        [im0, im1, im2, im3, im4, im5, im6, im7, im8, im9, im10, im11],
+                    ):
+                        fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
+
+                    sample_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_euler_bend.png")
+                    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+                    fig.savefig(sample_path, dpi=160)
+                    plt.close(fig)
+
+                    npz_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_euler_bend.npz")
+                    np.savez(
+                        npz_path,
+                        epoch=epoch,
+                        eps=eps_np,
+                        ez_real_gt=ezr_gt_np,
+                        ez_imag_gt=ezi_gt_np,
+                        ez_real_pred=ezr_pred_np,
+                        ez_imag_pred=ezi_pred_np,
+                        mag_gt=mag_gt,
+                        mag_pred=mag_pred,
+                        mag_err=mag_err,
+                        amp_err_map=amp_err_map,
+                        phase_gt=phase_gt,
+                        phase_pred=phase_pred,
+                        phase_err=phase_err,
+                        lambda_um=lambda_um_s[0, 0].cpu().item(),
+                    )
+                    logger.info(f"Saved sample visualization: {sample_path}")
+
+            if is_rank0():
+                msg = f"[epoch {epoch:04d}] val_fm={val_fm_loss:.4e}, val_res={val_res_loss:.4e}"
+                if phase_weight > 0.0:
+                    msg += f", val_phase={val_phase_loss:.4e}"
+                    try:
+                        val_phase_rms_deg = (math.sqrt(max(0.0, 2.0 * val_phase_loss)) * 180.0 / math.pi)
+                        msg += f" (≈{val_phase_rms_deg:.2f}° rms)"
+                    except Exception:
+                        pass
                 if use_endpoint:
-                    log_dict["val/endpoint_loss"] = val_endpoint_loss
+                    msg += f", val_endpoint={val_endpoint_loss:.4e}"
                 if phase_grad_weight > 0.0:
-                    log_dict["val/phase_grad_loss"] = val_phase_grad_loss
+                    msg += f", val_phase_grad={val_phase_grad_loss:.4e}"
                 if sparam_weight > 0.0:
-                    log_dict["val/sparam_loss"] = val_sparam_loss
-                wandb_run.log(log_dict, step=epoch)
+                    msg += f", val_sparam={val_sparam_loss:.4e}"
+                msg += (
+                    f", sample_residual={sample_residual_mean:.4e}"
+                    f", sample_amp_err={sample_amp_err_mean:.4e}"
+                    f", sample_phase_err={sample_phase_err_mean:.4e}"
+                )
+                logger.info(msg)
+
+                if (sparam_weight > 0.0) and (sparams_example is not None):
+                    S_true_0, S_pred_0, pv0 = sparams_example
+                    logger.info(
+                        f"[epoch {epoch:04d}] Sparams example (true->pred): "
+                        f"{_format_sparams_compact(S_true_0, S_pred_0, port_valid_1d=pv0)}"
+                    )
+
+                with open(val_csv_path, "a", encoding="UTF8", newline="") as f_csv:
+                    writer = csv.writer(f_csv)
+                    writer.writerow([
+                        epoch,
+                        val_fm_loss,
+                        val_res_loss,
+                        val_phase_loss if (phase_weight > 0.0) else "",
+                        val_endpoint_loss if use_endpoint else "",
+                        val_phase_grad_loss if (phase_grad_weight > 0.0) else "",
+                        val_sparam_loss if (sparam_weight > 0.0) else "",
+                        sample_residual_mean,
+                    ])
+
+                if wandb_run is not None:
+                    log_dict = {
+                        "epoch": epoch,
+                        "val/fm_loss": val_fm_loss,
+                        "val/residual_loss": val_res_loss,
+                        "val/sample_residual": sample_residual_mean,
+                        "val/sample_amp_err": sample_amp_err_mean,
+                        "val/sample_phase_err": sample_phase_err_mean,
+                    }
+                    if phase_weight > 0.0:
+                        log_dict["val/phase_loss"] = val_phase_loss
+                    if use_endpoint:
+                        log_dict["val/endpoint_loss"] = val_endpoint_loss
+                    if phase_grad_weight > 0.0:
+                        log_dict["val/phase_grad_loss"] = val_phase_grad_loss
+                    if sparam_weight > 0.0:
+                        log_dict["val/sparam_loss"] = val_sparam_loss
+                    wandb_run.log(log_dict, step=epoch)
 
         # -----------------------
-        # Train logging (DDP-averaged)
+        # Train logging
         # -----------------------
-        if epoch % args.log_every == 0:
+        if epoch % int(args.log_every) == 0:
             torch.cuda.synchronize()
             sec_per_epoch = time() - start_time
 
@@ -1240,13 +1477,13 @@ def main(args):
             res_mean = torch.tensor(running_residual_loss / max(train_steps_epoch, 1), device=device)
             ph_mean = torch.tensor(running_phase_loss / max(train_steps_epoch, 1), device=device)
             end_mean = torch.tensor(running_endpoint_loss / max(train_steps_epoch, 1), device=device)
-
             phg_mean = torch.tensor(running_phase_grad_loss / max(phase_grad_steps_epoch, 1), device=device)
             sp_mean = torch.tensor(running_sparam_loss / max(sparam_steps_epoch, 1), device=device)
 
             ddp_allreduce_mean_(fm_mean)
             ddp_allreduce_mean_(res_mean)
-            ddp_allreduce_mean_(ph_mean)
+            if phase_weight > 0.0:
+                ddp_allreduce_mean_(ph_mean)
             if use_endpoint:
                 ddp_allreduce_mean_(end_mean)
             if phase_grad_weight > 0.0:
@@ -1255,10 +1492,14 @@ def main(args):
                 ddp_allreduce_mean_(sp_mean)
 
             if is_rank0():
-                msg = (
-                    f"(epoch={epoch:04d}) train_fm={fm_mean.item():.4e}, "
-                    f"train_residual={res_mean.item():.4e}, train_phase={ph_mean.item():.4e}"
-                )
+                msg = f"(epoch={epoch:04d}) train_fm={fm_mean.item():.4e}, train_residual={res_mean.item():.4e}"
+                if phase_weight > 0.0:
+                    msg += f", train_phase={ph_mean.item():.4e}"
+                    try:
+                        ph_rms_deg = (math.sqrt(max(0.0, 2.0 * float(ph_mean.item()))) * 180.0 / math.pi)
+                        msg += f" (≈{ph_rms_deg:.2f}° rms)"
+                    except Exception:
+                        pass
                 if use_endpoint:
                     msg += f", train_endpoint={end_mean.item():.4e}"
                 if phase_grad_weight > 0.0:
@@ -1266,17 +1507,15 @@ def main(args):
                 if sparam_weight > 0.0:
                     msg += f", train_sparam={sp_mean.item():.4e}"
                 msg += f", sec_per_epoch={sec_per_epoch:.3e}"
-                msg += (
-                    f" | w_res={residual_weight:.3g}, w_phase={phase_weight:.3g}, "
-                    f"w_phg={phase_grad_weight:.3g}, w_sp={sparam_weight:.3g}"
-                )
+                msg += f" | w_res={residual_weight:.3g}, w_phase={phase_weight:.3g}, w_phg={phase_grad_weight:.3g}, w_sp={sparam_weight:.3g}"
+                if phase_grad_weight > 0.0:
+                    msg += f" | phg_steps={int(phase_grad_steps_epoch)}/{int(train_steps_epoch)} (every={int(args.phase_grad_every)})"
                 logger.info(msg)
 
             if wandb_run is not None and is_rank0():
                 wandb_log_dict = {
                     "train/fm_loss": fm_mean.item(),
                     "train/residual_loss": res_mean.item(),
-                    "train/phase_loss": ph_mean.item(),
                     "train/sec_per_epoch": sec_per_epoch,
                     "train/lr": scheduler.get_last_lr()[0],
                     "train/residual_weight": residual_weight,
@@ -1284,18 +1523,20 @@ def main(args):
                     "train/phase_grad_weight": phase_grad_weight,
                     "train/sparam_weight": sparam_weight,
                     "train/device_focus": device_focus,
-                    "train/use_config": int(use_config and (not config_failed)),
+                    "train/use_config": int(use_config and (not config_failed) and (epoch >= config_start_epoch)),
                 }
+                if phase_weight > 0.0:
+                    wandb_log_dict["train/phase_loss"] = ph_mean.item()
                 if use_endpoint:
                     wandb_log_dict["train/endpoint_loss"] = end_mean.item()
                     wandb_log_dict["train/endpoint_weight"] = endpoint_weight
                 if phase_grad_weight > 0.0:
                     wandb_log_dict["train/phase_grad_loss"] = phg_mean.item()
+                    wandb_log_dict["train/phase_grad_steps_epoch"] = int(phase_grad_steps_epoch)
                 if sparam_weight > 0.0:
                     wandb_log_dict["train/sparam_loss"] = sp_mean.item()
                 wandb_run.log(wandb_log_dict, step=epoch)
 
-            # reset epoch-local meters
             start_time = time()
             running_fm_loss = 0.0
             running_residual_loss = 0.0
@@ -1310,9 +1551,9 @@ def main(args):
         scheduler.step()
 
         # -----------------------
-        # Checkpoint (rank 0 only)
+        # Checkpoint
         # -----------------------
-        if epoch % args.ckpt_every == 0:
+        if epoch % int(args.ckpt_every) == 0:
             if is_rank0():
                 ckpt_path = os.path.join(ckpt_dir, f"{epoch:07d}.pt")
                 checkpoint = {
@@ -1339,133 +1580,90 @@ if __name__ == "__main__":
 
     parser.add_argument("--data-root", type=str, default="data_generation/data")
     parser.add_argument("--train-fraction", type=float, default=0.8)
-    parser.add_argument(
-        "--use-shards",
-        type=bool,
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help="Load dataset from shard .npz files (pack_dataset.py) instead of per-sample folders.",
-    )
-    parser.add_argument("--shard-subdir", type=str, default="shards",
-                        help="Subdirectory inside each sweep that contains shard files and index.json.")
-    parser.add_argument("--shard-index-name", type=str, default="index.json",
-                        help="Filename of the shard index JSON.")
-    parser.add_argument("--include-sweeps", type=str, default="",
-                        help="Comma-separated list of sweep subfolders to include (default: all).")
-    parser.add_argument(
-        "--subset-train-per-sweep",
-        type=str,
-        default="",
-        help="Optional: exact TRAIN sample counts per sweep, e.g. 'coupler_sweep=3000,y_branch_sweep=1000'.",
-    )
-    parser.add_argument(
-        "--subset-val-per-sweep",
-        type=str,
-        default="",
-        help="Optional: exact VAL sample counts per sweep, e.g. 'coupler_sweep=750,y_branch_sweep=250'. If omitted, derived from train ratios.",
-    )
-    parser.add_argument(
-        "--subset-val-total",
-        type=int,
-        default=0,
-        help="If subset-train-per-sweep is set and subset-val-per-sweep is omitted, derive val per sweep to sum to this total (default 25% of train).",
-    )
-    parser.add_argument(
-        "--subset-seed",
-        type=int,
-        default=0,
-        help="Seed for deterministic subset selection. Use a fixed value to reproduce the same subset.",
-    )
 
-    # GLOBAL batch size for DDP
+    parser.add_argument("--use-shards", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--shard-subdir", type=str, default="shards")
+    parser.add_argument("--shard-index-name", type=str, default="index.json")
+    parser.add_argument("--include-sweeps", type=str, default="")
+
+    parser.add_argument("--subset-train-per-sweep", type=str, default="")
+    parser.add_argument("--subset-val-per-sweep", type=str, default="")
+    parser.add_argument("--subset-val-total", type=int, default=0)
+    parser.add_argument("--subset-seed", type=int, default=0)
+
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--train-num-workers", type=int, default=8,
-                        help="Dataloader worker count for train loader.")
-    parser.add_argument("--val-num-workers", type=int, default=4,
-                        help="Dataloader worker count for val loader.")
-    parser.add_argument("--prefetch-factor", type=int, default=4,
-                        help="Prefetch factor per worker (ignored if workers=0).")
+    parser.add_argument("--train-num-workers", type=int, default=8)
+    parser.add_argument("--val-num-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
 
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--global-seed", type=int, default=15)
 
     parser.add_argument("--version", type=str, default="physics_unet_pbfm_ddp")
     parser.add_argument("--fm_steps", type=int, default=20)
-    parser.add_argument("--dx", type=float, default=1.0 / 30.0)
-    parser.add_argument("--lambda-um", type=float, default=1.55)
+
+    parser.add_argument("--dx", type=float, default=1.0 / 24.0)
+    parser.add_argument("--lambda-um", dest="lambda_um", type=float, default=1.55)
+
+    parser.add_argument("--crop-pml", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--pml-cells", type=int, default=0)
+
+    parser.add_argument("--include-sdf", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--normalize-sdf", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--sdf-thr-eps", dest="sdf_thr_eps", type=float, default=3.0)
+    parser.add_argument("--sdf-feature", type=str, default="raw", choices=["raw", "clip", "exp", "clip_exp"])
+    parser.add_argument("--sdf-sigma-px", type=float, default=0.0)
+    parser.add_argument("--sdf-sigma-nm", type=float, default=100.0)
 
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument(
-        "--warmup-epochs",
-        type=int,
-        default=2,
-        help="Linear warmup epochs for LR schedule (0 disables warmup).",
-    )
-    parser.add_argument(
-        "--warmup-start-factor",
-        type=float,
-        default=0.1,
-        help="Warmup starts at (warmup_start_factor * lr) and ramps to lr over warmup-epochs.",
-    )
-    parser.add_argument(
-        "--min-lr",
-        type=float,
-        default=5e-6,
-        help="Minimum LR for cosine decay (eta_min).",
-    )
+    parser.add_argument("--warmup-epochs", type=int, default=2)
+    parser.add_argument("--warmup-start-factor", type=float, default=0.1)
+    parser.add_argument("--min-lr", type=float, default=5e-6)
 
-    # ConFIG toggle
-    parser.add_argument(
-        "--config",
-        type=bool,
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Enable ConFIG (conflict-free gradient descent). Use --no-config to disable.",
-    )
+    parser.add_argument("--config", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--config-method", dest="config_method", type=str, default="pcgrad", choices=["pcgrad", "sum", "config"])
+    parser.add_argument("--config-start-epoch", type=int, default=200)
+
+    parser.add_argument("--unroll-steps", type=int, default=0)
+    parser.add_argument("--unroll-phase", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--phase-amp-tau", type=float, default=0.2)
 
     parser.add_argument("--use-stoc-samp", type=bool, default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--amp", type=bool, default=True, action=argparse.BooleanOptionalAction,
-                        help="Enable torch.cuda.amp autocast + GradScaler.")
+    parser.add_argument("--amp", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--detect-anomaly", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--use-checkpoint", type=bool, default=False, action=argparse.BooleanOptionalAction)
 
-    # Curriculum boundaries
-    parser.add_argument("--phaseA-epochs", dest="phaseA_epochs", type=int, default=50,
-                        help="Phase A: epochs <= this use FM (+ endpoint) only.")
-    parser.add_argument("--phaseB-epochs", dest="phaseB_epochs", type=int, default=200,
-                        help="Phase B: N1<epoch<=this adds residual (ramp). Phase C starts after this.")
+    parser.add_argument("--phaseA-epochs", dest="phaseA_epochs", type=int, default=50)
+    parser.add_argument("--phaseB-epochs", dest="phaseB_epochs", type=int, default=200)
 
-    # Weights + warmups
     parser.add_argument("--lambda-residual", type=float, default=1.0)
     parser.add_argument("--residual-warmup-epochs", type=int, default=50)
+    parser.add_argument("--residual-start-phase", type=str, default="B", choices=["A", "B"])
 
     parser.add_argument("--lambda-phase", type=float, default=0.1)
     parser.add_argument("--phase-warmup-epochs", type=int, default=50)
+    parser.add_argument("--phase-start-phase", type=str, default="C", choices=["A", "B", "C"])
 
     parser.add_argument("--lambda-endpoint", type=float, default=0.0)
     parser.add_argument("--endpoint-warmup-epochs", type=int, default=0)
 
-    # Phase-gradient loss (sparse)
     parser.add_argument("--lambda-phase-grad", type=float, default=0.0)
     parser.add_argument("--phase-grad-warmup-epochs", type=int, default=100)
-    parser.add_argument("--phase-grad-every", type=int, default=4,
-                        help="Compute phase-grad every N train steps (sparse).")
+    parser.add_argument("--phase-grad-every", type=int, default=4)
+    parser.add_argument("--phase-grad-start-phase", type=str, default="C", choices=["A", "B", "C"])
 
-    # S-parameter loss (sparse)
     parser.add_argument("--lambda-sparam", type=float, default=0.0)
+    parser.add_argument("--sparam-from-start", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--sparam-warmup-epochs", type=int, default=50)
-    parser.add_argument("--sparam-every", type=int, default=1,
-                        help="Compute sparam loss every N train steps.")
-    parser.add_argument(
-        "--sparam-start-phase",
-        type=str,
-        default="C",
-        choices=["B", "C"],
-        help="Which curriculum phase to start the S-parameter loss in. "
-             "B = start after phaseA (epoch > phaseA_epochs). "
-             "C = start after phaseB (epoch > phaseB_epochs, default).",
-    )
+    parser.add_argument("--sparam-every", type=int, default=1)
+    parser.add_argument("--sparam-start-phase", type=str, default="C", choices=["A", "B", "C"])
+    parser.add_argument("--sparam-mode", type=str, default="project", choices=["project", "head"])
 
     parser.add_argument("--normalize-eps", type=bool, default=True, action=argparse.BooleanOptionalAction)
+
+    parser.add_argument("--physics-features", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--complex-unet", type=bool, default=False, action=argparse.BooleanOptionalAction)
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--ckpt-every", type=int, default=50)
@@ -1478,50 +1676,21 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="Rayfield")
     parser.add_argument("--wandb-entity", type=str, default=None)
 
-    # Spatial weighting / focus
     parser.add_argument("--device-focus-max", type=float, default=3.0)
     parser.add_argument("--device-focus-warmup-epochs", type=int, default=100)
     parser.add_argument("--device-focus-hold-epochs", type=int, default=0)
     parser.add_argument("--device-focus-decay-epochs", type=int, default=200)
+
     parser.add_argument("--w-min", type=float, default=0.1)
-    parser.add_argument("--eps-thr", type=float, default=6.0)
+    parser.add_argument("--eps-thr", type=float, default=3.0)
     parser.add_argument("--dilate", type=int, default=9)
 
-    parser.add_argument("--val-batches", type=int, default=16,
-                        help="How many val batches to average each eval. 0 = full val set.")
+    parser.add_argument("--val-batches", type=int, default=16)
 
-    # -----------------------
-    # ConFIG stability knobs
-    # -----------------------
-    parser.add_argument(
-        "--config-eps",
-        dest="config_eps",
-        type=float,
-        default=1e-8,
-        help="ConFIG: minimum gradient norm threshold; tasks with ||g|| < eps are dropped.",
-    )
-    parser.add_argument(
-        "--config-normalize",
-        dest="config_normalize",
-        type=bool,
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="ConFIG: normalize each task gradient to unit norm before applying task weights.",
-    )
-    parser.add_argument(
-        "--config-fail-max",
-        dest="config_fail_max",
-        type=int,
-        default=25,
-        help="Disable ConFIG permanently after this many step-level failures.",
-    )
-    parser.add_argument(
-        "--config-log-every",
-        dest="config_log_every",
-        type=int,
-        default=200,
-        help="How often (in train steps) to log ConFIG diagnostics on rank0.",
-    )
+    parser.add_argument("--config-eps", dest="config_eps", type=float, default=1e-8)
+    parser.add_argument("--config-normalize", dest="config_normalize", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--config-fail-max", dest="config_fail_max", type=int, default=25)
+    parser.add_argument("--config-log-every", dest="config_log_every", type=int, default=200)
 
     args = parser.parse_args()
     main(args)

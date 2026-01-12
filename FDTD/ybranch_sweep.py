@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 try:
-from tqdm import tqdm
+    from tqdm import tqdm
 except Exception:  # pragma: no cover
     def tqdm(x, **_kwargs):
         return x
@@ -109,13 +109,13 @@ def build_param_list(
     l_outs = l_out_min + u[:, 5] * (l_out_max - l_out_min)
 
     # Quantize only width and wavelength (matches old script behavior)
-wg_widths = _quantize_01(wg_widths, wg_width_min, wg_width_max)
-wavelengths = _quantize_01(wavelengths, lambda_min, lambda_max)
+    wg_widths = _quantize_01(wg_widths, wg_width_min, wg_width_max)
+    wavelengths = _quantize_01(wavelengths, lambda_min, lambda_max)
 
     return [
         (float(w), float(lam), float(lj), float(lb), float(hb), float(lo))
         for w, lam, lj, lb, hb, lo in zip(wg_widths, wavelengths, l_js, l_bends, h_bends, l_outs)
-]
+    ]
 
 
 # -----------------------------

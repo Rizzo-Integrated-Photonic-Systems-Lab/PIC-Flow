@@ -1,3 +1,4 @@
+# coupler_sweep.py
 from __future__ import annotations
 
 import os
@@ -14,23 +15,32 @@ from scipy.stats import qmc
 from tqdm import tqdm
 
 from directional_coupler import DirectionalCoupler2D
-from conditioning_masks import make_source_mask
 
 
 # -----------------------------
-# Config defaults
+# Config defaults (Euler-aligned)
 # -----------------------------
-RESOLUTION_DEFAULT = 32
-N_GEO_DEFAULT = 7500
+RESOLUTION_DEFAULT = 20
+CROP_PX_DEFAULT = 384
+DPML_DEFAULT = 2.0 / 3.0
+
+N_GEO_DEFAULT = 500
 N_PROCS_DEFAULT = 24
 
-# Geometry and wavelength ranges (um)
+# Geometry and wavelength ranges (um) adjusted to fit 384@20 (non-PML interior = 19.2 um)
 gap_min, gap_max = 0.10, 0.35
-wg_length_min, wg_length_max = 5.0, 15.0
-bend_length_min, bend_length_max = 5.0, 7.0
+
+# Coupling region must fit well inside non-PML interior after margins.
+wg_length_min, wg_length_max = 5.0, 9.0
+
+# Bends must fit: with crop=384,res=20,dpml~0.65 => non-PML half-width ~9.6 um.
+# With a 0.5 um margin, bends of ~1..3 um are feasible for Lc up to ~12.
+bend_length_min, bend_length_max = 4.0, 6.0
+
 wg_width_min, wg_width_max = 0.38, 0.60
 lambda_min, lambda_max = 1.40, 1.60
-lead_gap_min, lead_gap_max = 1.0, 3.0
+
+lead_gap_min, lead_gap_max = 0.8, 2.5
 
 # Stratify gap (oversample small gap)
 GAP_STRATA = [
@@ -41,7 +51,7 @@ GAP_STRATA = [
 
 
 # -----------------------------
-# Naming utilities (collision-resistant)
+# Naming utilities
 # -----------------------------
 def _as_code_um(x_um: float, scale: int = 1000) -> int:
     return int(np.round(float(x_um) * scale))
@@ -55,7 +65,6 @@ def geom_tag(
     lead_extra_gap: float,
     lam: float,
 ) -> str:
-    # integer-coded fields for uniqueness + readable floats for sanity
     w_i = _as_code_um(wg_width, 1000)
     g_i = _as_code_um(gap, 1000)
     L_i = _as_code_um(wg_length, 1000)
@@ -75,10 +84,33 @@ def flip_y(arr: np.ndarray) -> np.ndarray:
 
 def synthesize_s_for_port2_from_port1(S_port1: np.ndarray) -> np.ndarray:
     # S_port1 = [S11, S21, S31, S41] for input=1
-    # By y-mirror symmetry:
-    # ports map: 1<->2 and 3<->4
-    # => [S(1,2),S(2,2),S(3,2),S(4,2)] = [S(2,1),S(1,1),S(4,1),S(3,1)]
+    # By y-mirror symmetry: 1<->2 and 3<->4
     return np.array([S_port1[1], S_port1[0], S_port1[3], S_port1[2]], dtype=np.complex128)
+
+
+# -----------------------------
+# Mask helper
+# -----------------------------
+def _draw_thick_line_mask(ny: int, nx: int, x0: float, y0: float, x1: float, y1: float, thickness_px: int = 3) -> np.ndarray:
+    x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+    vx = x1f - x0f
+    vy = y1f - y0f
+    vv = vx * vx + vy * vy
+    if vv < 1e-9:
+        m = np.zeros((ny, nx), dtype=np.float32)
+        xi = int(np.clip(round(x0f), 0, nx - 1))
+        yi = int(np.clip(round(y0f), 0, ny - 1))
+        m[yi, xi] = 1.0
+        return m
+
+    yy, xx = np.indices((ny, nx), dtype=np.float32)
+    t = ((xx - x0f) * vx + (yy - y0f) * vy) / vv
+    t = np.clip(t, 0.0, 1.0)
+    px = x0f + t * vx
+    py = y0f + t * vy
+    d2 = (xx - px) ** 2 + (yy - py) ** 2
+    thr2 = float(thickness_px * thickness_px)
+    return (d2 <= thr2).astype(np.float32)
 
 
 # -----------------------------
@@ -128,7 +160,6 @@ def build_param_list(N_GEO: int, seed_base: int = 42) -> list[tuple[float, float
 
     assert len(gaps) == N_GEO, f"expected N_GEO={N_GEO}, got {len(gaps)}"
 
-    # quantize only width and wavelength
     wg_widths = _quantize_01(wg_widths, wg_width_min, wg_width_max)
     wavelengths = _quantize_01(wavelengths, lambda_min, lambda_max)
 
@@ -149,22 +180,31 @@ def run_fdtd_sim_port1(
     lead_extra_gap: float,
     wl: float,
     RESOLUTION: int,
+    dpml_um: float,
+    cell_um: float,
+    crop_px: int,
+    decay_tol: float,
 ):
     dc = DirectionalCoupler2D(
         wg_width_um=wg_width,
         gap_um=gap,
         wg_length_um=wg_length,
         wavelength_um=wl,
-        resolution=RESOLUTION,
-        dpml=1,
+        resolution=int(RESOLUTION),
+        dpml=float(dpml_um),
+        crop_px=int(crop_px),
+        cell_x_um=float(cell_um),
+        cell_y_um=float(cell_um),
         pad_y_um=1.0,
         lead_extra_gap_um=lead_extra_gap,
         bend_length_um=bend_length,
-        bend_n_segments=64,
+        bend_n_segments=48,
+        source_shift_um=0.5,
+        quantize_grid=False,  # already quantized in main
+        fit_margin_um=0.5,
     )
 
-    # convention: eps, Ez, Hx, Hy, S_dict, cell
-    eps, Ez, Hx, Hy, S_dict, cell = dc.run_sim(input_port=1, decay_tol=1e-5)
+    eps, Ez, Hx, Hy, S_dict, cell = dc.run_sim(input_port=1, decay_tol=float(decay_tol))
     return dc, S_dict, Ez, eps, cell
 
 
@@ -173,7 +213,7 @@ def worker(task):
     Returns:
       ("OK", temp_npz_path_str) or ("ERR", err_string)
     """
-    (wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, tmp_dir_str) = task
+    (wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, dpml_um, cell_um, crop_px, decay_tol, tmp_dir_str) = task
     tmp_dir = Path(tmp_dir_str)
 
     base = geom_tag(wg_width, gap, wg_length, bend_length, lead_extra_gap, lam)
@@ -181,57 +221,56 @@ def worker(task):
     tmp_path = tmp_dir / tmp_name
 
     try:
-        dc, S_dict, Ez1, eps, cell = run_fdtd_sim_port1(
-            wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION
+        dc, S_dict, Ez1_full, eps_full, cell = run_fdtd_sim_port1(
+            wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, dpml_um, cell_um, crop_px, decay_tol
         )
         if S_dict is None:
             raise RuntimeError("S_dict is None")
-        if Ez1 is None or eps is None or cell is None:
-            raise RuntimeError("Missing Ez/eps/cell")
 
-        eps = np.asarray(eps, dtype=np.float32)
-        Ez1 = np.asarray(Ez1, dtype=np.complex64)
+        eps_full = np.asarray(eps_full, dtype=np.float32)
+        Ez1_full = np.asarray(Ez1_full, dtype=np.complex64)
+
+        # Crop to non-PML (Euler-style)
+        pml_px = int(np.round(float(dpml_um) * float(RESOLUTION)))
+        eps = eps_full[pml_px:-pml_px, pml_px:-pml_px]
+        Ez1 = Ez1_full[pml_px:-pml_px, pml_px:-pml_px]
 
         ny, nx = eps.shape
-        Lx_um, Ly_um = cell
+        crop_px = int(crop_px)
+        if (ny, nx) != (crop_px, crop_px):
+            raise RuntimeError(f"Expected cropped ({crop_px},{crop_px}) but got {(ny,nx)}")
 
-        # Port masks for ports 1..4 (for S-parameter projection / auxiliary losses)
+        # Source mask for input_port=1 (cropped coords)
+        src_px = dc.get_source_region_px(input_port=1, crop_pml=True)
+        src_mask1 = _draw_thick_line_mask(
+            ny, nx,
+            src_px["line_start_px"][0], src_px["line_start_px"][1],
+            src_px["line_end_px"][0], src_px["line_end_px"][1],
+            thickness_px=3,
+        )
+
+        # Port masks for ports 1..4 (cropped coords)
         port_ids = np.array([1, 2, 3, 4], dtype=np.int32)
-        port_centers = dc.get_port_centers_um()
-        y_span = dc.get_port_y_span_um()
-        port_masks = np.stack(
-            [
-                make_source_mask(
-                    input_port=p,
-                    port_centers_um=port_centers,
-                    y_span_um=y_span,
-                    Lx_um=Lx_um,
-                    Ly_um=Ly_um,
-                    ny=ny,
-                    nx=nx,
-                ).astype(np.float32)
-                for p in port_ids.tolist()
-            ],
-            axis=0,
-        )  # [P, ny, nx]
-
-        # Source mask for input_port=1
-        src_mask1 = make_source_mask(
-            input_port=1,
-            port_centers_um=port_centers,
-            y_span_um=y_span,
-            Lx_um=Lx_um,
-            Ly_um=Ly_um,
-            ny=ny,
-            nx=nx,
-        ).astype(np.float32)
+        port_masks = []
+        for p in port_ids.tolist():
+            pr = dc.get_port_region_px(p, crop_pml=True)
+            pm = _draw_thick_line_mask(
+                ny, nx,
+                pr["line_start_px"][0], pr["line_start_px"][1],
+                pr["line_end_px"][0], pr["line_end_px"][1],
+                thickness_px=3,
+            )
+            port_masks.append(pm.astype(np.float32))
+        port_masks = np.stack(port_masks, axis=0).astype(np.float32)  # [4, ny, nx]
 
         # S vector for input=1
         S1 = np.array([S_dict[(1, 1)], S_dict[(2, 1)], S_dict[(3, 1)], S_dict[(4, 1)]], dtype=np.complex128)
 
-        # grid meta
-        dx = 1.0 / RESOLUTION
-        dy = 1.0 / RESOLUTION
+        # grid meta (cropped)
+        dx = 1.0 / float(RESOLUTION)
+        dy = 1.0 / float(RESOLUTION)
+        Lx_um = float(cell[0]) - 2.0 * float(dpml_um)
+        Ly_um = float(cell[1]) - 2.0 * float(dpml_um)
 
         np.savez_compressed(
             tmp_path,
@@ -243,23 +282,25 @@ def worker(task):
             lead_extra_gap_um=np.float32(lead_extra_gap),
             wavelength_um=np.float32(lam),
             resolution=np.int32(RESOLUTION),
-            # grid scalars
+            dpml_um=np.float32(dpml_um),
+            # grid scalars (cropped)
             nx=np.int32(nx),
             ny=np.int32(ny),
             dx=np.float32(dx),
             dy=np.float32(dy),
             Lx_um=np.float32(Lx_um),
             Ly_um=np.float32(Ly_um),
-            # arrays
-            eps=eps,
+            pml_px=np.int32(pml_px),
+            # arrays (cropped)
+            eps=eps.astype(np.float32),
             Ez_real=Ez1.real.astype(np.float32),
             Ez_imag=Ez1.imag.astype(np.float32),
-            src_mask=src_mask1,
-            port_ids=port_ids,
-            port_masks=port_masks,
+            src_mask=src_mask1.astype(np.float32),
+            port_ids=port_ids.astype(np.int32),
+            port_masks=port_masks.astype(np.float32),
             S1_real=S1.real.astype(np.float32),
             S1_imag=S1.imag.astype(np.float32),
-            base_tag=np.array(base),  # scalar string array
+            base_tag=np.array(base),
         )
 
         return ("OK", str(tmp_path))
@@ -295,7 +336,7 @@ def _atomic_write_index(index_path: Path, index_list: List[Dict[str, object]]):
     tmp_path = index_path.with_suffix(".tmp")
     with open(tmp_path, "w") as f:
         json.dump(index_list, f, indent=2)
-    os.replace(tmp_path, index_path)  # atomic on POSIX
+    os.replace(tmp_path, index_path)
 
 
 def shard_writer(
@@ -307,14 +348,6 @@ def shard_writer(
     index_name: str = "index.json",
     save_index_every_shard: bool = True,
 ):
-    """
-    Consumes temp geometry npz paths.
-    For each geometry, produces TWO samples (inPort1 + inPort2 via symmetry).
-    Writes shards incrementally. Deletes temp npz immediately after reading.
-
-    Also writes index.json (atomically). If save_index_every_shard=True, index is
-    updated after each shard write (preemption-friendly).
-    """
     shards_root = Path(shards_root_str)
     shards_root.mkdir(parents=True, exist_ok=True)
 
@@ -347,19 +380,18 @@ def shard_writer(
         tmp_path = Path(payload)
         try:
             with np.load(tmp_path, allow_pickle=True) as f:
-                # robust scalar string extraction
                 base_tag = f["base_tag"].item()
                 if isinstance(base_tag, bytes):
                     base_tag = base_tag.decode("utf-8")
                 base_tag = str(base_tag)
 
-                eps = f["eps"]
-                Ezr = f["Ez_real"]
-                Ezi = f["Ez_imag"]
-                src1 = f["src_mask"]
+                eps = f["eps"].astype(np.float32)
+                Ezr = f["Ez_real"].astype(np.float32)
+                Ezi = f["Ez_imag"].astype(np.float32)
+                src1 = f["src_mask"].astype(np.float32)
                 port_ids = f["port_ids"].astype(np.int32) if "port_ids" in f else None
                 port_masks = f["port_masks"].astype(np.float32) if "port_masks" in f else None
-                S1 = f["S1_real"] + 1j * f["S1_imag"]
+                S1 = (f["S1_real"] + 1j * f["S1_imag"]).astype(np.complex128)
 
                 # scalars
                 wg_width_um = float(f["wg_width_um"])
@@ -369,6 +401,7 @@ def shard_writer(
                 lead_extra_gap_um = float(f["lead_extra_gap_um"])
                 wavelength_um = float(f["wavelength_um"])
                 resolution = int(f["resolution"])
+                dpml_um = float(f["dpml_um"])
 
                 nx = int(f["nx"])
                 ny = int(f["ny"])
@@ -376,23 +409,20 @@ def shard_writer(
                 dy = float(f["dy"])
                 Lx_um = float(f["Lx_um"])
                 Ly_um = float(f["Ly_um"])
+                pml_px = int(f["pml_px"])
 
             # sample 1 (inPort1)
             tag1 = f"{base_tag}__inPort1"
             arrays1 = {
-                "eps": eps.astype(np.float32),
-                "Ez_real": Ezr.astype(np.float32),
-                "Ez_imag": Ezi.astype(np.float32),
-                "src_mask": src1.astype(np.float32),
+                "eps": eps,
+                "Ez_real": Ezr,
+                "Ez_imag": Ezi,
+                "src_mask": src1,
                 **(
-                    {
-                "ports/ids": port_ids.astype(np.int32),
-                "ports/masks": port_masks.astype(np.float32),
-                    }
+                    {"ports/ids": port_ids, "ports/masks": port_masks}
                     if (port_ids is not None and port_masks is not None)
                     else {}
                 ),
-
                 "sparams/input_port": np.array(1, dtype=np.int32),
                 "sparams/source_off": np.array(0, dtype=np.int32),
                 "sparams/gap_um": np.array(gap_um, dtype=np.float32),
@@ -402,15 +432,16 @@ def shard_writer(
                 "sparams/lead_extra_gap_um": np.array(lead_extra_gap_um, dtype=np.float32),
                 "sparams/wavelength_um": np.array(wavelength_um, dtype=np.float32),
                 "sparams/resolution": np.array(resolution, dtype=np.int32),
+                "sparams/dpml_um": np.array(dpml_um, dtype=np.float32),
                 "sparams/S_real": S1.real.astype(np.float32),
                 "sparams/S_imag": S1.imag.astype(np.float32),
-
                 "grid/dx": np.array(dx, dtype=np.float32),
                 "grid/dy": np.array(dy, dtype=np.float32),
                 "grid/nx": np.array(nx, dtype=np.int32),
                 "grid/ny": np.array(ny, dtype=np.int32),
                 "grid/Lx_um": np.array(Lx_um, dtype=np.float32),
                 "grid/Ly_um": np.array(Ly_um, dtype=np.float32),
+                "grid/pml_px": np.array(pml_px, dtype=np.int32),
             }
             meta1 = {"tag": tag1, "dataset": dataset_name}
 
@@ -422,8 +453,6 @@ def shard_writer(
             src2 = flip_y(src1)
             S2 = synthesize_s_for_port2_from_port1(S1)
 
-            # For the y-flipped sample, port numbering maps 1<->2 and 3<->4.
-            # Build the mirrored port masks in canonical port order [1,2,3,4].
             if port_masks is not None and port_ids is not None and port_ids.shape[0] == 4:
                 m1, m2, m3, m4 = port_masks[0], port_masks[1], port_masks[2], port_masks[3]
                 port_masks2 = np.stack([flip_y(m2), flip_y(m1), flip_y(m4), flip_y(m3)], axis=0).astype(np.float32)
@@ -441,14 +470,10 @@ def shard_writer(
                 "Ez_imag": Ezi2.astype(np.float32),
                 "src_mask": src2.astype(np.float32),
                 **(
-                    {
-                "ports/ids": port_ids2.astype(np.int32),
-                "ports/masks": port_masks2.astype(np.float32),
-                    }
+                    {"ports/ids": port_ids2.astype(np.int32), "ports/masks": port_masks2.astype(np.float32)}
                     if (port_ids2 is not None and port_masks2 is not None)
                     else {}
                 ),
-
                 "sparams/input_port": np.array(2, dtype=np.int32),
                 "sparams/source_off": np.array(0, dtype=np.int32),
                 "sparams/gap_um": np.array(gap_um, dtype=np.float32),
@@ -458,22 +483,22 @@ def shard_writer(
                 "sparams/lead_extra_gap_um": np.array(lead_extra_gap_um, dtype=np.float32),
                 "sparams/wavelength_um": np.array(wavelength_um, dtype=np.float32),
                 "sparams/resolution": np.array(resolution, dtype=np.int32),
+                "sparams/dpml_um": np.array(dpml_um, dtype=np.float32),
                 "sparams/S_real": S2.real.astype(np.float32),
                 "sparams/S_imag": S2.imag.astype(np.float32),
-
                 "grid/dx": np.array(dx, dtype=np.float32),
                 "grid/dy": np.array(dy, dtype=np.float32),
                 "grid/nx": np.array(nx, dtype=np.int32),
                 "grid/ny": np.array(ny, dtype=np.int32),
                 "grid/Lx_um": np.array(Lx_um, dtype=np.float32),
                 "grid/Ly_um": np.array(Ly_um, dtype=np.float32),
+                "grid/pml_px": np.array(pml_px, dtype=np.int32),
             }
             meta2 = {"tag": tag2, "dataset": dataset_name}
 
             buffer.append((arrays1, meta1))
             buffer.append((arrays2, meta2))
 
-            # write full shards
             while len(buffer) >= shard_size:
                 batch = buffer[:shard_size]
                 buffer = buffer[shard_size:]
@@ -486,11 +511,9 @@ def shard_writer(
             except Exception:
                 pass
 
-    # final partial shard
     if buffer:
         write_one_shard(buffer)
 
-    # ensure final index exists even if save_index_every_shard=False
     if not save_index_every_shard:
         _atomic_write_index(index_path, index)
 
@@ -502,13 +525,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", type=str, default=None, help="Output root (default: <repo>/Data/coupler_sweep)")
     ap.add_argument("--resolution", type=int, default=RESOLUTION_DEFAULT)
+    ap.add_argument("--crop-px", type=int, default=CROP_PX_DEFAULT, help="Non-PML crop size in pixels (square).")
+    ap.add_argument("--dpml", type=float, default=DPML_DEFAULT)
     ap.add_argument("--n-geo", type=int, default=N_GEO_DEFAULT)
     ap.add_argument("--n-procs", type=int, default=N_PROCS_DEFAULT)
+    ap.add_argument("--decay-tol", type=float, default=1e-5)
 
     ap.add_argument("--shard-size", type=int, default=100, help="Samples per shard (NOTE: each geometry yields 2 samples).")
-    ap.add_argument("--compress", action="store_true", help="Use np.savez_compressed for shards (smaller, slower).")
-    ap.add_argument("--queue-max", type=int, default=64, help="Max queued temp files (bounds disk usage).")
-    ap.add_argument("--index-every-shard", action="store_true", help="Write index.json after every shard (recommended).")
+    ap.add_argument("--compress", action="store_true")
+    ap.add_argument("--queue-max", type=int, default=64)
+    ap.add_argument("--index-every-shard", action="store_true")
 
     args = ap.parse_args()
 
@@ -524,6 +550,22 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
     shards_dir.mkdir(parents=True, exist_ok=True)
 
+    # Quantize dpml/cell to EXACT integer-pixel sizes (Euler-style).
+    crop_px = int(args.crop_px)
+    if crop_px <= 0:
+        raise ValueError("--crop-px must be > 0")
+
+    pml_px = int(np.round(float(args.dpml) * float(args.resolution)))
+    dpml_um = float(pml_px) / float(args.resolution)
+    full_px = int(crop_px + 2 * pml_px)
+    cell_um = float(full_px) / float(args.resolution)
+
+    # Validate cropped shape
+    nx_full = int(np.round(cell_um * float(args.resolution)))
+    nx_crop = nx_full - 2 * pml_px
+    if nx_crop != crop_px:
+        raise ValueError(f"Crop mismatch: expected {crop_px} but got {nx_crop}. Check dpml/resolution/crop-px.")
+
     params = build_param_list(args.n_geo, seed_base=42)
 
     print(f"Unique geometries: {len(params)}")
@@ -532,9 +574,8 @@ def main():
     print(f"TMP_DIR:   {tmp_dir}  (bounded by queue_max ~ {args.queue_max})")
     print(f"SHARDS:    {shards_dir}")
     print(f"n_procs:   {args.n_procs}")
+    print(f"resolution: {args.resolution}, crop_px: {crop_px}, dpml_um: {dpml_um:.6f}, pml_px: {pml_px}, cell_um: {cell_um:.6f}")
     print(f"shard_size(samples): {args.shard_size}  => ~{math.ceil((2*len(params))/args.shard_size)} shards")
-    print(f"compress:  {bool(args.compress)}")
-    print(f"index-every-shard: {bool(args.index_every_shard)}")
 
     q: mp.Queue = mp.Queue(maxsize=args.queue_max)
 
@@ -553,10 +594,12 @@ def main():
     )
     writer_p.start()
 
-    tasks = [(w, g, L, b, lead, lam, args.resolution, str(tmp_dir)) for (w, g, L, b, lead, lam) in params]
+    tasks = [
+        (w, g, L, b, lead, lam, int(args.resolution), float(dpml_um), float(cell_um), int(crop_px), float(args.decay_tol), str(tmp_dir))
+        for (w, g, L, b, lead, lam) in params
+    ]
 
     successes, failures = 0, 0
-
     with mp.Pool(processes=args.n_procs) as pool:
         for status, payload in tqdm(pool.imap_unordered(worker, tasks), total=len(tasks), desc="FDTD (port1) -> tmp"):
             if status == "OK":
@@ -569,7 +612,6 @@ def main():
     q.put(None)
     writer_p.join()
 
-    # Cleanup tmp dir if empty
     try:
         if tmp_dir.exists() and not any(tmp_dir.iterdir()):
             tmp_dir.rmdir()
