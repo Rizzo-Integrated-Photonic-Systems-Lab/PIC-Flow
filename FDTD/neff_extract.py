@@ -1,10 +1,17 @@
+import argparse
+import logging
 import os
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tidy3d as td
 from tidy3d.plugins.mode import ModeSolver
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 # --- Geometry constants (µm) ---
@@ -98,11 +105,14 @@ def compute_neff_for_lambda(lam_um: float, wg_width_um: float) -> float:
         freqs=[freq],
     )
 
-    # Local solve (no cloud / stub files) for robustness on this cluster.
-    # If you later want to use the Tidy3D cloud mode solver, replace this with
-    # tidy3d.web.run(ms, ...) and make sure the API key + stub handling work
-    # with your installed tidy3d version.
+    # Use local solver
+    try:
+        logger.debug(f"Running local mode solve for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm")
     mode_data = ms.solve()
+        logger.debug(f"Local mode solve completed for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm")
+    except Exception as e:
+        logger.error(f"Local mode solve failed for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm: {e}")
+        raise RuntimeError(f"Mode solving failed for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm")
 
     # mode_data.n_eff is an xarray DataArray with dims ('f', 'mode_index')
     neffs_all = mode_data.n_eff.values[0, :].real  # shape (num_modes,)
@@ -124,12 +134,29 @@ def compute_neff_for_lambda(lam_um: float, wg_width_um: float) -> float:
     return float(neff_val)
 
 
+def compute_neff_for_width_lambda(args):
+    """
+    Compute n_eff for a single width-wavelength pair.
+    Returns (width_um, lambda_um, neff)
+    """
+    wg_width_um, lam_um = args
+    try:
+        logger.debug(f"Computing n_eff for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm")
+        neff = compute_neff_for_lambda(lam_um=lam_um, wg_width_um=wg_width_um)
+        logger.debug(f"Completed n_eff={neff:.6f} for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm")
+        return wg_width_um, lam_um, neff
+    except Exception as e:
+        logger.error(f"Error computing n_eff for width={wg_width_um:.3f} µm, lambda={lam_um:.4f} µm: {e}")
+        raise
+
+
 def sweep_widths_and_save_neff_csvs(
     widths_um: np.ndarray,
     out_dir: str = "neff_tables",
-    lambda_min_um: float = 1.40,
-    lambda_max_um: float = 1.60,
+    lambda_min_um: float = 1.45,
+    lambda_max_um: float = 1.65,
     lambda_step_um: float = 0.01,
+    num_processes: int = None,
 ) -> None:
     """
     Sweep over a list of waveguide widths and wavelengths and save n_eff(λ) tables.
@@ -141,56 +168,182 @@ def sweep_widths_and_save_neff_csvs(
     Each width w produces a CSV like:
         {out_dir}/neff_siwire_w{w_code}_t0220.csv
     where w_code is e.g. 038, 045, 060 for 0.38, 0.45, 0.60 µm.
+
+    Parameters:
+        num_processes: Number of parallel processes. If None, uses CPU count.
     """
     os.makedirs(out_dir, exist_ok=True)
 
     # Construct wavelength grid once and reuse for all widths
     lambda_grid = np.arange(lambda_min_um, lambda_max_um + 1e-9, lambda_step_um)
 
+    # Create all width-wavelength combinations
+    logger.info("Creating width-wavelength combinations...")
+    width_lambda_pairs = []
     for wg_width in widths_um:
-        # round to 2 decimal places to avoid 0.379999... artifacts
         wg_width_rounded = float(np.round(wg_width, 2))
-        w_code = int(round(wg_width_rounded * 100))  # 0.45 -> 45
-        w_str = f"{w_code:03d}"                      # 45 -> "045"
+        for lam in lambda_grid:
+            width_lambda_pairs.append((wg_width_rounded, float(lam)))
 
+    total_computations = len(width_lambda_pairs)
+    logger.info(f"Total computations: {total_computations}")
+    logger.info(f"Width range: {widths_um[0]:.3f} to {widths_um[-1]:.3f} µm ({len(widths_um)} widths)")
+    logger.info(f"Wavelength range: {lambda_grid[0]:.4f} to {lambda_grid[-1]:.4f} µm ({len(lambda_grid)} wavelengths)")
+
+    # Use parallel processing
+    if num_processes is None:
+        import multiprocessing
+        num_processes = multiprocessing.cpu_count()
+    logger.info(f"Using {num_processes} parallel processes")
+
+    results = {}
+    completed = 0
+    failed = 0
+
+    logger.info("Starting parallel computation...")
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        # Submit all jobs
+        logger.info(f"Submitting {total_computations} jobs to process pool...")
+        future_to_params = {
+            executor.submit(compute_neff_for_width_lambda, params): params
+            for params in width_lambda_pairs
+        }
+        logger.info("All jobs submitted, waiting for completion...")
+
+        # Process completed jobs
+        for future in as_completed(future_to_params):
+            try:
+                wg_width, lam_um, neff = future.result()
+                if wg_width not in results:
+                    results[wg_width] = {}
+                results[wg_width][lam_um] = neff
+
+                completed += 1
+                if completed % 50 == 0 or completed == total_computations:
+                    logger.info(f"Completed {completed}/{total_computations} computations")
+            except Exception as e:
+                failed += 1
+                params = future_to_params[future]
+                logger.error(f"Failed computation for width={params[0]:.3f} µm, lambda={params[1]:.4f} µm: {e}")
+
+    logger.info(f"Parallel computation finished. Completed: {completed}, Failed: {failed}")
+    logger.info(f"Results collected for {len(results)} widths")
+
+    if len(results) == 0:
+        logger.error("No results were collected! All computations may have failed.")
+        logger.error("Check Tidy3D configuration and try running with fewer processes or a single test case.")
+        return
+
+    # Save results for each width
+    logger.info(f"Saving results to {out_dir}/ directory...")
+    saved_count = 0
+    for wg_width in sorted(results.keys()):
+        w_code = int(round(wg_width * 100))
+        w_str = f"{w_code:03d}"
         csv_name = f"neff_siwire_w{w_str}_t0220.csv"
         csv_path = os.path.join(out_dir, csv_name)
 
-        print(
-            f"\n=== Computing n_eff over λ ∈ "
-            f"[{lambda_min_um:.2f}, {lambda_max_um:.2f}] µm "
-            f"in steps of {lambda_step_um:.3f} µm "
-            f"for wg_width = {wg_width_rounded:.2f} µm ==="
-        )
+        # Sort by wavelength for consistent output
+        width_results = results[wg_width]
+        sorted_lams = sorted(width_results.keys())
+        sorted_neffs = [width_results[lam] for lam in sorted_lams]
 
-        neff_vals = []
-        for lam in lambda_grid:
-            neff = compute_neff_for_lambda(lam_um=float(lam), wg_width_um=wg_width_rounded)
-            neff_vals.append(neff)
-            print(f"λ = {lam:.4f} µm  ->  n_eff = {neff:.6f}")
+        logger.info(f"Saving results for wg_width = {wg_width:.2f} µm ({len(sorted_lams)} data points) to {csv_path}")
 
-        # Save a multi-row CSV per width: one row per wavelength.
+        try:
         df = pd.DataFrame(
             {
-                "lambda_um": lambda_grid,
-                "neff": neff_vals,
+                    "lambda_um": sorted_lams,
+                    "neff": sorted_neffs,
             }
         )
         df.to_csv(csv_path, index=False)
-        print(f"Saved {csv_path}")
+            saved_count += 1
+            logger.info(f"Successfully saved {csv_path}")
+        except Exception as e:
+            logger.error(f"Failed to save {csv_path}: {e}")
+
+    logger.info(f"Saved {saved_count} CSV files to {out_dir}/")
 
 
 if __name__ == "__main__":
-    # Sweep wg_width from 0.38 to 0.60 µm in 0.01 µm steps
-    widths_um = np.arange(0.38, 0.60 + 1e-9, 0.01)
+    parser = argparse.ArgumentParser(description="Compute effective indices for silicon waveguides")
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=None,
+        help="Number of parallel processes (default: CPU count)"
+    )
+    parser.add_argument(
+        "--width-min",
+        type=float,
+        default=0.38,
+        help="Minimum waveguide width in µm (default: 0.38)"
+    )
+    parser.add_argument(
+        "--width-max",
+        type=float,
+        default=2.00,
+        help="Maximum waveguide width in µm (default: 2.00)"
+    )
+    parser.add_argument(
+        "--width-step",
+        type=float,
+        default=0.01,
+        help="Waveguide width step in µm (default: 0.01)"
+    )
+    parser.add_argument(
+        "--lambda-min",
+        type=float,
+        default=1.45,
+        help="Minimum wavelength in µm (default: 1.45)"
+    )
+    parser.add_argument(
+        "--lambda-max",
+        type=float,
+        default=1.65,
+        help="Maximum wavelength in µm (default: 1.65)"
+    )
+    parser.add_argument(
+        "--lambda-step",
+        type=float,
+        default=0.01,
+        help="Wavelength step in µm (default: 0.01)"
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="neff_tables",
+        help="Output directory for CSV files (default: neff_tables)"
+    )
 
-    # Compute n_eff vs wavelength for each width, sweeping λ from 1.40 to 1.60 µm.
+    args = parser.parse_args()
+
+    logger.info("Starting neff_extract.py")
+    logger.info(f"Arguments: num_processes={args.num_processes}, width_min={args.width_min}, "
+                f"width_max={args.width_max}, width_step={args.width_step}")
+    logger.info(f"Wavelength range: {args.lambda_min} to {args.lambda_max} µm (step: {args.lambda_step})")
+    logger.info(f"Output directory: {args.out_dir}")
+
+    # Sweep wg_width from args.width_min to args.width_max in args.width_step µm steps
+    widths_um = np.arange(args.width_min, args.width_max + 1e-9, args.width_step)
+
+    logger.info(f"Computing n_eff for {len(widths_um)} widths from {args.width_min:.2f} to {args.width_max:.2f} µm")
+
+    try:
+        # Compute n_eff vs wavelength for each width
     sweep_widths_and_save_neff_csvs(
         widths_um=widths_um,
-        lambda_min_um=1.40,
-        lambda_max_um=1.60,
-        lambda_step_um=0.01,
+            out_dir=args.out_dir,
+            lambda_min_um=args.lambda_min,
+            lambda_max_um=args.lambda_max,
+            lambda_step_um=args.lambda_step,
+            num_processes=args.num_processes,
     )
+        logger.info("neff_extract.py completed successfully")
+    except Exception as e:
+        logger.error(f"neff_extract.py failed with error: {e}")
+        sys.exit(1)
 
     # Optionally, you can uncomment the block below to quickly visualize one
     # particular width (e.g. 0.45 µm) after the sweep by loading its CSV and

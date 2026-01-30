@@ -1,48 +1,68 @@
 # euler_bend_device.py
 """
-EulerZigZag2D (Meep) with:
-- Deterministic pixel-exact crops (no "different size boxes" artifacts) via dpml/cell quantization
-- Edge-aligned I/O ports: input/output always axis-aligned and perpendicular to the boundary
-- Turn-devices (end_with_turn=True) end with an axis-aligned direction so output port is on an edge
+EulerZigZag2D (Meep, 2D effective-index) compatible with your current:
+- Device2DBase (cell_x/cell_y/dpml/resolution quantization already handled there)
+- utils.neff_siwire_from_tables
+- utils.get_mode_alpha_2dir
+- utils.pick_in_out_from_alpha
+- utils.quantize_square_cell_from_crop
 
-Key changes (vs your pasted version):
-1) quantize_grid=True (default): dpml is snapped so pml_px is an integer, and cell size is chosen so
-   (crop_px + 2*pml_px) is an integer number of pixels. This makes eps crops exactly crop_px×crop_px.
-2) path_rotation_deg is snapped to multiples of 90° (0/90/180/270) so ports land on edges.
-3) If end_with_turn=True and force_turn_ports_axis_aligned=True (default), the *final* turn is snapped
-   to 90° (or nearest multiple of 90°) so the output lead is axis-aligned.
-4) Simplified lead extension to boundaries with explicit ray intersection (removes sign confusion).
+What this file provides:
+- Deterministic crop sizing via crop_px + dpml quantization (no "different size boxes")
+- Zig-zag Euler-bend polyline converted to rotated mp.Block segments
+- Axis-aligned ports via rotation snapping to 0/90/180/270
+- Single-frequency S11/S21 (run_sim)
+- Broadband spectral S11(λ)/S21(λ) (run_spectrum)
+
+Assumptions:
+- get_mode_alpha_2dir(sim, monitor, ...) returns either (ndir,) for single-freq
+  or (Nf, ndir) for broadband.
+- pick_in_out_from_alpha(alpha, toward_device_sign, dir_plus, dir_minus) supports 1D and 2D alpha.
 """
 
-import meep as mp
+from __future__ import annotations
+
 import numpy as np
+import meep as mp
 
-from utils import neff_siwire_from_tables
 from devices_base import Device2DBase
+from utils import (
+    neff_siwire_from_tables,
+    get_mode_alpha_2dir,
+    pick_in_out_from_alpha,
+    quantize_square_cell_from_crop,
+)
 
 
-def _unit(vx: float, vy: float, eps: float = 1e-12):
-    n = float(np.sqrt(vx * vx + vy * vy))
+# -------------------------
+# Small geometry helpers
+# -------------------------
+def _unit(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64).reshape(2)
+    n = float(np.hypot(v[0], v[1]))
     if n < eps:
-        return 1.0, 0.0
-    return vx / n, vy / n
+        return np.array([1.0, 0.0], dtype=np.float64)
+    return v / n
 
 
-def _euler_bend_points(
-    *,
-    theta_total_rad: float,
-    R_min_um: float,
-    n_pts: int = 256,
-    sign: float = 1.0,
-):
+def _snap_deg_90(angle_deg: float) -> float:
+    # Snap to {0,90,180,270}
+    a = float(angle_deg)
+    return float(int(np.round(a / 90.0)) * 90) % 360.0
+
+
+def _rotate_points(pts: np.ndarray, angle_deg: float) -> np.ndarray:
+    th = np.deg2rad(float(angle_deg))
+    c, s = float(np.cos(th)), float(np.sin(th))
+    R = np.array([[c, -s], [s, c]], dtype=np.float64)
+    return pts @ R.T
+
+
+def _euler_bend_points(theta_total_rad: float, R_min_um: float, n_pts: int = 256, sign: float = 1.0):
     """
-    Simple "Euler" bend approximation:
-    curvature ramps 0 -> kmax -> 0 (triangular profile), so the path starts/ends straight.
-
-    Peak curvature: kmax = 1/R_min.
-    Total turning angle theta = ∫ k(s) ds = 0.5 * kmax * L  =>  L = 2 * theta / kmax = 2 * theta * R_min.
-
-    Returns x, y coordinates with x[0]=y[0]=0, and path length L.
+    Curvature ramps 0 -> kmax -> 0 (triangular curvature profile).
+    Total bend angle theta = ∫ k(s) ds = 0.5*kmax*L  => L = 2*theta/kmax = 2*theta*R_min.
+    Returns x,y with start at (0,0), end straight.
     """
     theta = float(theta_total_rad)
     if theta <= 0:
@@ -52,15 +72,14 @@ def _euler_bend_points(
         raise ValueError("R_min_um must be > 0")
 
     kmax = 1.0 / R
-    L = 2.0 * theta / kmax  # = 2 * theta * R
+    L = 2.0 * theta / kmax  # 2*theta*R
 
     n = max(32, int(n_pts))
     s = np.linspace(0.0, L, n, dtype=np.float64)
     ds = float(s[1] - s[0])
 
-    # triangular curvature profile
-    k = np.empty_like(s)
     mid = 0.5 * L
+    k = np.empty_like(s)
     for i, si in enumerate(s):
         if si <= mid:
             k[i] = kmax * (si / mid)
@@ -71,7 +90,6 @@ def _euler_bend_points(
     th = np.cumsum(k) * ds
     x = np.cumsum(np.cos(th)) * ds
     y = np.cumsum(np.sin(th)) * ds
-
     x -= x[0]
     y -= y[0]
     return x, y, float(L)
@@ -84,656 +102,460 @@ def _polyline_to_blocks(points_xy: np.ndarray, wg_width_um: float, material: mp.
     blocks = []
     pts = np.asarray(points_xy, dtype=np.float64)
     for a, b in zip(pts[:-1], pts[1:]):
-        x0, y0 = float(a[0]), float(a[1])
-        x1, y1 = float(b[0]), float(b[1])
-        dx = x1 - x0
-        dy = y1 - y0
-        seg_len = float(np.sqrt(dx * dx + dy * dy))
+        a = np.asarray(a, dtype=np.float64).reshape(2)
+        b = np.asarray(b, dtype=np.float64).reshape(2)
+        d = b - a
+        seg_len = float(np.hypot(d[0], d[1]))
         if seg_len <= 1e-9:
             continue
 
-        tx, ty = _unit(dx, dy)
-        nx, ny = -ty, tx
+        t = _unit(d)
+        n = np.array([-t[1], t[0]], dtype=np.float64)
 
-        center = mp.Vector3(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.0)
-        e1 = mp.Vector3(tx, ty, 0.0)  # tangent
-        e2 = mp.Vector3(nx, ny, 0.0)  # normal
+        center = mp.Vector3(float(0.5 * (a[0] + b[0])), float(0.5 * (a[1] + b[1])), 0.0)
+        e1 = mp.Vector3(float(t[0]), float(t[1]), 0.0)   # tangent
+        e2 = mp.Vector3(float(n[0]), float(n[1]), 0.0)   # normal
 
         size = mp.Vector3(seg_len * 1.05, float(wg_width_um), mp.inf)
         blocks.append(mp.Block(size=size, center=center, material=material, e1=e1, e2=e2))
     return blocks
 
 
-def _rotate_points(pts: np.ndarray, angle_rad: float) -> np.ndarray:
-    """Rotate 2D points around origin by angle_rad."""
-    c, s = np.cos(angle_rad), np.sin(angle_rad)
-    rot = np.array([[c, -s], [s, c]])
-    return pts @ rot.T
+def _axis_from_tangent(t: np.ndarray):
+    t = np.asarray(t, dtype=np.float64).reshape(2)
+    if abs(float(t[0])) >= abs(float(t[1])):
+        return mp.X, float(np.sign(float(t[0])) if float(t[0]) != 0 else 1.0)
+    return mp.Y, float(np.sign(float(t[1])) if float(t[1]) != 0 else 1.0)
 
 
-def _snap_deg_90(x: float) -> float:
-    return float(int(np.round(float(x) / 90.0)) * 90.0) % 360.0
+def _is_axis_aligned(t: np.ndarray, tol: float = 1e-3) -> bool:
+    t = _unit(np.asarray(t, dtype=np.float64))
+    return (abs(float(t[0])) > 1.0 - tol and abs(float(t[1])) < tol) or (abs(float(t[1])) > 1.0 - tol and abs(float(t[0])) < tol)
 
 
-def _snap_deg_90_nonsigned(x: float) -> float:
-    # For angles like bend magnitudes (0..180), snap to {0,90,180,...}
-    return float(int(np.round(float(x) / 90.0)) * 90.0)
-
-
+# -------------------------
+# Device
+# -------------------------
 class EulerZigZag2D(Device2DBase):
     """
-    2D effective-index waveguide with alternating Euler bends (zig-zag).
-
-    This class supports arbitrary crop sizes by setting crop_px and leaving cell_x_um/cell_y_um None.
-    When quantize_grid=True (default), dpml and cell size are quantized so the non-PML interior is
-    exactly crop_px×crop_px pixels (deterministic shapes).
+    Zig-zag Euler bends with 2 ports.
     """
 
     def __init__(
         self,
         wg_width_um: float = 0.45,
         wavelength_um: float = 1.55,
-        resolution: int = 24,
-        dpml: float = 2.0 / 3.0,
-        crop_px: int = 512,
         n_core: float | None = None,
         n_clad: float = 1.444,
-        # geometry controls
-        y0_um: float = 0.0,
+        # grid/crop
+        crop_px: int = 384,
+        resolution: int = 24,
+        dpml_um: float = 2.0 / 3.0,
+        # path controls
         n_zigs: int = 1,
         start_up: bool = True,
-        end_with_turn: bool = False,
-        end_turn_deg: float | None = None,
+        bend_angle_deg: float = 90.0,
         R_min_um: float = 1.5,
         straight_x_um: float = 1.0,
         straight_y_um: float = 0.8,
-        lead_x_um: float = 2.0,
-        min_straight_input_um: float = 2.0,
-        bend_angle_deg: float = 90.0,
-        lead_extend_through_pml: bool = True,
-        lead_boundary_clearance_um: float = 0.0,
-        fit_margin_um: float = 0.2,
-        path_rotation_deg: float = 0.0,
+        lead_in_um: float = 2.0,
+        lead_out_um: float = 2.0,
+        y0_um: float = 0.0,
+        path_rotation_deg: float = 0.0,  # snapped to 90deg
         # ports/sources
-        port_margin_um: float = 0.5,
+        port_margin_um: float = 0.6,      # distance from non-PML boundary into interior
         port_span_pad_um: float = 0.25,
-        source_shift_um: float = 0.5,
-        # grid overrides
-        cell_x_um: float | None = None,
-        cell_y_um: float | None = None,
-        # NEW: stability + port alignment
-        quantize_grid: bool = True,
-        force_turn_ports_axis_aligned: bool = True,
-        turn_axis_deg: float = 90.0,
+        source_shift_um: float = 0.5,     # source upstream from input port
+        # fitting margins for device window / safety
+        fit_margin_um: float = 0.25,
     ):
         crop_px = int(crop_px)
+        resolution = int(resolution)
         if crop_px <= 0:
             raise ValueError("crop_px must be > 0")
-        self.crop_px = crop_px
-
-        resolution = int(resolution)
         if resolution <= 0:
             raise ValueError("resolution must be > 0")
 
-        # Deterministic dpml/cell quantization => exact crop_px interior.
-        if bool(quantize_grid):
-            pml_px = int(np.round(float(dpml) * float(resolution)))
-            dpml_q = float(pml_px) / float(resolution)
-            full_px = int(crop_px + 2 * pml_px)
-            cell_um_q = float(full_px) / float(resolution)
-        else:
-            dpml_q = float(dpml)
-            cell_um_q = (float(crop_px) / float(resolution)) + 2.0 * float(dpml_q)
+        # Quantize dpml + cell so interior is exactly crop_px x crop_px pixels
+        dpml_q, pml_px, cell_um, full_px = quantize_square_cell_from_crop(
+            crop_px=crop_px, resolution=resolution, dpml_um=dpml_um
+        )
 
-        cx = float(cell_um_q) if cell_x_um is None else float(cell_x_um)
-        cy = float(cell_um_q) if cell_y_um is None else float(cell_y_um)
+        super().__init__(cell_x=cell_um, cell_y=cell_um, dpml=dpml_q, resolution=resolution)
 
-        super().__init__(cell_x_um=cx, cell_y_um=cy, dpml=float(dpml_q), resolution=int(resolution))
+        self.crop_px = crop_px
+        self.pml_px_q = int(pml_px)
 
         self.wg_width_um = float(wg_width_um)
         self.wavelength_um = float(wavelength_um)
         self.n_clad = float(n_clad)
 
-        self.y0_um = float(y0_um)
         self.n_zigs = int(n_zigs)
         self.start_up = bool(start_up)
-        self.end_with_turn = bool(end_with_turn)
-        self.end_turn_deg = None if end_turn_deg is None else float(end_turn_deg)
+        self.bend_angle_deg = float(bend_angle_deg)
         self.R_min_um = float(R_min_um)
         self.straight_x_um = float(straight_x_um)
         self.straight_y_um = float(straight_y_um)
-        self.lead_x_um = float(lead_x_um)
-        self.min_straight_input_um = float(min_straight_input_um)
-        self.bend_angle_deg = float(bend_angle_deg)
-        self.lead_extend_through_pml = bool(lead_extend_through_pml)
-        self.lead_boundary_clearance_um = float(lead_boundary_clearance_um)
-        self.fit_margin_um = float(fit_margin_um)
-
-        # Enforce rotation to {0,90,180,270} so ports land on edges.
+        self.lead_in_um = float(lead_in_um)
+        self.lead_out_um = float(lead_out_um)
+        self.y0_um = float(y0_um)
         self.path_rotation_deg = _snap_deg_90(path_rotation_deg)
 
         self.port_margin_um = float(port_margin_um)
         self.port_span_pad_um = float(port_span_pad_um)
         self.source_shift_um = float(source_shift_um)
 
-        self.force_turn_ports_axis_aligned = bool(force_turn_ports_axis_aligned)
-        self.turn_axis_deg = float(turn_axis_deg)
+        self.fit_margin_um = float(fit_margin_um)
 
-        if n_core is None:
-            self.n_core = neff_siwire_from_tables(self.wg_width_um, self.wavelength_um)
-        else:
-            self.n_core = float(n_core)
+        self.n_core = float(neff_siwire_from_tables(self.wg_width_um, self.wavelength_um)) if n_core is None else float(n_core)
+        self.clad_medium = mp.Medium(index=self.n_clad)
 
-        # to be filled by build_geometry()
+        # filled by build_geometry()
         self.geometry = None
-        self.clad_medium = None
-        self.port_1 = None
-        self.port_2 = None
-        self.src_1 = None
-        self.full_plane = None
+        self.port_in = None
+        self.port_out = None
+        self.src_vol = None
+        self.full_plane = mp.Volume(center=mp.Vector3(0, 0, 0), size=mp.Vector3(self.cell_x, self.cell_y, 0))
 
-        # Source region info (um, physical coords)
-        self.src_center_um = None
-        self.src_size_um = None
-        self.src_direction_rad = None
-
-        # scalar meta for masks
-        self.x_port_1_um = None
-        self.y_port_1_um = None
-        self.x_port_2_um = None
-        self.y_port_2_um = None
-        self.x_src_um = None
-        self.y_src_um = None
+        # tangents at ports
+        self.tan_in = None
+        self.tan_out = None
+        self.axis_in = None
+        self.axis_out = None
+        self.sign_in = None
+        self.sign_out = None
 
         self.build_geometry()
 
     def pml_px(self) -> int:
-        return int(np.round(float(self.dpml) * float(self.resolution)))
+        return int(self.pml_px_q)
 
     def nonpml_shape(self) -> tuple[int, int]:
-        p = self.pml_px()
-        nx = int(np.round(self.cell_x * self.resolution)) - 2 * p
-        ny = int(np.round(self.cell_y * self.resolution)) - 2 * p
-        return ny, nx
+        # (ny, nx) of interior (crop) if you crop away PML
+        return int(self.crop_px), int(self.crop_px)
 
-    def get_port_centers_um(self):
-        return {
-            1: (float(self.x_port_1_um), float(self.y_port_1_um)),
-            2: (float(self.x_port_2_um), float(self.y_port_2_um)),
-        }
-
-    def get_port_y_span_um(self):
+    def get_port_y_span_um(self) -> float:
         return float(self.wg_width_um + 2.0 * self.port_span_pad_um)
 
-    def _ray_to_cell_boundary(self, pt: np.ndarray, d: np.ndarray, clearance: float) -> np.ndarray | None:
-        """
-        Ray from pt along direction d (must be nonzero) to cell boundary with clearance.
-        Returns the nearest positive intersection point, or None if no valid hit.
-        """
-        half_x = 0.5 * self.cell_x
-        half_y = 0.5 * self.cell_y
-        px, py = float(pt[0]), float(pt[1])
-        dx, dy = float(d[0]), float(d[1])
-
-        eps = 1e-12
-        if abs(dx) < eps and abs(dy) < eps:
-            return None
-
-        t_vals = []
-        # Vertical boundaries x = ±half_x
-        if abs(dx) >= eps:
-            t_left = ((-half_x + clearance) - px) / dx
-            t_right = ((+half_x - clearance) - px) / dx
-            if t_left > 0:
-                t_vals.append(t_left)
-            if t_right > 0:
-                t_vals.append(t_right)
-
-        # Horizontal boundaries y = ±half_y
-        if abs(dy) >= eps:
-            t_bot = ((-half_y + clearance) - py) / dy
-            t_top = ((+half_y - clearance) - py) / dy
-            if t_bot > 0:
-                t_vals.append(t_bot)
-            if t_top > 0:
-                t_vals.append(t_top)
-
-        if not t_vals:
-            return None
-        t = float(min(t_vals))
-        return np.array([px + dx * t, py + dy * t], dtype=np.float64)
-
+    # -------------------------
+    # Path + ports
+    # -------------------------
     def build_geometry(self):
         core = mp.Medium(index=self.n_core)
-        clad = mp.Medium(index=self.n_clad)
-        self.clad_medium = clad
 
-        half_x = 0.5 * self.cell_x
-        half_y = 0.5 * self.cell_y
-        nonpml_left = -half_x + self.dpml
-        nonpml_right = +half_x - self.dpml
-        nonpml_bot = -half_y + self.dpml
-        nonpml_top = +half_y - self.dpml
-
-        if self.lead_boundary_clearance_um < 0:
-            raise ValueError("lead_boundary_clearance_um must be >= 0")
-        if self.fit_margin_um < 0:
-            raise ValueError("fit_margin_um must be >= 0")
-
-        # Build the zigzag centerline in local coordinates (starts along +x), then rotate it.
+        # Build local polyline: starts along +x
         pts = []
-        x = 0.0
-        y = 0.0
+        x, y = 0.0, 0.0
         pts.append((x, y))
 
-        def add_straight(dx_um: float, dy_um: float, n: int):
+        def add_straight(dx_um: float, dy_um: float):
             nonlocal x, y
-            n = max(2, int(n))
+            L = float(np.hypot(dx_um, dy_um))
+            n = max(8, int(np.ceil(L * self.resolution)))
             for t in np.linspace(0.0, 1.0, n, dtype=np.float64)[1:]:
                 pts.append((x + dx_um * float(t), y + dy_um * float(t)))
             x += float(dx_um)
             y += float(dy_um)
 
-        # Ensure minimum straight input section
-        input_lead = max(self.lead_x_um, self.min_straight_input_um)
-        add_straight(input_lead, 0.0, n=max(8, int(input_lead * self.resolution)))
+        # Input lead
+        add_straight(self.lead_in_um, 0.0)
 
         up = bool(self.start_up)
-        dir_x, dir_y = 1.0, 0.0  # local forward direction (starts +x)
-
-        n_zigs = max(0, int(self.n_zigs))
-        for zi in range(n_zigs):
+        for zi in range(max(0, self.n_zigs)):
             sgn = +1.0 if up else -1.0
+            th = np.deg2rad(float(self.bend_angle_deg))
 
-            theta_deg = float(self.bend_angle_deg)
-
-            # If this is a turn-device, enforce an axis-aligned *final* direction by making the final turn 90°.
-            if bool(self.end_with_turn) and (zi == n_zigs - 1):
-                if self.end_turn_deg is not None:
-                    if self.force_turn_ports_axis_aligned:
-                        theta_deg = _snap_deg_90_nonsigned(self.end_turn_deg)
-                    else:
-                        theta_deg = float(self.end_turn_deg)
-                elif self.force_turn_ports_axis_aligned:
-                    theta_deg = _snap_deg_90_nonsigned(self.turn_axis_deg)
-
-            bend_rad = np.deg2rad(theta_deg)
-
-            # First bend
-            xb, yb, _ = _euler_bend_points(theta_total_rad=bend_rad, R_min_um=self.R_min_um, n_pts=128, sign=sgn)
-            for i in range(1, len(xb)):
-                pts.append((x + float(xb[i]), y + float(yb[i])))
+            xb, yb, _ = _euler_bend_points(th, self.R_min_um, n_pts=192, sign=sgn)
+            for k in range(1, len(xb)):
+                pts.append((x + float(xb[k]), y + float(yb[k])))
             x += float(xb[-1])
             y += float(yb[-1])
 
-            # Straight along bent direction
-            bent_dir_x = float(np.cos(sgn * bend_rad))
-            bent_dir_y = float(np.sin(sgn * bend_rad))
-            add_straight(
-                bent_dir_x * self.straight_y_um,
-                bent_dir_y * self.straight_y_um,
-                n=max(8, int(abs(self.straight_y_um) * self.resolution)),
-            )
+            # straight along bent direction
+            add_straight(float(np.cos(sgn * th)) * self.straight_y_um,
+                         float(np.sin(sgn * th)) * self.straight_y_um)
 
-            # If we end after the first bend, forward dir is bent_dir.
-            if bool(self.end_with_turn) and (zi == n_zigs - 1):
-                dir_x, dir_y = bent_dir_x, bent_dir_y
-                break
-
-            # Second bend back to +x
-            xb2, yb2, _ = _euler_bend_points(theta_total_rad=bend_rad, R_min_um=self.R_min_um, n_pts=128, sign=-sgn)
-            rot = sgn * bend_rad
-            cr, sr = float(np.cos(rot)), float(np.sin(rot))
-            for i in range(1, len(xb2)):
-                xx = float(xb2[i])
-                yy = float(yb2[i])
-                xr = cr * xx - sr * yy
-                yr = sr * xx + cr * yy
+            # bend back to +x
+            xb2, yb2, _ = _euler_bend_points(th, self.R_min_um, n_pts=192, sign=-sgn)
+            rot = sgn * th
+            c, s = float(np.cos(rot)), float(np.sin(rot))
+            for k in range(1, len(xb2)):
+                xx, yy = float(xb2[k]), float(yb2[k])
+                xr = c * xx - s * yy
+                yr = s * xx + c * yy
                 pts.append((x + xr, y + yr))
-            xx = float(xb2[-1])
-            yy = float(yb2[-1])
-            xr_end = cr * xx - sr * yy
-            yr_end = sr * xx + cr * yy
+            xx, yy = float(xb2[-1]), float(yb2[-1])
+            xr_end = c * xx - s * yy
+            yr_end = s * xx + c * yy
             x += xr_end
             y += yr_end
 
-            dir_x, dir_y = 1.0, 0.0
+            # between-zig straight
+            add_straight(self.straight_x_um, 0.0)
 
-            # Horizontal straight between zigs
-            add_straight(self.straight_x_um, 0.0, n=max(8, int(self.straight_x_um * self.resolution)))
             up = not up
 
-        # Output lead in current forward direction
-        add_straight(dir_x * self.lead_x_um, dir_y * self.lead_x_um, n=max(8, int(self.lead_x_um * self.resolution)))
+        # Output lead
+        add_straight(self.lead_out_um, 0.0)
 
         pts = np.asarray(pts, dtype=np.float64)
 
-        # Center and apply vertical offset (before rotation)
-        x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
-        y_min, y_max = float(pts[:, 1].min()), float(pts[:, 1].max())
-        pts[:, 0] -= 0.5 * (x_min + x_max)
-        pts[:, 1] -= 0.5 * (y_min + y_max)
+        # Center + y-offset in local coords
+        pts[:, 0] -= 0.5 * float(pts[:, 0].min() + pts[:, 0].max())
+        pts[:, 1] -= 0.5 * float(pts[:, 1].min() + pts[:, 1].max())
         pts[:, 1] += self.y0_um
 
-        # Rotate path (snapped to multiples of 90 earlier)
-        rot_rad = np.deg2rad(self.path_rotation_deg)
-        pts = _rotate_points(pts, rot_rad)
+        # Snap-rotate (ports axis-aligned)
+        pts = _rotate_points(pts, self.path_rotation_deg)
 
-        # Fit check in non-PML region
-        core_half_w = 0.5 * self.wg_width_um
-        x_min_core = float(pts[:, 0].min()) - core_half_w
-        x_max_core = float(pts[:, 0].max()) + core_half_w
-        y_min_core = float(pts[:, 1].min()) - core_half_w
-        y_max_core = float(pts[:, 1].max()) + core_half_w
+        # Tangents at ends
+        tan_in = _unit(pts[1] - pts[0])
+        tan_out = _unit(pts[-1] - pts[-2])
 
-        if (
-            x_min_core < (nonpml_left + self.fit_margin_um)
-            or x_max_core > (nonpml_right - self.fit_margin_um)
-            or y_min_core < (nonpml_bot + self.fit_margin_um)
-            or y_max_core > (nonpml_top - self.fit_margin_um)
-        ):
-            raise ValueError(
-                "Waveguide does not fit inside the non-PML region. "
-                f"core_x=[{x_min_core:.3f},{x_max_core:.3f}] um, "
-                f"core_y=[{y_min_core:.3f},{y_max_core:.3f}] um, "
-                f"allowed_x=[{(nonpml_left + self.fit_margin_um):.3f},{(nonpml_right - self.fit_margin_um):.3f}] um, "
-                f"allowed_y=[{(nonpml_bot + self.fit_margin_um):.3f},{(nonpml_top - self.fit_margin_um):.3f}] um."
-            )
+        # Must be axis-aligned after snap-rotation
+        if not (_is_axis_aligned(tan_in) and _is_axis_aligned(tan_out)):
+            raise ValueError("Port tangents are not axis-aligned. Set path_rotation_deg to multiples of 90.")
 
-        # Centerline -> blocks
-        geometry = _polyline_to_blocks(pts, wg_width_um=self.wg_width_um, material=core)
+        self.tan_in = tan_in
+        self.tan_out = tan_out
+        self.axis_in, self.sign_in = _axis_from_tangent(tan_in)
+        self.axis_out, self.sign_out = _axis_from_tangent(tan_out)
 
-        # Endpoint tangents
-        input_pt = pts[0]
-        input_tangent = pts[1] - pts[0]
-        input_tangent = input_tangent / np.linalg.norm(input_tangent)
+        # Fit check inside non-PML interior with margin
+        half_x = 0.5 * float(self.cell_x)
+        half_y = 0.5 * float(self.cell_y)
+        left = -half_x + float(self.dpml) + float(self.fit_margin_um)
+        right = +half_x - float(self.dpml) - float(self.fit_margin_um)
+        bot = -half_y + float(self.dpml) + float(self.fit_margin_um)
+        top = +half_y - float(self.dpml) - float(self.fit_margin_um)
 
-        output_pt = pts[-1]
-        output_tangent = pts[-1] - pts[-2]
-        output_tangent = output_tangent / np.linalg.norm(output_tangent)
+        r = 0.5 * float(self.wg_width_um)
+        if (pts[:, 0].min() - r) < left or (pts[:, 0].max() + r) > right or (pts[:, 1].min() - r) < bot or (pts[:, 1].max() + r) > top:
+            raise ValueError("Waveguide does not fit inside non-PML interior; increase cell/crop or reduce geometry.")
 
-        # Extend leads to cell boundary (into PML) so fields settle / ports are stable.
-        clearance = self.lead_boundary_clearance_um if self.lead_extend_through_pml else self.dpml
+        # Build geometry blocks
+        self.geometry = _polyline_to_blocks(pts, wg_width_um=self.wg_width_um, material=core)
 
-        # input extends backwards
-        input_end = self._ray_to_cell_boundary(input_pt, -input_tangent, clearance)
-        if input_end is not None:
-            lead_len = float(np.linalg.norm(input_end - input_pt))
-            if lead_len > 0.01:
-                lead_center = 0.5 * (input_pt + input_end)
-                tx, ty = _unit(float(-input_tangent[0]), float(-input_tangent[1]))
-                geometry.append(
-                    mp.Block(
-                        size=mp.Vector3(lead_len * 1.05, self.wg_width_um, mp.inf),
-                        center=mp.Vector3(float(lead_center[0]), float(lead_center[1]), 0.0),
-                        material=core,
-                        e1=mp.Vector3(tx, ty, 0.0),
-                        e2=mp.Vector3(-ty, tx, 0.0),
-                    )
-                )
+        # Device window for ML conditioning: bounding box + small margin
+        x0, x1 = float(pts[:, 0].min()), float(pts[:, 0].max())
+        y0, y1 = float(pts[:, 1].min()), float(pts[:, 1].max())
+        half_w = 0.5 * float(self.wg_width_um)
+        self.dev_cx = 0.5 * (x0 + x1)
+        self.dev_cy = 0.5 * (y0 + y1)
+        self.dev_wx = (x1 - x0) + 2.0 * (float(self.fit_margin_um) + half_w)
+        self.dev_wy = (y1 - y0) + 2.0 * (float(self.fit_margin_um) + half_w)
 
-        # output extends forwards
-        output_end = self._ray_to_cell_boundary(output_pt, output_tangent, clearance)
-        if output_end is not None:
-            lead_len = float(np.linalg.norm(output_end - output_pt))
-            if lead_len > 0.01:
-                lead_center = 0.5 * (output_pt + output_end)
-                tx, ty = _unit(float(output_tangent[0]), float(output_tangent[1]))
-                geometry.append(
-                    mp.Block(
-                        size=mp.Vector3(lead_len * 1.05, self.wg_width_um, mp.inf),
-                        center=mp.Vector3(float(lead_center[0]), float(lead_center[1]), 0.0),
-                        material=core,
-                        e1=mp.Vector3(tx, ty, 0.0),
-                        e2=mp.Vector3(-ty, tx, 0.0),
-                    )
-                )
-
-        self.geometry = geometry
-
-        # Ports/source: placed relative to non-PML boundary intersection along the axis-aligned tangents.
+        # Ports: place them near non-PML boundary (inside) along the axis direction
         span = self.get_port_y_span_um()
-        half_span = 0.5 * span
 
-        def find_nonpml_boundary_intersection(pt, d_toward_boundary):
-            tx, ty = float(d_toward_boundary[0]), float(d_toward_boundary[1])
-            px, py = float(pt[0]), float(pt[1])
-            eps = 1e-12
-            t_vals = []
+        def place_port_on_interior_boundary(tangent: np.ndarray, margin: float, which: str):
+            # which = "in" or "out"
+            tangent = _unit(tangent)
+            axis, sgn = _axis_from_tangent(tangent)
 
-            if abs(tx) > eps:
-                t_left = (nonpml_left - px) / tx
-                t_right = (nonpml_right - px) / tx
-                if t_left > 0:
-                    t_vals.append(t_left)
-                if t_right > 0:
-                    t_vals.append(t_right)
+            half_x = 0.5 * float(self.cell_x)
+            half_y = 0.5 * float(self.cell_y)
+            nx_left = -half_x + float(self.dpml)
+            nx_right = +half_x - float(self.dpml)
+            ny_bot = -half_y + float(self.dpml)
+            ny_top = +half_y - float(self.dpml)
 
-            if abs(ty) > eps:
-                t_bot = (nonpml_bot - py) / ty
-                t_top = (nonpml_top - py) / ty
-                if t_bot > 0:
-                    t_vals.append(t_bot)
-                if t_top > 0:
-                    t_vals.append(t_top)
+            if axis == mp.X:
+                # tangent is ±x
+                x = (nx_left + margin) if sgn > 0 else (nx_right - margin)
+                y = 0.0
+                size = mp.Vector3(0, span, 0)
+                kpoint = mp.Vector3(sgn, 0, 0)
+            else:
+                # tangent is ±y
+                y = (ny_bot + margin) if sgn > 0 else (ny_top - margin)
+                x = 0.0
+                size = mp.Vector3(span, 0, 0)
+                kpoint = mp.Vector3(0, sgn, 0)
 
-            if not t_vals:
-                return np.array([px, py], dtype=np.float64)
-            t = float(min(t_vals))
-            return np.array([px + tx * t, py + ty * t], dtype=np.float64)
+            return mp.Vector3(x, y, 0), size, kpoint, axis, sgn
 
-        # --- Input boundary hit (toward boundary is -input_tangent) ---
-        input_boundary_pt = find_nonpml_boundary_intersection(input_pt, -input_tangent)
+        # Input port: tangent into device is tan_in (points from port into device)
+        port_in_center, port_in_size, k_in, axis_in, sgn_in = place_port_on_interior_boundary(self.tan_in, self.port_margin_um, "in")
+        self.port_in = mp.Volume(center=port_in_center, size=port_in_size)
 
-        # Source upstream, monitor downstream
-        src_pt = input_boundary_pt + input_tangent * self.port_margin_um
-        port_1_pt = input_boundary_pt + input_tangent * (self.port_margin_um + self.source_shift_um)
-
-        # Perpendicular for visualization
-        src_perp = np.array([-input_tangent[1], input_tangent[0]], dtype=np.float64)
-
-        self.x_port_1_um = float(port_1_pt[0])
-        self.y_port_1_um = float(port_1_pt[1])
-        self.x_src_um = float(src_pt[0])
-        self.y_src_um = float(src_pt[1])
-
-        self.src_center_um = (float(src_pt[0]), float(src_pt[1]))
-        self.src_size_um = (0.0, span)
-        self.src_direction_rad = float(np.arctan2(float(input_tangent[1]), float(input_tangent[0])))
-
-        # Port 1 volume (axis-aligned by construction)
-        if abs(float(input_tangent[0])) >= abs(float(input_tangent[1])):
-            port_1_size = mp.Vector3(0, span, 0)
-            src_size_vec = mp.Vector3(0, span, 0)
+        # Source is upstream of input port (opposite tangent direction)
+        if axis_in == mp.X:
+            src_center = mp.Vector3(float(port_in_center.x) - float(sgn_in) * float(self.source_shift_um), float(port_in_center.y), 0)
+            src_size = port_in_size
         else:
-            port_1_size = mp.Vector3(span, 0, 0)
-            src_size_vec = mp.Vector3(span, 0, 0)
+            src_center = mp.Vector3(float(port_in_center.x), float(port_in_center.y) - float(sgn_in) * float(self.source_shift_um), 0)
+            src_size = port_in_size
+        self.src_vol = mp.Volume(center=src_center, size=src_size)
 
-        self.port_1 = mp.Volume(center=mp.Vector3(float(port_1_pt[0]), float(port_1_pt[1]), 0.0), size=port_1_size)
-        self.src_1 = mp.Volume(center=mp.Vector3(float(src_pt[0]), float(src_pt[1]), 0.0), size=src_size_vec)
+        # Output port: tangent out of device is tan_out (points from device toward port boundary)
+        port_out_center, port_out_size, k_out, axis_out, sgn_out = place_port_on_interior_boundary(self.tan_out, self.port_margin_um, "out")
+        self.port_out = mp.Volume(center=port_out_center, size=port_out_size)
 
-        self.src_line_start_um = (float(src_pt[0] - src_perp[0] * half_span), float(src_pt[1] - src_perp[1] * half_span))
-        self.src_line_end_um = (float(src_pt[0] + src_perp[0] * half_span), float(src_pt[1] + src_perp[1] * half_span))
+        # Store for simulation
+        self._k_in = k_in
+        self._k_out = k_out
+        self.axis_in = axis_in
+        self.axis_out = axis_out
+        self.sign_in = sgn_in
+        self.sign_out = sgn_out
 
-        # --- Output boundary hit (toward boundary is +output_tangent) ---
-        output_boundary_pt = find_nonpml_boundary_intersection(output_pt, output_tangent)
-
-        # Place output monitor inward from boundary
-        port_2_pt = output_boundary_pt - output_tangent * self.port_margin_um
-
-        self.x_port_2_um = float(port_2_pt[0])
-        self.y_port_2_um = float(port_2_pt[1])
-
-        output_perp = np.array([-output_tangent[1], output_tangent[0]], dtype=np.float64)
-
-        self.output_center_um = (float(port_2_pt[0]), float(port_2_pt[1]))
-        self.output_line_start_um = (float(port_2_pt[0] - output_perp[0] * half_span), float(port_2_pt[1] - output_perp[1] * half_span))
-        self.output_line_end_um = (float(port_2_pt[0] + output_perp[0] * half_span), float(port_2_pt[1] + output_perp[1] * half_span))
-
-        if abs(float(output_tangent[0])) >= abs(float(output_tangent[1])):
-            port_2_size = mp.Vector3(0, span, 0)
-        else:
-            port_2_size = mp.Vector3(span, 0, 0)
-
-        self.port_2 = mp.Volume(center=mp.Vector3(float(port_2_pt[0]), float(port_2_pt[1]), 0.0), size=port_2_size)
-
-        self.full_plane = mp.Volume(center=mp.Vector3(0.0, 0.0, 0.0), size=mp.Vector3(self.cell_x, self.cell_y, 0.0))
-
-        # Store tangents for eigenmode source/monitor k-points
-        self.input_tangent = input_tangent
-        self.output_tangent = output_tangent
-
-        # Hard guarantee: if we forced axis-aligned turn ports, both tangents must be axis-aligned
-        if self.force_turn_ports_axis_aligned:
-            def _is_axis_aligned(t):
-                return (abs(t[0]) > 0.999 and abs(t[1]) < 1e-3) or (abs(t[1]) > 0.999 and abs(t[0]) < 1e-3)
-            if not (_is_axis_aligned(self.input_tangent) and _is_axis_aligned(self.output_tangent)):
-                raise ValueError("Ports are not axis-aligned; check turn enforcement / rotation snapping.")
-
-    def get_eps_and_cell(self, crop_pml: bool = False):
-        sim = mp.Simulation(
-            cell_size=self.cell,
-            resolution=self.resolution,
-            boundary_layers=[mp.PML(self.dpml)],
-            geometry=self.geometry,
-            default_material=self.clad_medium,
-            sources=[],
-        )
-        sim.init_sim()
-        eps_2d = sim.get_epsilon()  # [nx, ny]
-        eps_mid = eps_2d.T          # [ny, nx]
-        sim.reset_meep()
-
-        if not crop_pml:
-            return eps_mid, (self.cell_x, self.cell_y)
-        p = self.pml_px()
-        if p <= 0:
-            return eps_mid, (self.cell_x, self.cell_y)
-        return eps_mid[p:-p, p:-p], (self.cell_x - 2 * self.dpml, self.cell_y - 2 * self.dpml)
-
-    def _um_to_px(self, x_um, y_um, crop_pml: bool):
-        p = self.pml_px() if crop_pml else 0
-        px_x = (x_um + 0.5 * self.cell_x) * self.resolution - p
-        px_y = (y_um + 0.5 * self.cell_y) * self.resolution - p
-        return px_x, px_y
-
-    def get_source_region_px(self, crop_pml: bool = True):
-        cx, cy = self._um_to_px(self.src_center_um[0], self.src_center_um[1], crop_pml)
-        sx, sy = self._um_to_px(self.src_line_start_um[0], self.src_line_start_um[1], crop_pml)
-        ex, ey = self._um_to_px(self.src_line_end_um[0], self.src_line_end_um[1], crop_pml)
-        dx = float(self.input_tangent[0])
-        dy = float(self.input_tangent[1])
-        return {
-            "center_px": (cx, cy),
-            "line_start_px": (sx, sy),
-            "line_end_px": (ex, ey),
-            "direction_px": (dx, dy),
-        }
-
-    def get_output_region_px(self, crop_pml: bool = True):
-        cx, cy = self._um_to_px(self.output_center_um[0], self.output_center_um[1], crop_pml)
-        sx, sy = self._um_to_px(self.output_line_start_um[0], self.output_line_start_um[1], crop_pml)
-        ex, ey = self._um_to_px(self.output_line_end_um[0], self.output_line_end_um[1], crop_pml)
-        dx = float(self.output_tangent[0])
-        dy = float(self.output_tangent[1])
-        return {
-            "center_px": (cx, cy),
-            "line_start_px": (sx, sy),
-            "line_end_px": (ex, ey),
-            "direction_px": (dx, dy),
-        }
-
-    def run_sim(self, decay_tol: float = 1e-6):
-        """
-        Run FDTD simulation, compute S-parameters (S11, S21), and return fields.
-
-        Returns:
-            eps_mid: [ny, nx]
-            Ez_mid:  [ny, nx] complex Ez at center frequency
-            S: {(1,1): S11, (2,1): S21}
-            cell: (cell_x, cell_y) in µm
-        """
-        lam = self.wavelength_um
+    # -------------------------
+    # Build sims
+    # -------------------------
+    def _build_sim_single(self, df_frac: float = 0.1):
+        lam = float(self.wavelength_um)
         fcen = 1.0 / lam
-        df_source = 0.1 * fcen
-
-        kdir_in = mp.Vector3(float(self.input_tangent[0]), float(self.input_tangent[1]), 0.0)
-        kdir_out = mp.Vector3(float(self.output_tangent[0]), float(self.output_tangent[1]), 0.0)
+        fwidth = float(df_frac) * fcen
 
         sources = [
             mp.EigenModeSource(
-                src=mp.GaussianSource(fcen, fwidth=df_source),
-                volume=self.src_1,
+                src=mp.GaussianSource(fcen, fwidth=fwidth),
+                volume=self.src_vol,
                 eig_band=1,
                 eig_parity=mp.NO_PARITY,
                 eig_match_freq=True,
-                eig_kpoint=kdir_in,
+                eig_kpoint=self._k_in,
             )
         ]
 
         sim = mp.Simulation(
             cell_size=self.cell,
-            resolution=self.resolution,
-            boundary_layers=[mp.PML(self.dpml)],
+            resolution=int(self.resolution),
+            boundary_layers=[mp.PML(float(self.dpml))],
             geometry=self.geometry,
             default_material=self.clad_medium,
             sources=sources,
         )
 
-        # Axis choice (should be axis-aligned now)
-        dir_in = mp.X if abs(float(self.input_tangent[0])) >= abs(float(self.input_tangent[1])) else mp.Y
-        dir_out = mp.X if abs(float(self.output_tangent[0])) >= abs(float(self.output_tangent[1])) else mp.Y
+        m1 = sim.add_mode_monitor(fcen, 0, 1, mp.ModeRegion(volume=self.port_in, direction=self.axis_in))
+        m2 = sim.add_mode_monitor(fcen, 0, 1, mp.ModeRegion(volume=self.port_out, direction=self.axis_out))
 
-        mon_1 = sim.add_mode_monitor(fcen, 0, 1, mp.ModeRegion(volume=self.port_1, direction=dir_in))
-        mon_2 = sim.add_mode_monitor(fcen, 0, 1, mp.ModeRegion(volume=self.port_2, direction=dir_out))
+        dft = sim.add_dft_fields([mp.Ez], fcen, 0, 1, center=self.full_plane.center, size=self.full_plane.size)
+        return sim, (m1, m2), dft, fcen
 
-        dft_fields = sim.add_dft_fields(
-            [mp.Ez],
-            fcen,
-            0,
-            1,
-            center=self.full_plane.center,
-            size=self.full_plane.size,
+    def _build_sim_broadband(self, lam_min_um: float, lam_max_um: float, Nf: int):
+        lam_min_um = float(lam_min_um)
+        lam_max_um = float(lam_max_um)
+        Nf = int(Nf)
+
+        fmin = 1.0 / lam_max_um
+        fmax = 1.0 / lam_min_um
+        fcen = 0.5 * (fmin + fmax)
+        df = (fmax - fmin)
+
+        freqs = np.linspace(fcen - 0.5 * df, fcen + 0.5 * df, Nf)
+        lams = 1.0 / freqs
+
+        sources = [
+            mp.EigenModeSource(
+                src=mp.GaussianSource(fcen, fwidth=df),
+                volume=self.src_vol,
+                eig_band=1,
+                eig_parity=mp.NO_PARITY,
+                eig_match_freq=True,
+                eig_kpoint=self._k_in,
+            )
+        ]
+
+        sim = mp.Simulation(
+            cell_size=self.cell,
+            resolution=int(self.resolution),
+            boundary_layers=[mp.PML(float(self.dpml))],
+            geometry=self.geometry,
+            default_material=self.clad_medium,
+            sources=sources,
         )
 
-        sim.run(until_after_sources=mp.stop_when_dft_decayed(tol=decay_tol))
+        m1 = sim.add_mode_monitor(fcen, df, Nf, mp.ModeRegion(volume=self.port_in, direction=self.axis_in))
+        m2 = sim.add_mode_monitor(fcen, df, Nf, mp.ModeRegion(volume=self.port_out, direction=self.axis_out))
+        return sim, (m1, m2), (fcen, df, Nf, freqs, lams)
 
-        res_1 = sim.get_eigenmode_coefficients(mon_1, [1], eig_parity=mp.NO_PARITY)
-        res_2 = sim.get_eigenmode_coefficients(mon_2, [1], eig_parity=mp.NO_PARITY)
+    # -------------------------
+    # Single-frequency S-params
+    # -------------------------
+    def run_sim(self, decay_tol: float = 1e-6, dir_plus: int = 0, dir_minus: int = 1):
+        """
+        Returns:
+          eps_mid [ny,nx], Ez_mid [ny,nx] complex (at fcen),
+          S11 complex, S21 complex, (cell_x, cell_y)
+        """
+        sim, (m1, m2), dft, _fcen = self._build_sim_single(df_frac=0.1)
+        sim.run(until_after_sources=mp.stop_when_dft_decayed(tol=float(decay_tol)))
 
-        a1_fwd = res_1.alpha[0, 0, 0]
-        a1_bwd = res_1.alpha[0, 0, 1]
+        eps_mid = sim.get_epsilon().T.astype(np.float32)
+        Ez_mid = sim.get_dft_array(dft, mp.Ez, 0).T.astype(np.complex64)
 
-        a2_fwd = res_2.alpha[0, 0, 0]
-        a2_bwd = res_2.alpha[0, 0, 1]
+        # toward_device sign convention along each port axis:
+        # input port incoming toward device is along +tan_in => sign_in
+        toward1 = int(np.sign(self.sign_in))  # +1 means incoming is +axis
+        # output port incoming toward device is opposite tan_out => -sign_out
+        toward2 = int(-np.sign(self.sign_out))
 
-        def _incident_and_reflected(a_fwd, a_bwd, direction_axis, tangent):
-            if direction_axis == mp.X:
-                sgn = float(np.sign(float(tangent[0])))
-            else:
-                sgn = float(np.sign(float(tangent[1])))
-            if sgn == 0.0:
-                sgn = 1.0
-            # If propagation is along +axis, incident is forward; if along -axis, incident is backward.
-            if sgn > 0:
-                return a_fwd, a_bwd
-            return a_bwd, a_fwd
+        alpha1 = get_mode_alpha_2dir(sim, m1, band=1, eig_parity=mp.NO_PARITY)  # (ndir,) or (1,ndir)
+        alpha2 = get_mode_alpha_2dir(sim, m2, band=1, eig_parity=mp.NO_PARITY)
 
-        a_in, a_ref = _incident_and_reflected(a1_fwd, a1_bwd, dir_in, self.input_tangent)
-        a_out, _ = _incident_and_reflected(a2_fwd, a2_bwd, dir_out, self.output_tangent)
+        alpha1 = np.asarray(alpha1)
+        alpha2 = np.asarray(alpha2)
+        if alpha1.ndim == 2:
+            alpha1 = alpha1[0]
+        if alpha2.ndim == 2:
+            alpha2 = alpha2[0]
 
-        if abs(a_in) < 1e-12:
-            sim.reset_meep()
-            raise ValueError("Input mode amplitude is ~0; check port direction/sign convention.")
+        a1_in, b1_out = pick_in_out_from_alpha(alpha1, toward1, dir_plus=dir_plus, dir_minus=dir_minus)
+        _a2_in, b2_out = pick_in_out_from_alpha(alpha2, toward2, dir_plus=dir_plus, dir_minus=dir_minus)
 
-        S = {
-            (1, 1): a_ref / a_in,
-            (2, 1): a_out / a_in,
-        }
+        S11 = b1_out / a1_in
+        S21 = b2_out / a1_in
 
-        eps_2d = sim.get_epsilon()
-        eps_mid = eps_2d.T
-        Ez_mid = sim.get_dft_array(dft_fields, mp.Ez, 0).T
         sim.reset_meep()
 
-        return eps_mid, Ez_mid, S, (self.cell_x, self.cell_y)
+        self.S11 = S11
+        self.S21 = S21
+        return eps_mid, Ez_mid, S11, S21, (self.cell_x, self.cell_y)
+
+    # -------------------------
+    # Broadband spectral response
+    # -------------------------
+    def run_spectrum(
+        self,
+        lam_min_um: float = 1.40,
+        lam_max_um: float = 1.60,
+        Nf: int = 101,
+        decay_tol: float = 1e-6,
+        n_periods: int = 50,
+        dir_plus: int = 0,
+        dir_minus: int = 1,
+    ):
+        """
+        Returns:
+          lams [Nf] (um),
+          S11 [Nf] complex,
+          S21 [Nf] complex
+        """
+        sim, (m1, m2), (fcen, df, Nf, freqs, lams) = self._build_sim_broadband(lam_min_um, lam_max_um, Nf)
+
+        stop = mp.stop_when_fields_decayed(int(n_periods), mp.Ez, self.port_out.center, float(decay_tol))
+        sim.run(until_after_sources=stop)
+
+        res1 = sim.get_eigenmode_coefficients(m1, [1], eig_parity=mp.NO_PARITY)
+        res2 = sim.get_eigenmode_coefficients(m2, [1], eig_parity=mp.NO_PARITY)
+
+        alpha1 = res1.alpha[:, 0, :]  # (Nf, ndir)
+        alpha2 = res2.alpha[:, 0, :]  # (Nf, ndir)
+
+        toward1 = int(np.sign(self.sign_in))
+        toward2 = int(-np.sign(self.sign_out))
+
+        a1_in, b1_out = pick_in_out_from_alpha(alpha1, toward1, dir_plus=dir_plus, dir_minus=dir_minus)
+        _a2_in, b2_out = pick_in_out_from_alpha(alpha2, toward2, dir_plus=dir_plus, dir_minus=dir_minus)
+
+        S11 = b1_out / a1_in
+        S21 = b2_out / a1_in
+
+        sim.reset_meep()
+
+        self.lams = lams
+        self.S11_spec = S11
+        self.S21_spec = S21
+        return lams, S11, S21

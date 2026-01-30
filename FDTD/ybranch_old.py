@@ -1,15 +1,45 @@
 # ybranch.py
+from __future__ import annotations
+
 import meep as mp
 import numpy as np
 
 from utils import neff_siwire_from_tables
-from devices_base import (
-    Device2DBase,
-    DEFAULT_CELL_X_UM,
-    DEFAULT_CELL_Y_UM,
-    DEFAULT_DPML_UM,
-    DEFAULT_RESOLUTION,
-)
+from devices_base import Device2DBase
+
+
+def _draw_thick_line_mask(
+    ny: int,
+    nx: int,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    thickness_px: int = 3,
+) -> np.ndarray:
+    """
+    Draw a thick line segment into a float32 mask using a simple distance-to-segment threshold.
+    Coordinates are in pixel space (x right, y up) consistent with imshow(origin='lower').
+    """
+    x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+    vx = x1f - x0f
+    vy = y1f - y0f
+    vv = vx * vx + vy * vy
+    if vv < 1e-9:
+        m = np.zeros((ny, nx), dtype=np.float32)
+        xi = int(np.clip(round(x0f), 0, nx - 1))
+        yi = int(np.clip(round(y0f), 0, ny - 1))
+        m[yi, xi] = 1.0
+        return m
+
+    yy, xx = np.indices((ny, nx), dtype=np.float32)
+    t = ((xx - x0f) * vx + (yy - y0f) * vy) / vv
+    t = np.clip(t, 0.0, 1.0)
+    px = x0f + t * vx
+    py = y0f + t * vy
+    d2 = (xx - px) ** 2 + (yy - py) ** 2
+    thr2 = float(thickness_px * thickness_px)
+    return (d2 <= thr2).astype(np.float32)
 
 
 class YBranch2D(Device2DBase):
@@ -53,22 +83,43 @@ class YBranch2D(Device2DBase):
 
         bend_n_segments: int = 80,
 
+        # Euler-aligned sizing (optional):
+        crop_px: int | None = None,        # target non-PML crop in pixels (square)
+        quantize_grid: bool = True,        # snap dpml to integer pixels when crop_px is used
+        fit_margin_um: float = 0.5,        # safety margin from inner PML faces
         cell_x_um: float | None = None,
         cell_y_um: float | None = None,
 
         port_y_span_um: float | None = None,
     ):
-        # Use shared defaults from Device2DBase unless overridden
-        super().__init__(
-            cell_x_um=DEFAULT_CELL_X_UM if cell_x_um is None else cell_x_um,
-            cell_y_um=DEFAULT_CELL_Y_UM if cell_y_um is None else cell_y_um,
-            dpml=DEFAULT_DPML_UM if dpml is None else dpml,
-            resolution=DEFAULT_RESOLUTION if resolution is None else resolution,
-        )
+        crop_px_i = None if crop_px is None else int(crop_px)
+        if crop_px_i is not None and crop_px_i <= 0:
+            raise ValueError("crop_px must be > 0")
+        resolution_i = int(32 if resolution is None else resolution)
+        if resolution_i <= 0:
+            raise ValueError("resolution must be > 0")
+
+        # Quantize dpml + cell so (crop_px + 2*pml_px) is integer pixels (Euler-style).
+        if crop_px_i is not None and bool(quantize_grid) and (cell_x_um is None or cell_y_um is None):
+            pml_px = int(np.round(float(dpml) * float(resolution_i)))
+            dpml_q = float(pml_px) / float(resolution_i)
+            full_px = int(crop_px_i + 2 * pml_px)
+            cell_um_q = float(full_px) / float(resolution_i)
+            cx = cell_um_q if cell_x_um is None else float(cell_x_um)
+            cy = cell_um_q if cell_y_um is None else float(cell_y_um)
+            dpml_use = dpml_q
+        else:
+            cx = float(cell_x_um) if cell_x_um is not None else None
+            cy = float(cell_y_um) if cell_y_um is not None else None
+            dpml_use = float(dpml)
+
+        super().__init__(cell_x_um=cx, cell_y_um=cy, dpml=float(dpml_use), resolution=int(resolution_i))
+
+        self.crop_px = crop_px_i
+        self.fit_margin_um = float(fit_margin_um)
 
         self.wg_width_um = float(wg_width_um)
         self.wavelength_um = float(wavelength_um)
-        # resolution is already set by Device2DBase; avoid int(None) when resolution is omitted
         self.resolution = int(self.resolution)
 
         if n_core is None:
@@ -134,6 +185,64 @@ class YBranch2D(Device2DBase):
 
         self.build_geometry()
 
+    def pml_px(self) -> int:
+        return int(np.round(float(self.dpml) * float(self.resolution)))
+
+    def nonpml_shape(self) -> tuple[int, int]:
+        p = self.pml_px()
+        nx = int(np.round(self.cell_x * self.resolution)) - 2 * p
+        ny = int(np.round(self.cell_y * self.resolution)) - 2 * p
+        return ny, nx
+
+    def _um_to_px(self, x_um: float, y_um: float, crop_pml: bool) -> tuple[float, float]:
+        p = self.pml_px() if crop_pml else 0
+        px_x = (float(x_um) + 0.5 * self.cell_x) * float(self.resolution) - float(p)
+        px_y = (float(y_um) + 0.5 * self.cell_y) * float(self.resolution) - float(p)
+        return px_x, px_y
+
+    def get_port_region_px(self, port: int, crop_pml: bool = True) -> dict:
+        if port not in (1, 2, 3):
+            raise ValueError("port must be 1..3")
+        centers = self.get_port_centers_um()
+        x0, y0 = centers[int(port)]
+        span = self.get_port_y_span_um()
+        half = 0.5 * span
+        x_px, y_px = self._um_to_px(x0, y0, crop_pml)
+        x_s, y_s = self._um_to_px(x0, y0 - half, crop_pml)
+        x_e, y_e = self._um_to_px(x0, y0 + half, crop_pml)
+        return {
+            "center_px": (x_px, y_px),
+            "line_start_px": (x_s, y_s),
+            "line_end_px": (x_e, y_e),
+            "direction_px": (1.0, 0.0),
+        }
+
+    def get_source_region_px(self, input_port: int = 1, crop_pml: bool = True) -> dict:
+        if input_port != 1:
+            raise ValueError("YBranch2D has only one input port: input_port must be 1.")
+        x0 = float(self.x_port_left_um) - float(self.source_shift_um)
+        # keep inside non-PML
+        half_x = 0.5 * self.cell_x
+        nonpml_left = -half_x + float(self.dpml)
+        x0 = max(x0, nonpml_left + 0.1)
+        y0 = 0.0
+        span = self.get_port_y_span_um()
+        half = 0.5 * span
+        x_px, y_px = self._um_to_px(x0, y0, crop_pml)
+        x_s, y_s = self._um_to_px(x0, y0 - half, crop_pml)
+        x_e, y_e = self._um_to_px(x0, y0 + half, crop_pml)
+        return {
+            "center_px": (x_px, y_px),
+            "line_start_px": (x_s, y_s),
+            "line_end_px": (x_e, y_e),
+            "direction_px": (1.0, 0.0),
+        }
+
+    def make_line_mask_from_region_px(self, ny: int, nx: int, region_px: dict, thickness_px: int = 3) -> np.ndarray:
+        (x0, y0) = region_px["line_start_px"]
+        (x1, y1) = region_px["line_end_px"]
+        return _draw_thick_line_mask(ny, nx, x0, y0, x1, y1, thickness_px=int(thickness_px)).astype(np.float32)
+
     def build_geometry(self):
         core = mp.Medium(index=self.n_core)
         clad = mp.Medium(index=self.n_clad)
@@ -143,12 +252,15 @@ class YBranch2D(Device2DBase):
 
         # non-PML x-range
         half_cell = 0.5 * self.cell_x
+        half_y = 0.5 * self.cell_y
         x_pml_left = -half_cell
         x_pml_right = half_cell
         x_npml_left = x_pml_left + self.dpml
         x_npml_right = x_pml_right - self.dpml
+        y_npml_bot = -half_y + self.dpml
+        y_npml_top = +half_y - self.dpml
 
-        margin = 0.6
+        margin = float(self.fit_margin_um)
         L_req = self.l_in_um + self.l_junction_um + self.l_bend_um + self.l_out_um
         avail = (x_npml_right - margin) - (x_npml_left + margin)
         if L_req > avail:
@@ -273,6 +385,13 @@ class YBranch2D(Device2DBase):
         self.y_port_2_um = float(y_out_top)
         self.y_port_3_um = float(y_out_bot)
 
+        # Y fit sanity (non-PML)
+        y_max_core = max(abs(y_out_top), abs(y_out_bot)) + 0.5 * float(self.wg_width_um) + margin
+        if y_max_core > min(abs(y_npml_top), abs(y_npml_bot)):
+            raise ValueError(
+                "YBranch2D does not fit in non-PML region (y). Reduce h_bend/pad_y or increase crop/cell."
+            )
+
         if x_out0 < x_pml_right:
             out_len = x_pml_right - x_out0
             out_center = 0.5 * (x_out0 + x_pml_right)
@@ -355,7 +474,7 @@ class YBranch2D(Device2DBase):
             return float(self.wg_width_um + 0.4)
         return float(self._port_y_span_um)
 
-    def get_eps_and_cell(self):
+    def get_eps_and_cell(self, crop_pml: bool = False):
         """
         Return the permittivity grid (ny, nx) and (cell_x, cell_y) without running a source.
 
@@ -381,7 +500,13 @@ class YBranch2D(Device2DBase):
         # Free internal Meep state (helps avoid memory creep)
         sim.reset_meep()
 
+        if not crop_pml:
         return eps_mid, (self.cell_x, self.cell_y)
+
+        p = self.pml_px()
+        if p <= 0:
+            return eps_mid, (self.cell_x, self.cell_y)
+        return eps_mid[p:-p, p:-p], (self.cell_x - 2 * self.dpml, self.cell_y - 2 * self.dpml)
 
     def run_sim(self, input_port: int = 1, decay_tol: float = 1e-6):
         """

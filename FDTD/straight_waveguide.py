@@ -4,105 +4,60 @@ from utils import neff_siwire_from_tables
 from devices_base import Device2DBase
 
 class StraightWaveguide2D(Device2DBase):
-    """
-    2D effective-index straight waveguide, Tidy3D-style:
+    def __init__(self,
+                 wg_width=0.45,
+                 wavelength=1.55,
+                 dev_length_um=12.0,     
+                 n_core=None,
+                 n_clad=1.444,
+                 port_y_pad=1.0,
+                 source_shift=0.5,
+                 fit_margin_um=0.5):
+        super().__init__()  # inherits cell_x, cell_y, dpml, resolution defaults
 
-      - Core: index n_core, width wg_width_um (y), infinite in x (extends into PML)
-      - Background: cladding index n_clad
-      - PML on all sides
-      - Domain length (wg_length_um) is distance between inner PML faces
-    """
-
-    def __init__(
-        self,
-        wg_width_um: float = 0.45,
-        wg_length_um: float = 20.0,    # physical length between inner PML faces [µm]
-        wavelength_um: float = 1.55,
-        resolution: int = 40,
-        n_core: float | None = None,
-        n_clad: float = 1.444,
-        dpml: float = 1.0,
-        pad_y_um: float = 2.0,
-        port_margin_um: float = 2.0,   # distance from inner PML to ports [µm]
-        source_shift_um: float = 0.5,  # distance source is upstream of input port [µm]
-        cell_x_um: float | None = None,
-        cell_y_um: float | None = None,
-    ):
-        # Use base defaults unless overrides provided
-        cx = 25.0 if cell_x_um is None else cell_x_um
-        cy = 4.0 if cell_y_um is None else cell_y_um
-        super().__init__(cell_x_um=cx, cell_y_um=cy, dpml=dpml, resolution=resolution)
-
-        self.wg_width_um = wg_width_um
-        self.domain_length_um = wg_length_um
-        self.wavelength_um = wavelength_um
-        if n_core is None:
-            # Look up geometry‑ and wavelength‑dependent n_eff from tables
-            self.n_core = neff_siwire_from_tables(self.wg_width_um, self.wavelength_um)
-        else:
-            self.n_core = n_core
+        self.wg_width = wg_width
+        self.wavelength = wavelength
         self.n_clad = n_clad
-        self.pad_y_um = pad_y_um
-        self.port_margin_um = port_margin_um
-        self.source_shift_um = source_shift_um
+        self.source_shift = source_shift
+        self.port_y_span = wg_width + port_y_pad
 
-        # to be filled by build_geometry()
-        self.geometry = None
-        self.port_in = None
-        self.port_out = None
-        self.src_vol = None
-        self.full_plane = None
-        self.clad_medium = None
+        self.fit_margin_um = fit_margin_um
+        self.dev_length_um = float(dev_length_um)
 
-        # results
-        self.eps_mid = None
-        self.Ez_mid = None
-        self.S21 = None
-        self.a_in = None
-        self.a_out = None
+        # clamp so it fits inside non-PML interior
+        L_inner = self.cell_x - 2 * self.dpml
+        max_len = L_inner - 2 * self.fit_margin_um
+        self.dev_length_um = float(np.clip(self.dev_length_um, 1.0, max_len))
+
+        # device window definition (conditioning/mask)
+        self.dev_cx = 0.0
+        self.dev_cy = 0.0
+        self.dev_wx = self.dev_length_um
+        self.dev_wy = self.wg_width + 2 * (port_y_pad + self.fit_margin_um)
+
+        self.n_core = neff_siwire_from_tables(wg_width, wavelength) if n_core is None else n_core
+        self.clad_medium = mp.Medium(index=self.n_clad)
 
         self.build_geometry()
 
     def build_geometry(self):
         core = mp.Medium(index=self.n_core)
-        clad = mp.Medium(index=self.n_clad)
-        self.clad_medium = clad
 
-        # straight waveguide extending through PML in x
-        self.geometry = [
-            mp.Block(
-                size=mp.Vector3(mp.inf, self.wg_width_um, mp.inf),
-                center=mp.Vector3(0, 0, 0),
-                material=core,
-            )
-        ]
+        # infinite waveguide geometry
+        self.geometry = [mp.Block(size=mp.Vector3(mp.inf, self.wg_width, mp.inf),
+                                  center=mp.Vector3(0, 0, 0),
+                                  material=core)]
 
-        # inner non-PML region: [-L/2, +L/2]
-        L = self.domain_length_um
-        x_left = -0.5 * L
-        x_right = +0.5 * L
+        # ports at device-window ends
+        x_in = -0.5 * self.dev_length_um
+        x_out = +0.5 * self.dev_length_um
 
-        # ports inside domain, offset from PML
-        x_in = x_left + self.port_margin_um
-        x_out = x_right - self.port_margin_um
-
-        port_y_span = self.wg_width_um + 1.0
-        port_size = mp.Vector3(0, port_y_span, 0)
-
+        port_size = mp.Vector3(0, self.port_y_span, 0)
         self.port_in = mp.Volume(center=mp.Vector3(x_in, 0), size=port_size)
         self.port_out = mp.Volume(center=mp.Vector3(x_out, 0), size=port_size)
 
-        # source a bit upstream of the input monitor
-        self.src_vol = mp.Volume(
-            center=mp.Vector3(x_in - self.source_shift_um, 0),
-            size=port_size,
-        )
+        self.src_vol = mp.Volume(center=mp.Vector3(x_in - self.source_shift, 0), size=port_size)
 
-        # full xy slice for DFT fields
-        self.full_plane = mp.Volume(
-            center=mp.Vector3(0, 0),
-            size=mp.Vector3(self.cell_x, self.cell_y, 0),
-        )
 
     def run_sim(self, decay_tol: float = 1e-3):
         """Run Meep, compute S21, and cache eps/Ez."""

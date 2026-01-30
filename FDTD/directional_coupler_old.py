@@ -1,9 +1,22 @@
 # directional_coupler.py
 import meep as mp
 import numpy as np
+import os
 
 from utils import neff_siwire_from_tables
 from devices_base import Device2DBase
+
+
+def _find_neff_tables_dir() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "neff_tables"),
+        os.path.join(os.path.dirname(here), "neff_tables"),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return "neff_tables"
 
 
 def _draw_thick_line_mask(ny: int, nx: int, x0: float, y0: float, x1: float, y1: float, thickness_px: int = 3) -> np.ndarray:
@@ -93,7 +106,7 @@ class DirectionalCoupler2D(Device2DBase):
             cy = float(cell_y_um) if cell_y_um is not None else (float(crop_px) / float(resolution) + 2.0 * float(dpml))
             dpml_use = float(dpml)
 
-        super().__init__(cell_x_um=float(cx), cell_y_um=float(cy), dpml=float(dpml_use), resolution=int(resolution))
+        super().__init__(cell_x=float(cx), cell_y=float(cy), dpml=float(dpml_use), resolution=int(resolution))
 
         self.wg_width_um = float(wg_width_um)
         self.gap_um = float(gap_um)
@@ -101,7 +114,13 @@ class DirectionalCoupler2D(Device2DBase):
         self.wavelength_um = float(wavelength_um)
 
         if n_core is None:
-            self.n_core = float(neff_siwire_from_tables(self.wg_width_um, self.wavelength_um))
+            self.n_core = float(
+                neff_siwire_from_tables(
+                    self.wg_width_um,
+                    self.wavelength_um,
+                    tables_dir=_find_neff_tables_dir(),
+                )
+            )
         else:
             self.n_core = float(n_core)
 
@@ -126,6 +145,7 @@ class DirectionalCoupler2D(Device2DBase):
         self.port_y_offset_um = None
 
         self.src_x_left_um = None
+        self.src_x_right_um = None
         self.src_y_top_um = None
         self.src_y_bot_um = None
 
@@ -178,10 +198,14 @@ class DirectionalCoupler2D(Device2DBase):
         }
 
     def get_source_region_px(self, input_port: int = 1, crop_pml: bool = True) -> dict:
-        if input_port not in (1, 2):
-            raise ValueError("input_port must be 1 or 2")
-        x0 = float(self.src_x_left_um)
-        y0 = float(self.src_y_top_um if input_port == 1 else self.src_y_bot_um)
+        if input_port not in (1, 2, 3, 4):
+            raise ValueError("input_port must be 1..4")
+        if input_port in (1, 2):
+            x0 = float(self.src_x_left_um)
+            y0 = float(self.src_y_top_um if input_port == 1 else self.src_y_bot_um)
+        else:
+            x0 = float(self.src_x_right_um)
+            y0 = float(self.src_y_top_um if input_port == 3 else self.src_y_bot_um)
         span = self.get_port_y_span_um()
         half = 0.5 * span
         x_px, y_px = self._um_to_px(x0, y0, crop_pml)
@@ -381,7 +405,11 @@ class DirectionalCoupler2D(Device2DBase):
         src_x_left = float(port_x_left) - float(self.source_shift_um)
         src_x_left = max(src_x_left, float(nonpml_left) + 0.1)
 
+        src_x_right = float(port_x_right) + float(self.source_shift_um)
+        src_x_right = min(src_x_right, float(nonpml_right) - 0.1)
+
         self.src_x_left_um = float(src_x_left)
+        self.src_x_right_um = float(src_x_right)
         self.src_y_top_um = float(+src_y_offset)
         self.src_y_bot_um = float(-src_y_offset)
 
@@ -394,18 +422,44 @@ class DirectionalCoupler2D(Device2DBase):
         # sources
         self.src_1 = mp.Volume(center=mp.Vector3(src_x_left, +src_y_offset, 0.0), size=port_size)
         self.src_2 = mp.Volume(center=mp.Vector3(src_x_left, -src_y_offset, 0.0), size=port_size)
+        self.src_3 = mp.Volume(center=mp.Vector3(src_x_right, +src_y_offset, 0.0), size=port_size)
+        self.src_4 = mp.Volume(center=mp.Vector3(src_x_right, -src_y_offset, 0.0), size=port_size)
+
+        self.ports = {
+            "port_1": self.port_1,
+            "port_2": self.port_2,
+            "port_3": self.port_3,
+            "port_4": self.port_4,
+        }
+        self.sources = {
+            "src_1": self.src_1,
+            "src_2": self.src_2,
+            "src_3": self.src_3,
+            "src_4": self.src_4,
+        }
 
         self.full_plane = mp.Volume(center=mp.Vector3(0.0, 0.0, 0.0), size=mp.Vector3(self.cell_x, self.cell_y, 0.0))
 
     def run_sim(self, input_port: int = 1, decay_tol: float = 1e-6):
-        if input_port not in (1, 2):
-            raise ValueError("input_port must be 1 (top left) or 2 (bottom left).")
+        if input_port not in (1, 2, 3, 4):
+            raise ValueError("input_port must be 1..4.")
 
         lam = self.wavelength_um
         fcen = 1.0 / lam
         df_source = 0.1 * fcen
 
-        src_vol = self.src_1 if input_port == 1 else self.src_2
+        if input_port == 1:
+            src_vol = self.src_1
+            k = mp.Vector3(+1, 0, 0)
+        elif input_port == 2:
+            src_vol = self.src_2
+            k = mp.Vector3(+1, 0, 0)
+        elif input_port == 3:
+            src_vol = self.src_3
+            k = mp.Vector3(-1, 0, 0)
+        else:
+            src_vol = self.src_4
+            k = mp.Vector3(-1, 0, 0)
         sources = [
             mp.EigenModeSource(
                 src=mp.GaussianSource(fcen, fwidth=df_source),
@@ -413,6 +467,7 @@ class DirectionalCoupler2D(Device2DBase):
                 eig_band=1,
                 eig_parity=mp.NO_PARITY,
                 eig_match_freq=True,
+                eig_kpoint=k,
             )
         ]
 
@@ -449,19 +504,26 @@ class DirectionalCoupler2D(Device2DBase):
         a3_fwd, a3_bwd = res3.alpha[0, 0, 0], res3.alpha[0, 0, 1]
         a4_fwd, a4_bwd = res4.alpha[0, 0, 0], res4.alpha[0, 0, 1]
 
-        if input_port == 1:
-            a_in = a1_fwd
-        else:
-            a_in = a2_fwd
+        incoming = {
+            1: a1_fwd,
+            2: a2_fwd,
+            3: a3_bwd,
+            4: a4_bwd,
+        }
+        outgoing = {
+            1: a1_bwd,
+            2: a2_bwd,
+            3: a3_fwd,
+            4: a4_fwd,
+        }
+        a_in = incoming[int(input_port)]
         if abs(a_in) < 1e-12:
             sim.reset_meep()
             raise ValueError("Input mode amplitude is ~0; check geometry/ports/source placement.")
 
         S = {}
-        S[(1, input_port)] = a1_bwd / a_in
-        S[(2, input_port)] = a2_bwd / a_in
-        S[(3, input_port)] = a3_fwd / a_in
-        S[(4, input_port)] = a4_fwd / a_in
+        for port in (1, 2, 3, 4):
+            S[(port, input_port)] = outgoing[port] / a_in
 
         eps_2d = sim.get_epsilon()
         eps_mid = eps_2d.T

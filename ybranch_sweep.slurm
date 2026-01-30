@@ -21,7 +21,9 @@ export MKL_NUM_THREADS=1
 # ---- run params (tune these)
 N_GEO=5000
 N_PROCS=26            # <= cpus-per-task; leave some headroom for OS/IO
-RES=32
+RES=20
+CROP_PX=384
+DPML=0.6666666667
 SHARD_SIZE=100        # samples per shard (each geometry -> 1 sample)
 QUEUE_MAX=128          # bounds temp file footprint
 COMPRESS="--compress" # comment out if you want faster, bigger shards
@@ -31,6 +33,8 @@ python -u FDTD/ybranch_sweep.py \
   --n-geo ${N_GEO} \
   --n-procs ${N_PROCS} \
   --resolution ${RES} \
+  --crop-px ${CROP_PX} \
+  --dpml ${DPML} \
   --shard-size ${SHARD_SIZE} \
   --queue-max ${QUEUE_MAX} \
   ${COMPRESS} \

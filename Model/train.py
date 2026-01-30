@@ -1,4 +1,5 @@
 # train.py  (train_physics_unet_pbfm_ddp.py)
+# Fixed weighted-sum training with optional ConFIG (conflictfree) gradient surgery.
 
 import argparse
 import csv
@@ -18,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torch.nn as nn
 
 try:
     from torch.amp import GradScaler as _GradScaler
@@ -31,10 +33,28 @@ except Exception:
 import wandb
 
 from dataset import FDTDDataset
+from dataset_fast import FastFDTDDataset
 from physics_unet import PhysicsUNet, HelmholtzResidual2D
 from complex_physics_unet import ComplexPhysicsUNet
 from flow_matching import psi_t, u_t, sample_t, cfm_loss_residual, sample as fm_sample, SIG_MIN
 from sparams_loss import extract_sparams
+
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None  # type: ignore[assignment]
+
+# Optional: ConFIG (conflictfree library)
+try:
+    from conflictfree.grad_operator import ConFIG_update as _ConFIG_update  # type: ignore
+    from conflictfree.utils import apply_gradient_vector as _apply_gradient_vector  # type: ignore
+    from conflictfree.utils import get_gradient_vector as _get_gradient_vector  # type: ignore
+    _HAS_CONFLICTFREE = True
+except Exception:  # pragma: no cover
+    _ConFIG_update = None
+    _apply_gradient_vector = None
+    _get_gradient_vector = None
+    _HAS_CONFLICTFREE = False
 
 # Optional (rank0 sample plots)
 import matplotlib
@@ -48,6 +68,64 @@ torch.set_float32_matmul_precision("high")
 torch.backends.cuda.preferred_linalg_library("cusolver")
 
 dtype = torch.float32
+
+
+def _save_eval_sample_png(
+    *,
+    out_path: str,
+    title: str,
+    eps_phys: np.ndarray,
+    ezr_gt: np.ndarray,
+    ezi_gt: np.ndarray,
+    ezr_pred: np.ndarray,
+    ezi_pred: np.ndarray,
+) -> None:
+    """
+    Save a compact 2x4 comparison panel:
+      eps | Ez_real GT | Ez_imag GT | |Ez| GT
+      Ez_real pred | Ez_imag pred | |Ez| pred | |err|
+    Arrays are expected as HxW numpy arrays in physical units.
+    """
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        mag_gt = np.sqrt(ezr_gt**2 + ezi_gt**2 + 1e-12)
+        mag_pred = np.sqrt(ezr_pred**2 + ezi_pred**2 + 1e-12)
+        mag_err = np.sqrt((ezr_pred - ezr_gt) ** 2 + (ezi_pred - ezi_gt) ** 2 + 1e-12)
+
+        fig, axes = plt.subplots(2, 4, figsize=(16, 7))
+        axes = axes.reshape(2, 4)
+        fig.suptitle(title, fontsize=11)
+
+        def im(ax, arr, t, *, cmap="magma", vmin=None, vmax=None):
+            h = ax.imshow(arr, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax)
+            ax.set_title(t, fontsize=10)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return h
+
+        hs = []
+        hs.append(im(axes[0, 0], eps_phys, "eps (phys)", cmap="viridis"))
+        hs.append(im(axes[0, 1], ezr_gt, "Ez_real (GT)", cmap="RdBu"))
+        hs.append(im(axes[0, 2], ezi_gt, "Ez_imag (GT)", cmap="RdBu"))
+        hs.append(im(axes[0, 3], mag_gt, "|Ez| (GT)", cmap="magma"))
+
+        hs.append(im(axes[1, 0], ezr_pred, "Ez_real (pred)", cmap="RdBu"))
+        hs.append(im(axes[1, 1], ezi_pred, "Ez_imag (pred)", cmap="RdBu"))
+        hs.append(im(axes[1, 2], mag_pred, "|Ez| (pred)", cmap="magma"))
+        hs.append(im(axes[1, 3], mag_err, "|err|", cmap="magma"))
+
+        for ax, h in zip(axes.ravel(), hs):
+            fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
+
+        fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+    except Exception:
+        # plotting must never crash training
+        try:
+            plt.close("all")
+        except Exception:
+            pass
 
 
 @torch.no_grad()
@@ -134,104 +212,6 @@ def _phase_start_epoch(phase: str, N1: int, N2: int) -> int:
     return int(N2)
 
 
-def _norm(a: torch.Tensor) -> float:
-    return float(torch.linalg.norm(a).item())
-
-
-def _finite_frac(x: torch.Tensor) -> float:
-    return float(torch.isfinite(x).float().mean().item())
-
-
-def _cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> float:
-    na = torch.linalg.norm(a).clamp_min(eps)
-    nb = torch.linalg.norm(b).clamp_min(eps)
-    return float((torch.dot(a.flatten(), b.flatten()) / (na * nb)).item())
-
-
-def compute_grad_vector(
-    loss: torch.Tensor,
-    model: torch.nn.Module,
-    *,
-    retain_graph: bool,
-    create_graph: bool = False,
-) -> torch.Tensor:
-    params = [p for p in model.parameters() if p.requires_grad]
-    if not params:
-        return torch.zeros(0, device=loss.device, dtype=loss.dtype)
-
-    grads = torch.autograd.grad(
-        outputs=loss,
-        inputs=params,
-        retain_graph=retain_graph,
-        create_graph=create_graph,
-        allow_unused=True,
-    )
-    vecs: list[torch.Tensor] = []
-    for p, g in zip(params, grads):
-        if g is None:
-            vecs.append(torch.zeros(p.numel(), device=p.device, dtype=p.dtype))
-        else:
-            vecs.append(g.detach().reshape(-1))
-    return torch.cat(vecs, dim=0)
-
-
-def apply_gradient_vector_local(model: torch.nn.Module, grad_vec: torch.Tensor) -> None:
-    offset = 0
-    for p in model.parameters():
-        if not p.requires_grad:
-            continue
-        n = p.numel()
-        g = grad_vec[offset: offset + n].view_as(p).to(device=p.device, dtype=p.dtype)
-        if p.grad is None:
-            p.grad = g.clone()
-        else:
-            p.grad.detach().copy_(g)
-        offset += n
-    if offset != int(grad_vec.numel()):
-        raise ValueError("apply_gradient_vector_local: size mismatch")
-
-
-def pcgrad_update(grads: list[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
-    if len(grads) == 0:
-        raise ValueError("pcgrad_update: empty grads")
-    if len(grads) == 1:
-        return grads[0]
-
-    base = [g.double() for g in grads]
-    proj = [g.clone() for g in base]
-    n = len(proj)
-
-    idx = list(range(n))
-    for i in range(n):
-        order = idx[i + 1:] + idx[:i]
-        for j in order:
-            gij = torch.dot(proj[i], base[j])
-            if not torch.isfinite(gij):
-                continue
-            if gij.item() < 0.0:
-                denom = torch.dot(base[j], base[j]).clamp_min(eps)
-                proj[i] = proj[i] - (gij / denom) * base[j]
-
-    g_out = torch.zeros_like(proj[0])
-    for g in proj:
-        if torch.isfinite(g).all():
-            g_out += g
-    return g_out.float()
-
-
-def ddp_broadcast_amp_scale(scaler: _GradScaler, device: torch.device) -> float:
-    """
-    Ensures identical GradScaler scale on all ranks when doing manual grad allreduce.
-    Returns 1.0 if AMP is disabled.
-    """
-    if (scaler is None) or (not scaler.is_enabled()):
-        return 1.0
-    s = torch.tensor([float(scaler.get_scale())], device=device, dtype=torch.float32)
-    if dist.is_initialized():
-        dist.broadcast(s, src=0)
-    return float(s.item())
-
-
 def _move_aux_to_device(aux, device: torch.device):
     if not isinstance(aux, dict):
         return None
@@ -273,7 +253,12 @@ def _format_sparams_compact(S_true_1d, S_pred_1d, port_valid_1d=None, max_ports=
     mags_t = torch.abs(S_true_1d).detach().cpu().numpy()
     mags_p = torch.abs(S_pred_1d).detach().cpu().numpy()
     ph_t = torch.angle(S_true_1d).detach().cpu().numpy()
-    ph_p = torch.angle(S_pred_1d).detach().cpu().numpy()
+    ph_p = torch.angle(S_true_1d).detach().cpu().numpy()  # safe if pred missing; overwritten below
+    try:
+        ph_p = torch.angle(S_pred_1d).detach().cpu().numpy()
+    except Exception:
+        pass
+
     parts = []
     for i in range(min(len(mags_t), len(mags_p), max_ports)):
         if keep is not None and (i >= len(keep) or not bool(keep[i])):
@@ -296,15 +281,42 @@ def _ensure_model_pml_cells(model_like, pml_cells: int) -> None:
                     return
                 except Exception:
                     pass
-        # fallback: attach a minimal object
         m.helmholtz = SimpleNamespace(pml_cells=int(pml_cells))
     except Exception:
         pass
 
 
+def _parse_list(s: str) -> list[str]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
 def main(args):
     assert torch.cuda.is_available(), "Need CUDA GPUs for DDP training."
     dist.init_process_group(backend="nccl")
+
+    # Optional: force all enabled losses to start from epoch 1 (disable phased curriculum).
+    # Note: a loss only participates if its corresponding lambda > 0.
+    if bool(getattr(args, "all_losses_from_start", False)):
+        # Collapse curriculum phases entirely: treat the whole run as a single phase starting at epoch 1.
+        args.phaseA_epochs = 0
+        args.phaseB_epochs = 0
+
+        # Start phases at A (epoch 0 => active on epoch 1 loop)
+        args.residual_start_phase = "A"
+        args.phase_start_phase = "A"
+        args.phase_grad_start_phase = "A"
+        args.sparam_start_phase = "A"
+        args.sparam_from_start = True
+
+        # Remove warmups so weights are nonzero immediately (if lambdas are nonzero)
+        args.residual_warmup_epochs = 0
+        args.phase_warmup_epochs = 0
+        args.phase_grad_warmup_epochs = 0
+        args.sparam_warmup_epochs = 0
+        args.endpoint_warmup_epochs = 0
 
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -338,6 +350,8 @@ def main(args):
     if is_rank0():
         logger.info(f"DDP: rank={rank}/{world}, local_rank={local_rank}, device={device}")
     logger.info(f"Experiment dir: {experiment_dir}")
+    # NOTE: when --all-losses-from-start is enabled we collapse phaseA/phaseB to 0 above,
+    # so @B/@C tau schedules effectively start immediately.
 
     val_csv_path = os.path.join(experiment_dir, "validation.csv")
     if is_rank0():
@@ -408,12 +422,78 @@ def main(args):
             for i in range(abs(drift)):
                 subset_val[keys[i % len(keys)]] += step
 
+    # Choose dataset class based on --use-fast-dataset flag
+    use_fast = bool(getattr(args, "use_fast_dataset", False))
+
     stats = None
-    if is_rank0():
-        train_ds_tmp = FDTDDataset(
+    if use_fast:
+        # Fast dataset: load preprocessed .pt files
+        if is_rank0():
+            logger.info("Using FastFDTDDataset (preprocessed .pt files)")
+            train_ds_tmp = FastFDTDDataset(
+                preprocessed_dir=args.data_root,
+                split="train",
+                train_fraction=args.train_fraction,
+                augment=False,
+                return_aux=True,
+                use_index_split=bool(getattr(args, "use_index_split", False)),
+            )
+            stats = train_ds_tmp.get_stats()
+        stats = broadcast_object(stats, src=0)
+
+        train_ds = FastFDTDDataset(
+            preprocessed_dir=args.data_root,
+            split="train",
+            train_fraction=args.train_fraction,
+            stats=stats,
+            augment=bool(getattr(args, "augment", True)),
+            return_aux=True,
+            use_index_split=bool(getattr(args, "use_index_split", False)),
+        )
+        val_ds = FastFDTDDataset(
+            preprocessed_dir=args.data_root,
+            split="val",
+            train_fraction=args.train_fraction,
+            stats=stats,
+            augment=False,
+            return_aux=True,
+            use_index_split=bool(getattr(args, "use_index_split", False)),
+        )
+    else:
+        # Regular dataset: load from NPZ shards
+        if is_rank0():
+            train_ds_tmp = FDTDDataset(
+                root_dir=args.data_root,
+                split="train",
+                train_fraction=args.train_fraction,
+                normalize_eps=args.normalize_eps,
+                include_sdf=bool(getattr(args, "include_sdf", False)),
+                normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
+                sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
+                sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
+                sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
+                sdf_feature=str(getattr(args, "sdf_feature", "raw")),
+                sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
+                use_shards=args.use_shards,
+                shard_subdir=args.shard_subdir,
+                shard_index_name=args.shard_index_name,
+                include_sweeps=include_sweeps,
+                subset_train_per_sweep=subset_train if subset_train else None,
+                subset_val_per_sweep=subset_val if subset_train or subset_val else None,
+                subset_seed=subset_seed,
+                crop_pml=bool(getattr(args, "crop_pml", False)),
+                pml_cells=int(getattr(args, "pml_cells", 0)),
+                return_aux=True,
+                use_index_split=bool(getattr(args, "use_index_split", False)),
+            )
+            stats = train_ds_tmp.get_stats()
+        stats = broadcast_object(stats, src=0)
+
+        train_ds = FDTDDataset(
             root_dir=args.data_root,
             split="train",
             train_fraction=args.train_fraction,
+            stats=stats,
             normalize_eps=args.normalize_eps,
             include_sdf=bool(getattr(args, "include_sdf", False)),
             normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
@@ -426,64 +506,15 @@ def main(args):
             shard_subdir=args.shard_subdir,
             shard_index_name=args.shard_index_name,
             include_sweeps=include_sweeps,
+            return_aux=True,
             subset_train_per_sweep=subset_train if subset_train else None,
             subset_val_per_sweep=subset_val if subset_train or subset_val else None,
             subset_seed=subset_seed,
             crop_pml=bool(getattr(args, "crop_pml", False)),
             pml_cells=int(getattr(args, "pml_cells", 0)),
-            return_aux=True,
+            augment=bool(getattr(args, "augment", True)),  # D4 augmentation during training
+            use_index_split=bool(getattr(args, "use_index_split", False)),
         )
-        stats = train_ds_tmp.get_stats()
-    stats = broadcast_object(stats, src=0)
-
-    train_ds = FDTDDataset(
-        root_dir=args.data_root,
-        split="train",
-        train_fraction=args.train_fraction,
-        stats=stats,
-        normalize_eps=args.normalize_eps,
-        include_sdf=bool(getattr(args, "include_sdf", False)),
-        normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
-        sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
-        sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
-        sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
-        sdf_feature=str(getattr(args, "sdf_feature", "raw")),
-        sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
-        use_shards=args.use_shards,
-        shard_subdir=args.shard_subdir,
-        shard_index_name=args.shard_index_name,
-        include_sweeps=include_sweeps,
-        return_aux=True,
-        subset_train_per_sweep=subset_train if subset_train else None,
-        subset_val_per_sweep=subset_val if subset_train or subset_val else None,
-        subset_seed=subset_seed,
-        crop_pml=bool(getattr(args, "crop_pml", False)),
-        pml_cells=int(getattr(args, "pml_cells", 0)),
-    )
-    val_ds = FDTDDataset(
-        root_dir=args.data_root,
-        split="val",
-        train_fraction=args.train_fraction,
-        stats=stats,
-        normalize_eps=args.normalize_eps,
-        include_sdf=bool(getattr(args, "include_sdf", False)),
-        normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
-        sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
-        sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
-        sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
-        sdf_feature=str(getattr(args, "sdf_feature", "raw")),
-        sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
-        use_shards=args.use_shards,
-        shard_subdir=args.shard_subdir,
-        shard_index_name=args.shard_index_name,
-        include_sweeps=include_sweeps,
-        return_aux=True,
-        subset_train_per_sweep=subset_train if subset_train else None,
-        subset_val_per_sweep=subset_val if subset_train or subset_val else None,
-        subset_seed=subset_seed,
-        crop_pml=bool(getattr(args, "crop_pml", False)),
-        pml_cells=int(getattr(args, "pml_cells", 0)),
-    )
 
     train_sampler = DistributedSampler(
         train_ds, num_replicas=world, rank=rank, shuffle=True, seed=args.global_seed, drop_last=True
@@ -540,19 +571,21 @@ def main(args):
         logger.info("Using ComplexPhysicsUNet" if use_complex else "Using PhysicsUNet")
         logger.info("Physics features ENABLED" if enable_physics else "Physics features DISABLED (vanilla UNet ablation)")
         try:
-            x0, _ = train_ds[0]
+            sample0 = train_ds[0]
+            x0 = sample0[0] if isinstance(sample0, (tuple, list)) else sample0
             h, w = int(x0.shape[-2]), int(x0.shape[-1])
             logger.info(f"Data resolution: {h}x{w} (attention at ds=8 => {h//8}x{w//8} tokens)")
         except Exception as exc:  # pragma: no cover
             logger.info(f"Data resolution: <unknown> (probe failed: {exc})")
 
+    attn_res = () if args.no_attention else (8,)
     model_kwargs = dict(
         in_channels=in_channels,
         out_channels=2,
         model_channels=args.hidden_size,
-        num_res_blocks=4,
-        channel_mult=(1, 2, 4, 8, 8),
-        attention_resolutions=(8,),
+        num_res_blocks=3,
+        channel_mult=(1, 2, 4, 8,),
+        attention_resolutions=attn_res,
         dropout=0.0,
         dims=2,
         num_heads=4,
@@ -597,7 +630,14 @@ def main(args):
     if is_rank0():
         logger.info(f"Model params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+    # Weighted-sum objective only (no AugLag / no MGDA / no PCGrad).
+
+    # Optimizer (model params only)
+    opt = torch.optim.AdamW(
+        list(model.parameters()),
+        lr=args.lr,
+        weight_decay=0.0,
+    )
 
     amp_enabled = bool(getattr(args, "amp", True))
     if _AMP_NEW_API:
@@ -642,21 +682,21 @@ def main(args):
     # -----------------------
     start_epoch = 1
     if args.resume_from:
-        if is_rank0():
-            logger.info(f"Resuming from {args.resume_from}")
-            checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
-            m_ret = model.module.load_state_dict(checkpoint["model"], strict=False)
-            e_ret = ema.load_state_dict(checkpoint["ema"], strict=False)
-            if m_ret.missing_keys or m_ret.unexpected_keys:
-                logger.info(f"Resume(model) missing={len(m_ret.missing_keys)} unexpected={len(m_ret.unexpected_keys)}")
-            if e_ret.missing_keys or e_ret.unexpected_keys:
-                logger.info(f"Resume(ema) missing={len(e_ret.missing_keys)} unexpected={len(e_ret.unexpected_keys)}")
-            opt.load_state_dict(checkpoint["opt"])
-            model.module.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
-            ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+        checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
 
-            _ensure_model_pml_cells(model, pml_cells=pml_cells)
-            _ensure_model_pml_cells(ema, pml_cells=pml_cells)
+        model.module.load_state_dict(checkpoint["model"], strict=False)
+        ema.load_state_dict(checkpoint["ema"], strict=False)
+
+        opt.load_state_dict(checkpoint["opt"])
+
+        model.module.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+        ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+
+        _ensure_model_pml_cells(model, pml_cells=pml_cells)
+        _ensure_model_pml_cells(ema, pml_cells=pml_cells)
+
+        if is_rank0():
+            logger.info(f"Resumed from {args.resume_from}")
 
         try:
             ckpt_name = os.path.basename(args.resume_from)
@@ -670,7 +710,6 @@ def main(args):
     # Training settings
     # -----------------------
     use_config = bool(args.config)
-    config_method = str(getattr(args, "config_method", "pcgrad")).strip().lower()
     config_start_epoch = max(1, int(getattr(args, "config_start_epoch", 1)))
     use_endpoint = args.lambda_endpoint > 0
     use_residual = args.lambda_residual > 0
@@ -678,17 +717,9 @@ def main(args):
     use_phase_grad = args.lambda_phase_grad > 0
     use_sparam = args.lambda_sparam > 0
 
-    ConFIG_update = None
-    if use_config and config_method == "config":
-        try:
-            from conflictfree.grad_operator import ConFIG_update as _ConFIG_update
-            ConFIG_update = _ConFIG_update
-        except Exception as e:
-            if is_rank0():
-                logger.warning(f"'conflictfree' not available ({type(e).__name__}: {e}); falling back to pcgrad.")
-            config_method = "pcgrad"
-
-    config_failed = False
+    if use_config and (not _HAS_CONFLICTFREE) and is_rank0():
+        logger.warning("ConFIG requested (--config) but 'conflictfree' is not available; disabling ConFIG and using plain weighted sum.")
+    config_active_global = bool(use_config and _HAS_CONFLICTFREE)
 
     lam_mean = float(stats["lambda_um_mean"])
     lam_std = float(stats["lambda_um_std"])
@@ -713,8 +744,9 @@ def main(args):
     if is_rank0():
         logger.info(f"Training for {args.epochs} epochs, starting at epoch {start_epoch}")
         logger.info(f"Schedule: PhaseA<= {args.phaseA_epochs}, PhaseB<= {args.phaseB_epochs}, PhaseC> {args.phaseB_epochs}")
-        cfg_log = f"enabled={use_config} start_epoch={config_start_epoch}" if use_config else "disabled"
-        logger.info(f"Conflict-free grads: {cfg_log} method={config_method if use_config else 'off'}")
+        logger.info("Objective: fixed weighted sum")
+        cfg_log = f"enabled={config_active_global} start_epoch={config_start_epoch}" if use_config else "disabled"
+        logger.info(f"Conflict-free grads (ConFIG): {cfg_log}")
 
     detect_anomaly = bool(getattr(args, "detect_anomaly", False))
     if detect_anomaly:
@@ -804,7 +836,18 @@ def main(args):
                 frac = min(1.0, (epoch - e0) / float(args.device_focus_decay_epochs))
                 device_focus = device_focus * (1.0 - frac) + focus_end * frac
 
-        for x_full, cond, aux in train_loader:
+        use_tqdm = bool(getattr(args, "tqdm", False)) and (tqdm is not None) and is_rank0()
+        it = train_loader
+        if use_tqdm:
+            it = tqdm(
+                train_loader,
+                total=len(train_loader),
+                desc=f"epoch {epoch}/{args.epochs}",
+                dynamic_ncols=True,
+                mininterval=float(getattr(args, "tqdm_mininterval", 1.0)),
+            )
+
+        for x_full, cond, aux in it:
             x_full = x_full.to(device, dtype=dtype, non_blocking=True)
             cond = cond.to(device, dtype=dtype, non_blocking=True)
             aux = _move_aux_to_device(aux, device)
@@ -870,161 +913,131 @@ def main(args):
             # -----------------------
             opt.zero_grad(set_to_none=True)
 
-            config_active = bool(use_config) and (epoch >= config_start_epoch) and (not config_failed)
+            # ConFIG (conflictfree) branch: combine per-loss gradients with ConFIG_update.
+            # This uses the library's get/apply_gradient_vector helpers (like your reference repo).
+            config_active = bool(config_active_global) and (epoch >= config_start_epoch)
             if config_active:
-                eps_cfg = float(args.config_eps)
-
-                # One synchronized AMP scale per step
-                scale_val = ddp_broadcast_amp_scale(scaler, device)
-
+                # IMPORTANT:
+                # DDP does not support multiple backward passes on the same graph in one iteration
+                # when different losses touch different parameter subsets (e.g. sparam head).
+                # So we avoid `.backward()` entirely here and compute per-loss gradients with
+                # `torch.autograd.grad`, then all-reduce the *combined* ConFIG gradient vector once.
+                grads: list[torch.Tensor] = []
                 loss_items: list[tuple[str, torch.Tensor, float]] = [("fm", fm_loss, 1.0)]
+                if endpoint_weight > 0.0:
+                    loss_items.append(("end", endpoint_loss, float(endpoint_weight)))
                 if residual_weight > 0.0:
                     loss_items.append(("res", residual_loss, float(residual_weight)))
                 if phase_weight > 0.0:
                     loss_items.append(("phase", phase_loss, float(phase_weight)))
-                if endpoint_weight > 0.0:
-                    loss_items.append(("end", endpoint_loss, float(endpoint_weight)))
                 if compute_phase_grad_step and phase_grad_weight > 0.0:
                     loss_items.append(("phg", phase_grad_loss, float(phase_grad_weight)))
                 if compute_sparam_step and sparam_weight > 0.0:
                     loss_items.append(("sp", sparam_loss, float(sparam_weight)))
 
-                grad_vecs_unscaled: dict[str, torch.Tensor] = {}
-                for i, (name, L, w) in enumerate(loss_items):
-                    retain = (i != len(loss_items) - 1)
-
-                    L_for_grad = (L * scale_val) if (scale_val != 1.0) else L
-                    g_scaled = compute_grad_vector(L_for_grad, model.module, retain_graph=retain)
-
-                    # Unscale before collective
-                    g = (g_scaled / scale_val) if (scale_val != 1.0) else g_scaled
-                    ddp_allreduce_mean_(g)
-                    grad_vecs_unscaled[name] = g
-
-                do_cfg_log = is_rank0() and (global_step % int(args.config_log_every) == 0)
-                if do_cfg_log:
-                    lines = []
-                    for name, _, w in loss_items:
-                        g = grad_vecs_unscaled.get(name, None)
-                        if g is None:
-                            lines.append(f"{name}: None")
-                            continue
-                        lines.append(
-                            f"{name}: w={w:.3g} ||g||={_norm(g):.3e} finite={_finite_frac(g):.3f} "
-                            f"|g|max={float(g.abs().max().item()):.3e} |g|mean={float(g.abs().mean().item()):.3e}"
-                        )
-                    cos_lines = []
-                    g_fm = grad_vecs_unscaled["fm"]
-                    for name in ["res", "phase", "end", "phg", "sp"]:
-                        if name in grad_vecs_unscaled:
-                            cos_lines.append(f"cos(fm,{name})={_cos(g_fm, grad_vecs_unscaled[name]):+.3f}")
-                    logger.info(
-                        f"[CFG dbg] epoch={epoch} step={global_step} "
-                        f"phg={int(compute_phase_grad_step)} sp={int(compute_sparam_step)} | "
-                        + " | ".join(lines)
-                        + (" | " + " ".join(cos_lines) if cos_lines else "")
-                    )
-
-                tasks: list[tuple[str, torch.Tensor, float]] = []
-                for name, _, w in loss_items:
-                    g = grad_vecs_unscaled.get(name, None)
-                    if g is None:
-                        continue
-                    if not torch.isfinite(g).all():
-                        continue
-                    n = torch.linalg.norm(g)
-                    if (not torch.isfinite(n)) or (n.item() < eps_cfg):
-                        continue
+                # Compute a gradient vector per loss term (unweighted, matching your reference implementation).
+                # Note: weights still control participation (which losses are included).
+                params = [p for p in model.module.parameters() if p.requires_grad]
+                for i, (_name, L, w) in enumerate(loss_items):
                     if float(w) <= 0.0:
                         continue
-                    tasks.append((name, g, float(w)))
+                    retain = (i != len(loss_items) - 1)
 
-                if len(tasks) == 0:
-                    tasks = [("fm", grad_vecs_unscaled["fm"], 1.0)]
+                    g_list = torch.autograd.grad(
+                        outputs=L,
+                        inputs=params,
+                        retain_graph=retain,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
+                    vec_parts = []
+                    for p, g in zip(params, g_list):
+                        if g is None:
+                            vec_parts.append(torch.zeros(p.numel(), device=p.device, dtype=torch.float32))
+                        else:
+                            vec_parts.append(g.detach().to(dtype=torch.float32).reshape(-1))
+                    g_vec = torch.cat(vec_parts, dim=0)
+                    g_vec = torch.nan_to_num(g_vec, nan=0.0, posinf=0.0, neginf=0.0)
+                    grads.append(g_vec)
 
-                grads_unscaled: list[torch.Tensor] = []
-                for _, g, w in tasks:
-                    if bool(args.config_normalize):
-                        g = g / torch.linalg.norm(g).clamp_min(eps_cfg)
-                    grads_unscaled.append(g * w)
+                # Fallback to fm-only if any gradient vector contains NaNs.
+                g_config = None
+                if len(grads) > 0 and (not grads[0].isnan().any()):
+                    ok = True
+                    for g in grads:
+                        if g is None or g.isnan().any() or (not torch.isfinite(g).all()):
+                            ok = False
+                            break
+                    if ok:
+                        g_config = _ConFIG_update(grads)
 
-                try:
-                    if config_method == "pcgrad":
-                        g_cfg_unscaled = pcgrad_update(grads_unscaled)
-                    elif config_method == "sum":
-                        g_cfg_unscaled = torch.zeros_like(grads_unscaled[0])
-                        for g in grads_unscaled:
-                            if torch.isfinite(g).all():
-                                g_cfg_unscaled += g
+                if g_config is None:
+                    g_step = grads[0] if len(grads) > 0 else None
+                else:
+                    g_step = g_config
+
+                if g_step is None:
+                    # ultra fallback (shouldn't happen): do plain FM backward
+                    opt.zero_grad(set_to_none=True)
+                    if scaler.is_enabled():
+                        scaler.scale(fm_loss).backward()
+                        scaler.unscale_(opt)
                     else:
-                        if ConFIG_update is None:
-                            raise RuntimeError("ConFIG_update unavailable")
-                        grads64 = [g.double() for g in grads_unscaled]
-                        g_cfg_unscaled = ConFIG_update(grads64).float()
+                        fm_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer_step()
+                else:
+                    # DDP-sync: average the combined grad vector across ranks once
+                    if dist.is_initialized():
+                        dist.all_reduce(g_step, op=dist.ReduceOp.SUM)
+                        g_step = g_step / float(dist.get_world_size())
 
-                    if not torch.isfinite(g_cfg_unscaled).all():
-                        raise ValueError("config-method produced non-finite grad")
-
-                except Exception as e:
-                    if is_rank0():
-                        logger.warning(
-                            f"Conflict-free step failed ({config_method}): {type(e).__name__}: {e} | fallback=sum"
-                        )
-                    g_cfg_unscaled = torch.zeros_like(grads_unscaled[0])
-                    for g in grads_unscaled:
-                        if torch.isfinite(g).all():
-                            g_cfg_unscaled += g
-                    if not hasattr(main, "_cfg_fail_count"):
-                        main._cfg_fail_count = 0
-                    main._cfg_fail_count += 1
-                    if main._cfg_fail_count >= int(args.config_fail_max):
-                        if is_rank0():
-                            logger.warning("Conflict-free method failed too many times; disabling permanently.")
-                        config_failed = True
-
-                # Scale once at the end so scaler.unscale_(opt) works
-                g_cfg_scaled = (g_cfg_unscaled * scale_val) if (scale_val != 1.0) else g_cfg_unscaled
-                apply_gradient_vector_local(model.module, g_cfg_scaled)
-
-                if scaler.is_enabled():
-                    scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                optimizer_step()
+                    # Apply vector to parameter .grad and step
+                    opt.zero_grad(set_to_none=True)
+                    start = 0
+                    with torch.no_grad():
+                        for p in params:
+                            n = p.numel()
+                            p.grad = g_step[start : start + n].view_as(p).to(dtype=p.dtype)
+                            start += n
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
 
             else:
-                total_loss = fm_loss
-                if endpoint_weight > 0.0:
-                    total_loss = total_loss + endpoint_weight * endpoint_loss
-                if residual_weight > 0.0:
-                    total_loss = total_loss + residual_weight * residual_loss
-                if phase_weight > 0.0:
-                    total_loss = total_loss + phase_weight * phase_loss
-                if compute_phase_grad_step and phase_grad_weight > 0.0:
-                    total_loss = total_loss + phase_grad_weight * phase_grad_loss
-                if compute_sparam_step and sparam_weight > 0.0:
-                    total_loss = total_loss + sparam_weight * sparam_loss
+                # Plain weighted sum (default / when ConFIG disabled)
+                    total_loss = fm_loss
+                    if endpoint_weight > 0.0:
+                        total_loss = total_loss + endpoint_weight * endpoint_loss
+                    if residual_weight > 0.0:
+                        total_loss = total_loss + residual_weight * residual_loss
+                    if phase_weight > 0.0:
+                        total_loss = total_loss + phase_weight * phase_loss
+                    if compute_phase_grad_step and phase_grad_weight > 0.0:
+                        total_loss = total_loss + phase_grad_weight * phase_grad_loss
+                    if compute_sparam_step and sparam_weight > 0.0:
+                        total_loss = total_loss + sparam_weight * sparam_loss
 
-                try:
                     if scaler.is_enabled():
                         scaler.scale(total_loss).backward()
                         scaler.unscale_(opt)
                     else:
                         total_loss.backward()
-                except RuntimeError as e:
-                    if is_rank0():
-                        logger.error(
-                            "Backward failed. Context:\n"
-                            f"  epoch={epoch} global_step={global_step}\n"
-                            f"  weights: w_res={residual_weight:.6g} w_phase={phase_weight:.6g} "
-                            f"w_end={endpoint_weight:.6g} w_phg={phase_grad_weight:.6g} w_sp={sparam_weight:.6g}\n"
-                            f"  compute: residual={compute_residual_step} phase={compute_phase_epoch} "
-                            f"phg_step={compute_phase_grad_step} sp_step={compute_sparam_step}\n"
-                            f"  amp={bool(scaler.is_enabled())} detect_anomaly={bool(detect_anomaly)}\n"
-                            f"  error: {type(e).__name__}: {e}"
-                        )
-                    raise
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                optimizer_step()
+
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer_step()
+
+            if use_tqdm:
+                try:
+                    it.set_postfix(
+                        fm=float(fm_loss.item()),
+                        res=float(residual_loss.item()) if residual_weight > 0.0 else 0.0,
+                        ph=float(phase_loss.item()) if phase_weight > 0.0 else 0.0,
+                        end=float(endpoint_loss.item()) if endpoint_weight > 0.0 else 0.0,
+                        sp=float(sparam_loss.item()) if compute_sparam_step and sparam_weight > 0.0 else 0.0,
+                        lr=float(opt.param_groups[0]["lr"]),
+                    )
+                except Exception:
+                    pass
 
             update_ema(ema, model.module)
 
@@ -1221,6 +1234,7 @@ def main(args):
                 residuals = []
                 amp_errs = []
                 phase_errs = []
+                saved_any = False
                 with torch.no_grad():
                     n_samples = min(len(val_ds), int(args.sample_eval_limit))
                     for s in range(n_samples):
@@ -1285,125 +1299,39 @@ def main(args):
                         phase_err_s = torch.atan2(torch.sin(phase_pred_s - phase_gt_s), torch.cos(phase_pred_s - phase_gt_s))
                         phase_errs.append(float((torch.abs(phase_err_s) * m).sum().item() / (m.sum().item() + 1e-12)))
 
+                        # Save a qualitative sample panel (rank0 only).
+                        # Default behavior: save on every eval epoch, for the first sample only.
+                        save_eval_samples = bool(getattr(args, "save_eval_samples", True))
+                        save_limit = int(getattr(args, "save_eval_samples_limit", 1))
+                        if save_eval_samples and (s < max(0, save_limit)):
+                            # eps (phys) for display: prefer GT eps if available
+                            eps_gt_phys = x_full_s[:, 2:3]
+                            if args.normalize_eps:
+                                eps_gt_phys = eps_gt_phys * float(stats["eps_std"]) + float(stats["eps_mean"])
+                            eps_img = eps_gt_phys[0, 0].detach().float().cpu().numpy()
+
+                            ezr_gt_img = ezr_gt_s[0, 0].detach().float().cpu().numpy()
+                            ezi_gt_img = ezi_gt_s[0, 0].detach().float().cpu().numpy()
+                            ezr_pred_img = x1_pred[:, 0:1][0, 0].detach().float().cpu().numpy()
+                            ezi_pred_img = x1_pred[:, 1:2][0, 0].detach().float().cpu().numpy()
+
+                            out_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_idx{s:03d}.png")
+                            title = f"epoch={epoch:04d} idx={s:03d}"
+                            _save_eval_sample_png(
+                                out_path=out_path,
+                                title=title,
+                                eps_phys=eps_img,
+                                ezr_gt=ezr_gt_img,
+                                ezi_gt=ezi_gt_img,
+                                ezr_pred=ezr_pred_img,
+                                ezi_pred=ezi_pred_img,
+                            )
+                            if os.path.isfile(out_path):
+                                saved_any = True
+
                 sample_residual_mean = float(np.mean(residuals)) if residuals else 0.0
                 sample_amp_err_mean = float(np.mean(amp_errs)) if amp_errs else 0.0
                 sample_phase_err_mean = float(np.mean(phase_errs)) if phase_errs else 0.0
-
-            # Save sample visualization (rank0 only)
-            if is_rank0():
-                with torch.no_grad():
-                    x_full_s, cond_s, aux_s = val_ds[0]
-                    x_full_s = x_full_s.unsqueeze(0).to(device, dtype=dtype)
-                    cond_s = cond_s.unsqueeze(0).to(device, dtype=dtype)
-
-                    eps_s = x_full_s[:, 2:3]
-                    src_s = x_full_s[:, 3:4]
-                    extra_maps_s = x_full_s[:, 4:] if x_full_s.shape[1] > 4 else None
-                    fields_1_s = x_full_s[:, 0:2]
-                    x0_fields_s = torch.randn_like(fields_1_s)
-                    lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean
-
-                    if extra_maps_s is not None:
-                        cond_maps_s = torch.cat([eps_s, src_s, extra_maps_s], dim=1)
-                    else:
-                        cond_maps_s = torch.cat([eps_s, src_s], dim=1)
-
-                    x1_fields_pred = fm_sample(
-                        ema,
-                        x0_fields_s,
-                        num_steps=int(args.fm_steps),
-                        use_stoc_samp=bool(args.use_stoc_samp),
-                        cond_maps=cond_maps_s,
-                        cond=cond_s,
-                        lambda_um=lambda_um_s,
-                        phys_gate=1.0,
-                        phase_gate=1.0,
-                        sig_min=SIG_MIN,
-                    )
-
-                    ezr_pred = x1_fields_pred[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
-                    ezi_pred = x1_fields_pred[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
-                    ezr_gt = fields_1_s[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
-                    ezi_gt = fields_1_s[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
-                    eps_np = eps_s[0, 0].cpu().numpy()
-                    if args.normalize_eps:
-                        eps_np = eps_np * float(stats["eps_std"]) + float(stats["eps_mean"])
-
-                    ezr_pred_np = ezr_pred[0].cpu().numpy()
-                    ezi_pred_np = ezi_pred[0].cpu().numpy()
-                    ezr_gt_np = ezr_gt[0].cpu().numpy()
-                    ezi_gt_np = ezi_gt[0].cpu().numpy()
-
-                    mag_gt = np.sqrt(ezr_gt_np ** 2 + ezi_gt_np ** 2)
-                    mag_pred = np.sqrt(ezr_pred_np ** 2 + ezi_pred_np ** 2)
-                    mag_err = np.sqrt((ezr_pred_np - ezr_gt_np) ** 2 + (ezi_pred_np - ezi_gt_np) ** 2)
-                    amp_err_map = np.abs(mag_pred - mag_gt)
-
-                    phase_gt = np.arctan2(ezi_gt_np, ezr_gt_np)
-                    phase_pred = np.arctan2(ezi_pred_np, ezr_pred_np)
-                    phase_err = phase_pred - phase_gt
-                    phase_err = np.arctan2(np.sin(phase_err), np.cos(phase_err))
-
-                    fig, axes = plt.subplots(2, 6, figsize=(24, 7))
-                    axes = axes.reshape(2, 6)
-
-                    fig.suptitle(f"Epoch {epoch:04d} | λ={lambda_um_s[0, 0].item():.4f} µm", fontsize=11)
-
-                    def im(ax, arr, title, cmap="magma", vmin=None, vmax=None):
-                        h = ax.imshow(arr, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax, interpolation="nearest")
-                        ax.set_title(title, fontsize=10)
-                        ax.set_xticks([0, arr.shape[1]])
-                        ax.set_yticks([0, arr.shape[0]])
-                        return h
-
-                    im0 = im(axes[0, 0], eps_np, "eps (input)", cmap="viridis")
-                    im1 = im(axes[0, 1], ezr_gt_np, "Ez_real (GT)", cmap="RdBu")
-                    im2 = im(axes[0, 2], ezi_gt_np, "Ez_imag (GT)", cmap="RdBu")
-                    im3 = im(axes[0, 3], mag_gt, "|Ez| (GT)", cmap="magma")
-                    im4 = im(axes[0, 4], phase_gt, "∠Ez (GT)", cmap="hsv", vmin=-np.pi, vmax=np.pi)
-                    im5 = im(axes[0, 5], mag_pred, "|Ez| (pred)", cmap="magma")
-
-                    im6 = im(axes[1, 0], ezr_pred_np, "Ez_real (pred)", cmap="RdBu")
-                    im7 = im(axes[1, 1], ezi_pred_np, "Ez_imag (pred)", cmap="RdBu")
-                    im8 = im(axes[1, 2], mag_pred, "|Ez| (pred)", cmap="magma")
-                    im9 = im(axes[1, 3], mag_err, "|err|", cmap="magma")
-                    im10 = im(axes[1, 4], amp_err_map, "||Ez|-|GT||", cmap="magma")
-                    im11 = im(axes[1, 5], phase_err, "∠err (rad)", cmap="RdBu", vmin=-np.pi, vmax=np.pi)
-
-                    for ax in axes.ravel():
-                        ax.set_xlabel("x (grid)")
-                        ax.set_ylabel("y (grid)")
-
-                    for ax, h in zip(
-                        axes.ravel(),
-                        [im0, im1, im2, im3, im4, im5, im6, im7, im8, im9, im10, im11],
-                    ):
-                        fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
-
-                    sample_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_euler_bend.png")
-                    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
-                    fig.savefig(sample_path, dpi=160)
-                    plt.close(fig)
-
-                    npz_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_euler_bend.npz")
-                    np.savez(
-                        npz_path,
-                        epoch=epoch,
-                        eps=eps_np,
-                        ez_real_gt=ezr_gt_np,
-                        ez_imag_gt=ezi_gt_np,
-                        ez_real_pred=ezr_pred_np,
-                        ez_imag_pred=ezi_pred_np,
-                        mag_gt=mag_gt,
-                        mag_pred=mag_pred,
-                        mag_err=mag_err,
-                        amp_err_map=amp_err_map,
-                        phase_gt=phase_gt,
-                        phase_pred=phase_pred,
-                        phase_err=phase_err,
-                        lambda_um=lambda_um_s[0, 0].cpu().item(),
-                    )
-                    logger.info(f"Saved sample visualization: {sample_path}")
 
             if is_rank0():
                 msg = f"[epoch {epoch:04d}] val_fm={val_fm_loss:.4e}, val_res={val_res_loss:.4e}"
@@ -1426,6 +1354,8 @@ def main(args):
                     f", sample_phase_err={sample_phase_err_mean:.4e}"
                 )
                 logger.info(msg)
+                if saved_any:
+                    logger.info(f"[epoch {epoch:04d}] Saved eval sample(s) to {samples_dir}")
 
                 if (sparam_weight > 0.0) and (sparams_example is not None):
                     S_true_0, S_pred_0, pv0 = sparams_example
@@ -1523,7 +1453,7 @@ def main(args):
                     "train/phase_grad_weight": phase_grad_weight,
                     "train/sparam_weight": sparam_weight,
                     "train/device_focus": device_focus,
-                    "train/use_config": int(use_config and (not config_failed) and (epoch >= config_start_epoch)),
+                    "train/use_config": int(config_active_global and (epoch >= config_start_epoch)),
                 }
                 if phase_weight > 0.0:
                     wandb_log_dict["train/phase_loss"] = ph_mean.item()
@@ -1535,6 +1465,7 @@ def main(args):
                     wandb_log_dict["train/phase_grad_steps_epoch"] = int(phase_grad_steps_epoch)
                 if sparam_weight > 0.0:
                     wandb_log_dict["train/sparam_loss"] = sp_mean.item()
+
                 wandb_run.log(wandb_log_dict, step=epoch)
 
             start_time = time()
@@ -1585,6 +1516,10 @@ if __name__ == "__main__":
     parser.add_argument("--shard-subdir", type=str, default="shards")
     parser.add_argument("--shard-index-name", type=str, default="index.json")
     parser.add_argument("--include-sweeps", type=str, default="")
+    parser.add_argument("--use-index-split", type=bool, default=False, action=argparse.BooleanOptionalAction,
+                        help="Use pre-computed split field from index.json (unified_sweep format)")
+    parser.add_argument("--use-fast-dataset", type=bool, default=False, action=argparse.BooleanOptionalAction,
+                        help="Use preprocessed .pt files for faster loading (requires running preprocess_dataset.py first)")
 
     parser.add_argument("--subset-train-per-sweep", type=str, default="")
     parser.add_argument("--subset-val-per-sweep", type=str, default="")
@@ -1608,6 +1543,9 @@ if __name__ == "__main__":
     parser.add_argument("--crop-pml", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--pml-cells", type=int, default=0)
 
+    parser.add_argument("--augment", type=bool, default=True, action=argparse.BooleanOptionalAction,
+                        help="Enable D4 augmentation during training (8x effective data)")
+
     parser.add_argument("--include-sdf", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--normalize-sdf", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--sdf-thr-eps", dest="sdf_thr_eps", type=float, default=3.0)
@@ -1616,13 +1554,14 @@ if __name__ == "__main__":
     parser.add_argument("--sdf-sigma-nm", type=float, default=100.0)
 
     parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--no-attention", action="store_true", help="Disable attention layers to reduce memory")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--warmup-start-factor", type=float, default=0.1)
     parser.add_argument("--min-lr", type=float, default=5e-6)
 
-    parser.add_argument("--config", type=bool, default=True, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--config-method", dest="config_method", type=str, default="pcgrad", choices=["pcgrad", "sum", "config"])
+    # ConFIG conflict-free gradient combination (uses 'conflictfree' library).
+    parser.add_argument("--config", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--config-start-epoch", type=int, default=200)
 
     parser.add_argument("--unroll-steps", type=int, default=0)
@@ -1658,7 +1597,7 @@ if __name__ == "__main__":
     parser.add_argument("--sparam-warmup-epochs", type=int, default=50)
     parser.add_argument("--sparam-every", type=int, default=1)
     parser.add_argument("--sparam-start-phase", type=str, default="C", choices=["A", "B", "C"])
-    parser.add_argument("--sparam-mode", type=str, default="project", choices=["project", "head"])
+    parser.add_argument("--sparam-mode", type=str, default="modal", choices=["project", "modal", "head"])
 
     parser.add_argument("--normalize-eps", type=bool, default=True, action=argparse.BooleanOptionalAction)
 
@@ -1669,6 +1608,8 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--sample-eval-limit", type=int, default=16)
+    parser.add_argument("--save-eval-samples", dest="save_eval_samples", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--save-eval-samples-limit", dest="save_eval_samples_limit", type=int, default=1)
 
     parser.add_argument("--resume-from", type=str, default="")
 
@@ -1687,10 +1628,21 @@ if __name__ == "__main__":
 
     parser.add_argument("--val-batches", type=int, default=16)
 
-    parser.add_argument("--config-eps", dest="config_eps", type=float, default=1e-8)
-    parser.add_argument("--config-normalize", dest="config_normalize", type=bool, default=True, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--config-fail-max", dest="config_fail_max", type=int, default=25)
-    parser.add_argument("--config-log-every", dest="config_log_every", type=int, default=200)
+    parser.add_argument("--tqdm", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--tqdm-mininterval", dest="tqdm_mininterval", type=float, default=1.0)
+
+    # (Removed: PCGrad/MGDA/config-method variants; ConFIG is the only supported conflict-free method.)
+
+    # Convenience: disable staged curriculum and start all enabled losses from epoch 1.
+    parser.add_argument(
+        "--all-losses-from-start",
+        dest="all_losses_from_start",
+        type=bool,
+        default=False,
+        action=argparse.BooleanOptionalAction,
+    )
+
+    # (Removed: AugLag / adaptive-weighting flags. This script supports fixed weighted-sum only.)
 
     args = parser.parse_args()
     main(args)

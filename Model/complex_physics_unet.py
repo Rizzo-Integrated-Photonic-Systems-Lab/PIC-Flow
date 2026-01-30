@@ -607,23 +607,17 @@ class ComplexPhysicsUNet(nn.Module):
         self.out_act = ModReLU(ch)
         self.out_conv = ComplexConv2d(ch, 1, kernel_size=3, padding=1)  # 1 complex channel out
 
-        # S-param head (optional)
+        # S-param head (optional) - uses ImprovedSParamHead with phase gradient features
         self.enable_sparam_head = enable_sparam_head
         self.max_ports = 4
         if enable_sparam_head:
-            sparam_in_dim = 2 * self.max_ports + cond_dim + self.max_ports
-            hidden = max(128, 2 * model_channels)
-            hidden_mid = max(64, hidden // 2)
-            self.sparam_head = nn.Sequential(
-                nn.Linear(sparam_in_dim, hidden),
-                nn.LayerNorm(hidden),
-                nn.SiLU(),
-                nn.Linear(hidden, hidden),
-                nn.LayerNorm(hidden),
-                nn.SiLU(),
-                nn.Linear(hidden, hidden_mid),
-                nn.SiLU(),
-                nn.Linear(hidden_mid, 2 * self.max_ports),
+            from sparam_head import ImprovedSParamHead
+            self.sparam_head = ImprovedSParamHead(
+                max_ports=self.max_ports,
+                cond_dim=cond_dim,
+                hidden_dim=max(256, 2 * model_channels),
+                num_layers=4,
+                dropout=0.1,
             )
         else:
             self.sparam_head = None
@@ -860,72 +854,61 @@ class ComplexPhysicsUNet(nn.Module):
         return emb
 
     def predict_sparams(self, E_pred_phys_raw: torch.Tensor, aux: dict, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Predict S-parameters using the improved learned head.
+
+        The ImprovedSParamHead uses:
+        1. Phase gradient features (to infer propagation direction)
+        2. Amplitude features at each port
+        3. Input port indicator
+        4. Conditioning (wavelength)
+
+        This allows the network to learn the mapping from field patterns to
+        S-parameters without needing explicit forward/backward mode separation.
+        """
         if self.sparam_head is None:
             raise RuntimeError(
                 "S-parameter head is disabled on this model (enable_sparam_head=False). "
                 "Enable it by running with --sparam-mode head and --lambda-sparam > 0."
             )
 
+        B = E_pred_phys_raw.shape[0]
+        device = E_pred_phys_raw.device
+
         pm = aux.get("port_masks", None)
-
         if pm is None:
-            B = int(E_pred_phys_raw.shape[0])
-            amps_real = torch.zeros((B, self.max_ports), device=E_pred_phys_raw.device, dtype=torch.float32)
-            amps_imag = torch.zeros_like(amps_real)
-        else:
-            if pm.dim() == 3:
-                pm = pm.unsqueeze(0).expand(E_pred_phys_raw.shape[0], -1, -1, -1)
-            B, P, _, _ = pm.shape
-            P = min(P, self.max_ports)
+            # No port masks - return zeros
+            return torch.zeros((B, self.max_ports), device=device, dtype=torch.complex64)
 
-            amps = []
-            absE = torch.abs(E_pred_phys_raw).clamp_min(1e-6)
-            for p in range(P):
-                w = pm[:, p].to(E_pred_phys_raw.real.dtype)
-                m = w * absE  # amplitude-weighted mask per port
-                den = m.sum(dim=(1, 2)).clamp_min(1.0)
-                a = (m * E_pred_phys_raw).sum(dim=(1, 2)) / den
-                amps.append(a)
-            a = torch.stack(amps, dim=1)
+        if pm.dim() == 3:
+            pm = pm.unsqueeze(0).expand(B, -1, -1, -1)
 
-            if P < self.max_ports:
-                pad = torch.zeros((B, self.max_ports - P), device=a.device, dtype=a.dtype)
-                a = torch.cat([a, pad], dim=1)
-
-            amps_real = a.real
-            amps_imag = a.imag
-
-        B = amps_real.shape[0]
-
+        # Get input port index
         in_idx = aux.get("in_port_idx", None)
         if in_idx is None:
-            in_idx = torch.zeros((B,), device=amps_real.device, dtype=torch.long)
+            in_idx = torch.zeros((B,), device=device, dtype=torch.long)
         elif torch.is_tensor(in_idx):
-            in_idx = in_idx.to(device=amps_real.device, dtype=torch.long).view(-1)
+            in_idx = in_idx.to(device=device, dtype=torch.long).view(-1)
             if in_idx.numel() == 1:
                 in_idx = in_idx.expand(B)
         else:
-            in_idx = torch.full((B,), int(in_idx), device=amps_real.device, dtype=torch.long)
+            in_idx = torch.full((B,), int(in_idx), device=device, dtype=torch.long)
 
-        in_idx = in_idx.clamp(min=0, max=self.max_ports - 1)
-        in_oh = torch.zeros((B, self.max_ports), device=amps_real.device, dtype=amps_real.dtype)
-        in_oh.scatter_(1, in_idx.view(B, 1), 1.0)
-
+        # Prepare conditioning
         if cond is None or self.cond_dim <= 0:
-            cond_feat = torch.zeros((B, int(self.cond_dim)), device=amps_real.device, dtype=amps_real.dtype)
+            cond_feat = torch.zeros((B, max(1, int(self.cond_dim))), device=device, dtype=torch.float32)
         else:
-            cond_feat = cond.to(device=amps_real.device, dtype=amps_real.dtype)
-            if cond_feat.shape[1] < int(self.cond_dim):
-                pad = torch.zeros((B, int(self.cond_dim) - cond_feat.shape[1]), device=amps_real.device, dtype=cond_feat.dtype)
-                cond_feat = torch.cat([cond_feat, pad], dim=1)
-            elif cond_feat.shape[1] > int(self.cond_dim):
-                cond_feat = cond_feat[:, :int(self.cond_dim)]
+            cond_feat = cond.to(device=device, dtype=torch.float32)
 
-        feat = torch.cat([amps_real, amps_imag, cond_feat, in_oh], dim=1)
-        out = self.sparam_head(feat)
-        S_re = out[:, :self.max_ports]
-        S_im = out[:, self.max_ports:]
-        return torch.complex(S_re, S_im)
+        # Call the improved head - it handles all the feature extraction internally
+        S_pred = self.sparam_head(
+            E=E_pred_phys_raw,
+            port_masks=pm,
+            in_port_idx=in_idx,
+            cond=cond_feat,
+        )
+
+        return S_pred
 
 
 # ---------------------------------------------------------------------------

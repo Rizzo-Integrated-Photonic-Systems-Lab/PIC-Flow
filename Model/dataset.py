@@ -9,14 +9,16 @@ FDTD dataset loader with:
 - return_aux that is DataLoader-collate-safe (no None values)
 - port_masks are cropped consistently when crop_pml=True
 - subset selection is reproducible (stable hash; no Python hash randomization)
+- D4 symmetry augmentation (8 unique transforms, no duplicates)
 
 Drop-in replacement for your current file.
 """
 
 import json
 import zlib
+import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,6 +33,79 @@ _SDF_WARNED = False
 
 ShardRef = Tuple[Path, int, str]  # (shard_path, slot, tag)
 SampleRef = Union[Path, ShardRef]
+
+
+# ---------------------------------------------------------------------------
+# D4 symmetry group augmentation (8 unique transformations, no duplicates)
+# ---------------------------------------------------------------------------
+# The dihedral group D4 has exactly 8 elements:
+#   - 4 rotations: 0°, 90°, 180°, 270° (CCW)
+#   - 4 reflections: horizontal flip composed with each rotation
+#
+# We represent each as (rot_k, flip_h) where:
+#   rot_k in {0,1,2,3} = number of 90° CCW rotations
+#   flip_h in {False, True} = whether to flip horizontally AFTER rotation
+#
+# This gives 4 × 2 = 8 unique transformations with no overlap.
+
+D4_TRANSFORMS = [
+    (0, False),  # identity
+    (1, False),  # 90° CCW
+    (2, False),  # 180°
+    (3, False),  # 270° CCW
+    (0, True),   # horizontal flip
+    (1, True),   # 90° CCW + flip = anti-diagonal reflection
+    (2, True),   # 180° + flip = vertical flip
+    (3, True),   # 270° CCW + flip = diagonal reflection
+]
+
+
+def apply_d4_transform_np(arr: np.ndarray, transform_idx: int) -> np.ndarray:
+    """
+    Apply one of the 8 unique D4 transforms to a numpy array.
+
+    Args:
+        arr: Array of shape [..., H, W] (last two dims are spatial)
+        transform_idx: Integer 0-7 selecting which D4 element to apply
+
+    Returns:
+        Transformed array with same shape (H,W may swap for 90°/270° rotations)
+    """
+    rot_k, flip_h = D4_TRANSFORMS[transform_idx % 8]
+
+    # Rotate by k*90° CCW (axes=(-2,-1) for last two spatial dims)
+    if rot_k != 0:
+        arr = np.rot90(arr, k=rot_k, axes=(-2, -1))
+
+    # Flip horizontally (along last axis = W)
+    if flip_h:
+        arr = np.flip(arr, axis=-1)
+
+    return np.ascontiguousarray(arr)
+
+
+def apply_d4_transform_torch(x: torch.Tensor, transform_idx: int) -> torch.Tensor:
+    """
+    Apply one of the 8 unique D4 transforms to a torch tensor.
+
+    Args:
+        x: Tensor of shape [..., H, W] (last two dims are spatial)
+        transform_idx: Integer 0-7 selecting which D4 element to apply
+
+    Returns:
+        Transformed tensor with same shape (H,W may swap for 90°/270° rotations)
+    """
+    rot_k, flip_h = D4_TRANSFORMS[transform_idx % 8]
+
+    # Rotate by k*90° CCW (dims=(-2,-1) for last two spatial dims)
+    if rot_k != 0:
+        x = torch.rot90(x, k=rot_k, dims=(-2, -1))
+
+    # Flip horizontally (along last dim = W)
+    if flip_h:
+        x = torch.flip(x, dims=[-1])
+
+    return x
 
 
 def phase_anchor_roi(
@@ -171,11 +246,19 @@ class FDTDDataset(Dataset):
         # --- Determinism knobs ---
         split_seed: int = 0,               # deterministic train/val split shuffle
         stats_seed: Optional[int] = None,  # deterministic stats subset; defaults to split_seed if None
+        # --- Augmentation ---
+        augment: bool = False,             # D4 symmetry augmentation (8 unique transforms)
+        # --- Pre-computed splits (unified_sweep format) ---
+        use_index_split: bool = False,     # Use split field from index.json instead of train_fraction
+        # --- Corrupt/Bad sample handling ---
+        skip_bad_samples: bool = True,     # Skip corrupted samples instead of crashing
+        bad_sample_max_retries: int = 10,  # Max retries before failing
     ):
         super().__init__()
         self.root = Path(root_dir)
         self.split = split
         self.train_fraction = float(train_fraction)
+        self.use_index_split = bool(use_index_split)
         self.normalize_eps = bool(normalize_eps)
         self.use_double = bool(use_double)
         self.use_shards = bool(use_shards)
@@ -206,6 +289,8 @@ class FDTDDataset(Dataset):
         self.split_seed = int(split_seed)
         self.stats_seed = int(split_seed if stats_seed is None else stats_seed)
 
+        self.augment = bool(augment)
+
         # Number of SDF channels appended after [Ezr, Ezi, eps, src]
         self.sdf_n_channels: int = 0
         self.sdf_feature_names: List[str] = []
@@ -226,6 +311,12 @@ class FDTDDataset(Dataset):
         self.x_channels: int = 4 + (self.sdf_n_channels if self.include_sdf else 0)
 
         self._shard_cache: Dict[Path, np.lib.npyio.NpzFile] = {}
+        self._bad_shards: Set[Path] = set()
+        self._bad_sample_count = 0
+        self._retry_rng = np.random.default_rng(self.split_seed + 12345)
+
+        self.skip_bad_samples = bool(skip_bad_samples)
+        self.bad_sample_max_retries = max(1, int(bad_sample_max_retries))
 
         # Conditioning (Option A)
         self.cond_param_names: List[str] = ["wg_width_um"]
@@ -248,8 +339,13 @@ class FDTDDataset(Dataset):
         if not sweep_dirs:
             raise RuntimeError(f"No sweep subfolders found under {self.root}")
 
+        # Collect refs - optionally filter by pre-computed split from index
         if self.use_shards:
-            all_refs: List[SampleRef] = self._collect_shard_refs(sweep_dirs)
+            if self.use_index_split:
+                # Use pre-computed splits from index.json (unified_sweep format)
+                all_refs: List[SampleRef] = self._collect_shard_refs(sweep_dirs, target_split=split)
+            else:
+                all_refs = self._collect_shard_refs(sweep_dirs)
         else:
             all_refs = self._collect_folder_refs(sweep_dirs)
 
@@ -258,8 +354,11 @@ class FDTDDataset(Dataset):
         perm = rng.permutation(len(all_refs))
         all_refs = [all_refs[i] for i in perm]
 
+        # If using index splits, we already filtered - just use all refs
+        if self.use_index_split and self.use_shards:
+            self.sample_refs = all_refs
         # Optional deterministic subset selection (applied before split).
-        if (self.subset_train_per_sweep is not None) or (self.subset_val_per_sweep is not None):
+        elif (self.subset_train_per_sweep is not None) or (self.subset_val_per_sweep is not None):
             self.sample_refs = self._subset_refs_by_sweep(
                 all_refs,
                 split=split,
@@ -431,7 +530,16 @@ class FDTDDataset(Dataset):
             raise RuntimeError(f"No sample subfolders found in sweeps {sweep_dirs}")
         return all_dirs
 
-    def _collect_shard_refs(self, sweep_dirs: List[Path]) -> List[ShardRef]:
+    def _collect_shard_refs(self, sweep_dirs: List[Path], target_split: Optional[str] = None) -> List[ShardRef]:
+        """
+        Collect shard references from all sweep directories.
+
+        Args:
+            sweep_dirs: List of sweep directory paths to scan
+            target_split: If provided, only include entries where index["split"] matches this value.
+                         Supports "train", "val", "test". For "val", also accepts "val" entries.
+                         (unified_sweep format uses pre-computed splits)
+        """
         refs: List[ShardRef] = []
         for sdir in sweep_dirs:
             shard_dir = sdir / self.shard_subdir
@@ -441,11 +549,20 @@ class FDTDDataset(Dataset):
             with open(index_path, "r") as f:
                 entries = json.load(f)
             for e in entries:
+                # Filter by split if target_split is specified
+                if target_split is not None:
+                    entry_split = e.get("split", "")
+                    if entry_split != target_split:
+                        continue
+
                 shard_path = shard_dir / e["shard"]
                 slot = int(e["slot"])
-                tag = e.get("tag", "")
+                # Use tag if present, otherwise geometry_id (unified_sweep format)
+                tag = e.get("tag", e.get("geometry_id", ""))
                 refs.append((shard_path, slot, tag))
         if not refs:
+            if target_split is not None:
+                raise RuntimeError(f"No shard entries found for split='{target_split}' under sweeps {sweep_dirs}")
             raise RuntimeError(f"No shard entries found under sweeps {sweep_dirs}")
         refs.sort(key=lambda r: (r[2], r[0].name, r[1]))
         return refs
@@ -454,11 +571,41 @@ class FDTDDataset(Dataset):
     # Shard IO
     # -----------------------
 
-    def _get_shard_file(self, shard_path: Path) -> np.lib.npyio.NpzFile:
+    def _mark_bad_shard(self, shard_path: Path, err: Exception) -> None:
+        self._bad_shards.add(shard_path)
+        if shard_path in self._shard_cache:
+            try:
+                del self._shard_cache[shard_path]
+            except Exception:
+                pass
+        if self.skip_bad_samples:
+            print(f"[dataset.py] WARNING: marking shard as bad: {shard_path} ({type(err).__name__}: {err})")
+
+    def _get_shard_file(self, shard_path: Path, max_retries: int = 3) -> np.lib.npyio.NpzFile:
+        if shard_path in self._bad_shards:
+            raise zipfile.BadZipFile(f"Skipping previously marked bad shard: {shard_path}")
         if shard_path not in self._shard_cache:
             if not shard_path.is_file():
                 raise FileNotFoundError(f"Shard file not found: {shard_path}")
-            self._shard_cache[shard_path] = np.load(shard_path, allow_pickle=False)
+            # Retry logic for transient filesystem errors on HPC shared storage
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    self._shard_cache[shard_path] = np.load(shard_path, allow_pickle=False)
+                    break
+                except Exception as e:
+                    if isinstance(e, zipfile.BadZipFile):
+                        self._mark_bad_shard(shard_path, e)
+                        raise
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.1 * (attempt + 1))  # exponential backoff
+                        # Clear any cached bad state
+                        if shard_path in self._shard_cache:
+                            del self._shard_cache[shard_path]
+            else:
+                raise last_error  # re-raise if all retries failed
         return self._shard_cache[shard_path]
 
     def _load_raw_from_shard(self, ref: ShardRef, dtype_np):
@@ -481,9 +628,14 @@ class FDTDDataset(Dataset):
         if src is None:
             src = np.zeros_like(eps)
 
+        # Wavelength: try multiple key paths for compatibility
         lam_arr = get_arr("sparams/wavelength_um", required=False)
         if lam_arr is None:
-            lam_arr = get_arr("sparams/lambda_um", required=True)
+            lam_arr = get_arr("sparams/lambda_um", required=False)
+        if lam_arr is None:
+            lam_arr = get_arr("wavelength_um", required=False)  # unified_sweep format
+        if lam_arr is None:
+            raise KeyError(f"Missing wavelength key in shard {shard_path} slot {slot}")
         lam_um = float(lam_arr)
 
         return ez_r, ez_i, eps, src, lam_um
@@ -499,6 +651,7 @@ class FDTDDataset(Dataset):
                 return None
             return data[full_key]
 
+        # S-parameters: try combined format first, then individual S-params (unified_sweep format)
         Sr = get_arr("sparams/S_real")
         Si = get_arr("sparams/S_imag")
         if Sr is not None and Si is not None:
@@ -506,18 +659,28 @@ class FDTDDataset(Dataset):
             Si = Si.astype(dtype_np)
             sparams_true = (Sr + 1j * Si).astype(np.complex128 if dtype_np == np.float64 else np.complex64)
         else:
-            sparams_true = None
+            # Try unified_sweep format: individual S-params like sparams/S11_real, sparams/S21_real, etc.
+            sparams_true = self._load_individual_sparams(data, prefix, dtype_np)
 
+        # Port masks: try ports/masks first, then port_masks (unified_sweep format)
         port_masks = get_arr("ports/masks")
+        if port_masks is None:
+            port_masks = get_arr("port_masks")  # unified_sweep format
         if port_masks is not None:
             port_masks = port_masks.astype(dtype_np)
 
+        # Port IDs: try ports/ids first, then port_ids (unified_sweep format)
         port_ids = get_arr("ports/ids")
+        if port_ids is None:
+            port_ids = get_arr("port_ids")  # unified_sweep format
         if port_ids is not None:
             port_ids = port_ids.astype(np.int32)
 
+        # Input port: try sparams/input_port first, then input_port (unified_sweep format)
         in_port_idx = None
         in_port = get_arr("sparams/input_port")
+        if in_port is None:
+            in_port = get_arr("input_port")  # unified_sweep format
         if in_port is not None:
             try:
                 in_port_val = int(np.array(in_port).item())
@@ -537,6 +700,48 @@ class FDTDDataset(Dataset):
             "port_masks": port_masks,
             "port_ids": port_ids,
         }
+
+    def _load_individual_sparams(self, data, prefix: str, dtype_np):
+        """
+        Load individual S-parameters from unified_sweep format.
+        Looks for keys like sparams/S11_real, sparams/S21_real, etc.
+        Returns a 1D complex array ordered by port number.
+        """
+        # Find all S-param keys in this slot
+        sparam_keys = []
+        for key in data.files:
+            if key.startswith(prefix + "sparams/S") and key.endswith("_real"):
+                # Extract the S-param name (e.g., "S11", "S21")
+                sparam_name = key[len(prefix + "sparams/"):-len("_real")]
+                if len(sparam_name) >= 2 and sparam_name[0] == "S":
+                    sparam_keys.append(sparam_name)
+
+        if not sparam_keys:
+            return None
+
+        # Sort by output port number (first digit after S)
+        def sort_key(s):
+            try:
+                return int(s[1])  # S11 -> 1, S21 -> 2, etc.
+            except (IndexError, ValueError):
+                return 999
+        sparam_keys = sorted(set(sparam_keys), key=sort_key)
+
+        # Build complex array
+        sparams = []
+        for sname in sparam_keys:
+            real_key = prefix + f"sparams/{sname}_real"
+            imag_key = prefix + f"sparams/{sname}_imag"
+            if real_key in data and imag_key in data:
+                sr = float(data[real_key])
+                si = float(data[imag_key])
+                sparams.append(complex(sr, si))
+
+        if not sparams:
+            return None
+
+        ctype = np.complex128 if dtype_np == np.float64 else np.complex64
+        return np.array(sparams, dtype=ctype)
 
     # -----------------------
     # Folder IO
@@ -638,20 +843,24 @@ class FDTDDataset(Dataset):
         return ""
 
     def _get_param_value_from_ref(self, ref: SampleRef, name: str) -> Optional[float]:
-        key = f"sparams/{name}"
         if isinstance(ref, tuple):
             shard_path, slot, _ = ref
             data = self._get_shard_file(shard_path)
-            full_key = f"s{slot}/" + key
-            if full_key not in data:
-                return None
-            try:
-                return float(np.array(data[full_key]).item())
-            except Exception:
-                try:
-                    return float(data[full_key])
-                except Exception:
-                    return None
+            prefix = f"s{slot}/"
+
+            # Try multiple key paths: sparams/{name}, params/{name}, {name}
+            for key_path in [f"sparams/{name}", f"params/{name}", name]:
+                full_key = prefix + key_path
+                if full_key in data:
+                    try:
+                        return float(np.array(data[full_key]).item())
+                    except Exception:
+                        try:
+                            return float(data[full_key])
+                        except Exception:
+                            continue
+            return None
+
         d = Path(ref)
         sp_path = d / "sparams.npz"
         if not sp_path.is_file():
@@ -770,13 +979,29 @@ class FDTDDataset(Dataset):
                     except Exception:
                         return None
 
+            # Try grid/dx first, then dx_um (unified_sweep format)
             dx_um = get_scalar("grid/dx")
             dy_um = get_scalar("grid/dy")
+            if dx_um is None:
+                dx_um = get_scalar("dx_um")  # unified_sweep format
+            if dy_um is None:
+                dy_um = get_scalar("dy_um")  # unified_sweep format
+
             if dx_um is None or dy_um is None:
+                # Try computing from Lx/Ly and nx/ny
                 Lx_um = get_scalar("grid/Lx_um")
                 Ly_um = get_scalar("grid/Ly_um")
                 nx = get_scalar("grid/nx")
                 ny = get_scalar("grid/ny")
+                # Also try unified_sweep format at top level
+                if Lx_um is None:
+                    Lx_um = get_scalar("Lx_um")
+                if Ly_um is None:
+                    Ly_um = get_scalar("Ly_um")
+                if nx is None:
+                    nx = get_scalar("nx")
+                if ny is None:
+                    ny = get_scalar("ny")
                 if (Lx_um is not None) and (Ly_um is not None) and (nx is not None) and (ny is not None):
                     try:
                         dx_um = float(Lx_um) / float(nx)
@@ -1017,10 +1242,26 @@ class FDTDDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sample_refs)
 
-    def __getitem__(self, idx: int):
-        dtype_np = np.float64 if self.use_double else np.float32
-        ref = self.sample_refs[idx]
+    def _is_bad_ref(self, ref: SampleRef) -> bool:
+        if not isinstance(ref, tuple):
+            return False
+        shard_path, _, _ = ref
+        return shard_path in self._bad_shards
 
+    def _random_ref(self) -> SampleRef:
+        n = len(self.sample_refs)
+        if n == 0:
+            raise RuntimeError("No samples available")
+        for _ in range(10):
+            j = int(self._retry_rng.integers(0, n))
+            ref = self.sample_refs[j]
+            if not self._is_bad_ref(ref):
+                return ref
+        # Fall back even if bad; __getitem__ will handle retries.
+        j = int(self._retry_rng.integers(0, n))
+        return self.sample_refs[j]
+
+    def _build_sample(self, ref: SampleRef, dtype_np):
         ez_r, ez_i, eps, src, lam_um = self._load_raw(ref, dtype_np=dtype_np)
 
         # Optional: crop PML out of arrays before downstream processing.
@@ -1081,6 +1322,12 @@ class FDTDDataset(Dataset):
         x = torch.from_numpy(sample)
         cond = torch.from_numpy(cond_np).to(dtype=x.dtype)
 
+        # D4 augmentation: sample one of 8 unique transforms
+        d4_idx = 0
+        if self.augment:
+            d4_idx = np.random.randint(0, 8)
+            x = apply_d4_transform_torch(x, d4_idx)
+
         if not self.return_aux:
             return x, cond
 
@@ -1131,6 +1378,9 @@ class FDTDDataset(Dataset):
 
         if port_masks_np is not None and P > 0:
             pm = np.asarray(port_masks_np).astype(dtype_np)  # [P,H,W]
+            # Apply same D4 transform as x
+            if self.augment and d4_idx != 0:
+                pm = apply_d4_transform_np(pm, d4_idx)
             # If pm spatial dims do not match x (should not happen after cropping), fall back to zeros.
             if pm.ndim == 3 and pm.shape[1] == x.shape[1] and pm.shape[2] == x.shape[2]:
                 pm_pad = np.zeros((self.max_ports, pm.shape[1], pm.shape[2]), dtype=dtype_np)
@@ -1144,6 +1394,35 @@ class FDTDDataset(Dataset):
             aux["sparams_true"] = torch.from_numpy(s_pad).to(aux["sparams_true"].dtype)
 
         return x, cond, aux
+
+    def __getitem__(self, idx: int):
+        dtype_np = np.float64 if self.use_double else np.float32
+
+        for attempt in range(self.bad_sample_max_retries):
+            ref = self.sample_refs[idx] if attempt == 0 else self._random_ref()
+            if self._is_bad_ref(ref):
+                if not self.skip_bad_samples:
+                    shard_path, _, _ = ref  # type: ignore[misc]
+                    raise zipfile.BadZipFile(f"Shard marked bad: {shard_path}")
+                continue
+            try:
+                return self._build_sample(ref, dtype_np)
+            except (zipfile.BadZipFile, KeyError, OSError, EOFError, ValueError) as e:
+                self._bad_sample_count += 1
+                if isinstance(ref, tuple):
+                    shard_path, _, _ = ref
+                    if isinstance(e, zipfile.BadZipFile):
+                        self._mark_bad_shard(shard_path, e)
+                if not self.skip_bad_samples:
+                    raise
+                if (self._bad_sample_count == 1) or (self._bad_sample_count % 50 == 0):
+                    print(f"[dataset.py] WARNING: skipping bad sample (count={self._bad_sample_count}): {e}")
+                continue
+
+        raise RuntimeError(
+            f"Exceeded bad sample retries (max={self.bad_sample_max_retries}). "
+            "Dataset likely contains too many corrupt shards."
+        )
 
     def get_stats(self) -> Dict[str, float]:
         return self.stats

@@ -678,15 +678,14 @@ class PhysicsUNet(nn.Module):
         # We pad aux to max_ports=4 in the dataset.
         self.max_ports = 4
         if self.enable_sparam_head:
-            # Input features: Re/Im of per-port complex amplitudes (2*P) + cond vector (cond_dim) + one-hot in_port (P)
-            sparam_in_dim = 2 * self.max_ports + int(cond_dim) + self.max_ports
-            hidden = max(64, model_channels)
-            self.sparam_head = nn.Sequential(
-                nn.Linear(sparam_in_dim, hidden),
-                nn.SiLU(),
-                nn.Linear(hidden, hidden),
-                nn.SiLU(),
-                nn.Linear(hidden, 2 * self.max_ports),  # Re/Im for S at each port
+            # Use ImprovedSParamHead with phase gradient features for better S-param prediction
+            from sparam_head import ImprovedSParamHead
+            self.sparam_head = ImprovedSParamHead(
+                max_ports=self.max_ports,
+                cond_dim=int(cond_dim),
+                hidden_dim=max(256, 2 * model_channels),
+                num_layers=4,
+                dropout=0.1,
             )
         else:
             self.sparam_head = None
@@ -860,11 +859,16 @@ class PhysicsUNet(nn.Module):
     
     def predict_sparams(self, E_pred_phys_raw: torch.Tensor, aux: dict, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Predict S-parameters using a learned head trained against Meep targets.
+        Predict S-parameters using the improved learned head.
 
-        This avoids the mismatch between Meep's eigenmode coefficient definition and
-        a simple stripe-average projection. The head consumes per-port projected
-        complex amplitudes + conditioning.
+        The ImprovedSParamHead uses:
+        1. Phase gradient features (to infer propagation direction)
+        2. Amplitude features at each port
+        3. Input port indicator
+        4. Conditioning (wavelength)
+
+        This allows the network to learn the mapping from field patterns to
+        S-parameters without needing explicit forward/backward mode separation.
 
         Args:
           E_pred_phys_raw: complex tensor [B,H,W] (no label-based phase alignment)
@@ -879,92 +883,45 @@ class PhysicsUNet(nn.Module):
                 "S-parameter head is disabled on this model (enable_sparam_head=False). "
                 "Enable it by running with --sparam-mode head and --lambda-sparam > 0."
             )
+
+        B = E_pred_phys_raw.shape[0]
+        device = E_pred_phys_raw.device
+
         pm = aux.get("port_masks", None)
-        # If port masks are missing for a sample/batch, fall back to zeros. This keeps the head
-        # DDP-safe (parameters still used) and avoids crashing on partially-supervised datasets.
         if pm is None:
-            B = int(E_pred_phys_raw.shape[0])
-            a = torch.zeros((B, self.max_ports), device=E_pred_phys_raw.device, dtype=E_pred_phys_raw.dtype)
-            amps_real = a.real if torch.is_complex(a) else a
-            amps_imag = torch.zeros_like(amps_real)
-            # build in_port one-hot + cond as usual and run head
-            in_idx = aux.get("in_port_idx", None)
-            if in_idx is None:
-                in_idx = torch.zeros((B,), device=E_pred_phys_raw.device, dtype=torch.long)
-            elif torch.is_tensor(in_idx):
-                in_idx = in_idx.to(device=E_pred_phys_raw.device, dtype=torch.long).view(-1)
-                if in_idx.numel() == 1:
-                    in_idx = in_idx.expand(B)
-            else:
-                in_idx = torch.full((B,), int(in_idx), device=E_pred_phys_raw.device, dtype=torch.long)
-            in_idx = in_idx.clamp(min=0, max=self.max_ports - 1)
-            in_oh = torch.zeros((B, self.max_ports), device=E_pred_phys_raw.device, dtype=amps_real.dtype)
-            in_oh.scatter_(1, in_idx.view(B, 1), 1.0)
+            # No port masks - return zeros
+            return torch.zeros((B, self.max_ports), device=device, dtype=torch.complex64)
 
-            if cond is None or self.cond_dim <= 0:
-                cond_feat = torch.zeros((B, int(self.cond_dim)), device=E_pred_phys_raw.device, dtype=amps_real.dtype)
-            else:
-                cond_feat = cond.to(device=E_pred_phys_raw.device, dtype=amps_real.dtype)
-                if cond_feat.shape[1] < int(self.cond_dim):
-                    pad = torch.zeros((B, int(self.cond_dim) - cond_feat.shape[1]), device=E_pred_phys_raw.device, dtype=cond_feat.dtype)
-                    cond_feat = torch.cat([cond_feat, pad], dim=1)
-                elif cond_feat.shape[1] > int(self.cond_dim):
-                    cond_feat = cond_feat[:, : int(self.cond_dim)]
-
-            feat = torch.cat([amps_real, amps_imag, cond_feat, in_oh], dim=1)
-            out = self.sparam_head(feat)  # [B,2P]
-            S_re = out[:, : self.max_ports]
-            S_im = out[:, self.max_ports :]
-            return torch.complex(S_re, S_im)
         if pm.dim() == 3:
-            pm = pm.unsqueeze(0).expand(E_pred_phys_raw.shape[0], -1, -1, -1)
-        B, P, _, _ = pm.shape
-        P = min(P, int(self.max_ports))
+            pm = pm.unsqueeze(0).expand(B, -1, -1, -1)
 
-        amps = []
-        for p in range(P):
-            w = pm[:, p].to(E_pred_phys_raw.real.dtype)
-            den = w.sum(dim=(1, 2)).clamp_min(1.0)
-            a = (w * E_pred_phys_raw).sum(dim=(1, 2)) / den
-            amps.append(a)
-        a = torch.stack(amps, dim=1)  # [B,P] complex
-
-        if P < self.max_ports:
-            pad = torch.zeros((B, self.max_ports - P), device=a.device, dtype=a.dtype)
-            a = torch.cat([a, pad], dim=1)
-
-        # in_port one-hot (0-based)
+        # Get input port index
         in_idx = aux.get("in_port_idx", None)
         if in_idx is None:
-            in_idx = torch.zeros((B,), device=a.device, dtype=torch.long)
+            in_idx = torch.zeros((B,), device=device, dtype=torch.long)
         elif torch.is_tensor(in_idx):
-            in_idx = in_idx.to(device=a.device, dtype=torch.long).view(-1)
+            in_idx = in_idx.to(device=device, dtype=torch.long).view(-1)
             if in_idx.numel() == 1:
                 in_idx = in_idx.expand(B)
         else:
-            in_idx = torch.full((B,), int(in_idx), device=a.device, dtype=torch.long)
-        in_idx = in_idx.clamp(min=0, max=self.max_ports - 1)
-        in_oh = torch.zeros((B, self.max_ports), device=a.device, dtype=a.real.dtype)
-        in_oh.scatter_(1, in_idx.view(B, 1), 1.0)
+            in_idx = torch.full((B,), int(in_idx), device=device, dtype=torch.long)
 
-        # cond (optional)
+        # Prepare conditioning
         if cond is None or self.cond_dim <= 0:
-            cond_feat = torch.zeros((B, int(self.cond_dim)), device=a.device, dtype=a.real.dtype)
+            cond_feat = torch.zeros((B, max(1, int(self.cond_dim))), device=device, dtype=torch.float32)
         else:
-            cond_feat = cond.to(device=a.device, dtype=a.real.dtype)
-            if cond_feat.shape[1] < int(self.cond_dim):
-                pad = torch.zeros((B, int(self.cond_dim) - cond_feat.shape[1]), device=a.device, dtype=cond_feat.dtype)
-                cond_feat = torch.cat([cond_feat, pad], dim=1)
-            elif cond_feat.shape[1] > int(self.cond_dim):
-                cond_feat = cond_feat[:, : int(self.cond_dim)]
+            cond_feat = cond.to(device=device, dtype=torch.float32)
 
-        feat = torch.cat([a.real, a.imag, cond_feat, in_oh], dim=1)
-        out = self.sparam_head(feat)  # [B,2P]
-        S_re = out[:, : self.max_ports]
-        S_im = out[:, self.max_ports :]
-        return torch.complex(S_re, S_im)
+        # Call the improved head - it handles all the feature extraction internally
+        S_pred = self.sparam_head(
+            E=E_pred_phys_raw,
+            port_masks=pm,
+            in_port_idx=in_idx,
+            cond=cond_feat,
+        )
 
-    @torch.no_grad()
+        return S_pred
+
     @torch.no_grad()
     def set_normalization_stats(self, stats: dict, normalize_eps: bool = True):
         """Set normalization statistics from dataset stats dict."""

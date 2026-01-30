@@ -17,23 +17,24 @@ except Exception:  # pragma: no cover
         return x
 
 from ybranch import YBranch2D
-from conditioning_masks import make_source_mask
 
 
 # -----------------------------
 # Config defaults
 # -----------------------------
-RESOLUTION_DEFAULT = 32
+RESOLUTION_DEFAULT = 20
+CROP_PX_DEFAULT = 384
+DPML_DEFAULT = 2.0 / 3.0
 N_GEO_DEFAULT = 5000
 N_PROCS_DEFAULT = 24
 
-# Sweep ranges (um)
+# Sweep ranges (um) tuned to fit 384@20 with dpml~0.65 (non-PML interior ~19.2um).
 wg_width_min, wg_width_max = 0.38, 0.60
 lambda_min, lambda_max = 1.40, 1.60
-l_j_min, l_j_max = 1.5, 3.5
-l_bend_min, l_bend_max = 5.0, 8.0
-h_bend_min, h_bend_max = 0.5, 1.2
-l_out_min, l_out_max = 1.0, 15.0
+l_j_min, l_j_max = 1.2, 3.2
+l_bend_min, l_bend_max = 4.0, 7.0
+h_bend_min, h_bend_max = 0.6, 2.8
+l_out_min, l_out_max = 1.0, 6.0
 
 
 # -----------------------------
@@ -133,7 +134,11 @@ def run_fdtd_sim(
     yb = YBranch2D(
         wg_width_um=wg_width,
         wavelength_um=wavelength,
-        resolution=RESOLUTION,
+        resolution=int(RESOLUTION),
+        crop_px=CROP_PX_DEFAULT if "CROP_PX_DEFAULT" in globals() else 384,
+        dpml=float(DPML_DEFAULT) if "DPML_DEFAULT" in globals() else (2.0 / 3.0),
+        quantize_grid=True,
+        fit_margin_um=0.5,
         l_junction_um=l_j,
         l_bend_um=l_bend,
         h_bend_um=h_bend,
@@ -151,7 +156,7 @@ def worker(task):
     Returns:
       ("OK", temp_npz_path_str) or ("ERR", err_string)
     """
-    (wg_width, lam, l_j, l_bend, h_bend, l_out, RESOLUTION, tmp_dir_str) = task
+    (wg_width, lam, l_j, l_bend, h_bend, l_out, RESOLUTION, dpml_um, crop_px, tmp_dir_str) = task
     tmp_dir = Path(tmp_dir_str)
 
     base = geom_tag(wg_width, lam, l_j, l_bend, h_bend, l_out)
@@ -159,57 +164,64 @@ def worker(task):
     tmp_path = tmp_dir / tmp_name
 
     try:
-        yb, S_dict, Ez1, eps, cell = run_fdtd_sim(
-            wg_width, lam, l_j, l_bend, h_bend, l_out, RESOLUTION
+        yb = YBranch2D(
+            wg_width_um=wg_width,
+            wavelength_um=lam,
+            resolution=int(RESOLUTION),
+            dpml=float(dpml_um),
+            crop_px=int(crop_px),
+            quantize_grid=True,
+            fit_margin_um=0.5,
+            l_junction_um=l_j,
+            l_bend_um=l_bend,
+            h_bend_um=h_bend,
+            l_out_um=l_out,
+            bend_n_segments=96,
         )
+
+        # convention: eps, Ez, Hx, Hy, S_dict, cell
+        eps_full, Ez_full, Hx, Hy, S_dict, cell = yb.run_sim(input_port=1, decay_tol=1e-5)
         if S_dict is None:
             raise RuntimeError("S_dict is None")
-        if Ez1 is None or eps is None or cell is None:
+        if Ez_full is None or eps_full is None or cell is None:
             raise RuntimeError("Missing Ez/eps/cell")
 
-        eps = np.asarray(eps, dtype=np.float32)
-        Ez1 = np.asarray(Ez1, dtype=np.complex64)
+        eps_full = np.asarray(eps_full, dtype=np.float32)
+        Ez_full = np.asarray(Ez_full, dtype=np.complex64)
+
+        # Crop to non-PML (Euler-style)
+        pml_px = int(np.round(float(yb.dpml) * float(yb.resolution)))
+        eps = eps_full[pml_px:-pml_px, pml_px:-pml_px]
+        Ez1 = Ez_full[pml_px:-pml_px, pml_px:-pml_px]
 
         ny, nx = eps.shape
-        Lx_um, Ly_um = cell
+        crop_px = int(crop_px)
+        if (ny, nx) != (crop_px, crop_px):
+            raise RuntimeError(f"Expected cropped ({crop_px},{crop_px}) but got {(ny,nx)}")
 
-        # Port masks for ports 1..3 (for S-parameter projection / auxiliary losses)
+        # grid meta (cropped non-PML)
+        Lx_um = float(cell[0]) - 2.0 * float(dpml_um)
+        Ly_um = float(cell[1]) - 2.0 * float(dpml_um)
+
+        # Port masks for ports 1..3 (cropped coords; for S-parameter projection / auxiliary losses)
         port_ids = np.array([1, 2, 3], dtype=np.int32)
-        port_centers = yb.get_port_centers_um()
-        y_span = yb.get_port_y_span_um()
-        port_masks = np.stack(
-            [
-                make_source_mask(
-                    input_port=p,
-                    port_centers_um=port_centers,
-                    y_span_um=y_span,
-                    Lx_um=Lx_um,
-                    Ly_um=Ly_um,
-                    ny=ny,
-                    nx=nx,
-                ).astype(np.float32)
-                for p in port_ids.tolist()
-            ],
-            axis=0,
-        )  # [P, ny, nx]
+        port_masks = []
+        for p in port_ids.tolist():
+            pr = yb.get_port_region_px(int(p), crop_pml=True)
+            pm = yb.make_line_mask_from_region_px(ny, nx, pr, thickness_px=3)
+            port_masks.append(pm.astype(np.float32))
+        port_masks = np.stack(port_masks, axis=0).astype(np.float32)  # [3, ny, nx]
 
-        # Source mask for input_port=1
-        src_mask1 = make_source_mask(
-            input_port=1,
-            port_centers_um=port_centers,
-            y_span_um=y_span,
-            Lx_um=Lx_um,
-            Ly_um=Ly_um,
-            ny=ny,
-            nx=nx,
-        ).astype(np.float32)
+        # Source mask for input_port=1 (cropped coords)
+        src_px = yb.get_source_region_px(input_port=1, crop_pml=True)
+        src_mask1 = yb.make_line_mask_from_region_px(ny, nx, src_px, thickness_px=3).astype(np.float32)
 
         # S vector for input=1 (ports: 1,2,3)
         S1 = np.array([S_dict[(1, 1)], S_dict[(2, 1)], S_dict[(3, 1)]], dtype=np.complex128)
 
         # grid meta
-        dx = 1.0 / RESOLUTION
-        dy = 1.0 / RESOLUTION
+        dx = 1.0 / float(RESOLUTION)
+        dy = 1.0 / float(RESOLUTION)
 
         np.savez_compressed(
             tmp_path,
@@ -228,6 +240,7 @@ def worker(task):
             dy=np.float32(dy),
             Lx_um=np.float32(Lx_um),
             Ly_um=np.float32(Ly_um),
+            pml_px=np.int32(pml_px),
             # arrays
             eps=eps,
             Ez_real=Ez1.real.astype(np.float32),
@@ -428,6 +441,8 @@ def main():
         help="Output root (default: <repo>/Data/y_branch_sweep)",
     )
     ap.add_argument("--resolution", type=int, default=RESOLUTION_DEFAULT)
+    ap.add_argument("--crop-px", type=int, default=CROP_PX_DEFAULT, help="Non-PML crop size in pixels (square).")
+    ap.add_argument("--dpml", type=float, default=DPML_DEFAULT)
     ap.add_argument("--n-geo", type=int, default=N_GEO_DEFAULT)
     ap.add_argument("--n-procs", type=int, default=N_PROCS_DEFAULT)
 
@@ -443,6 +458,22 @@ def main():
 
     repo_root = Path(__file__).resolve().parents[1]
     OUT_DIR = Path(args.out_dir) if args.out_dir is not None else (repo_root / "Data" / "y_branch_sweep")
+    # Quantize dpml/cell to EXACT integer-pixel sizes (Euler-style).
+    crop_px = int(args.crop_px)
+    if crop_px <= 0:
+        raise ValueError("--crop-px must be > 0")
+
+    pml_px = int(np.round(float(args.dpml) * float(args.resolution)))
+    dpml_um = float(pml_px) / float(args.resolution)
+    full_px = int(crop_px + 2 * pml_px)
+    cell_um = float(full_px) / float(args.resolution)
+
+    # Validate cropped shape
+    nx_full = int(np.round(cell_um * float(args.resolution)))
+    nx_crop = nx_full - 2 * pml_px
+    if nx_crop != crop_px:
+        raise ValueError(f"Crop mismatch: expected {crop_px} but got {nx_crop}. Check dpml/resolution/crop-px.")
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     tmp_dir = OUT_DIR / "tmp_geom"
@@ -458,6 +489,7 @@ def main():
     print(f"TMP_DIR:   {tmp_dir}  (bounded by queue_max ~ {args.queue_max})")
     print(f"SHARDS:    {shards_dir}")
     print(f"n_procs:   {args.n_procs}")
+    print(f"resolution: {args.resolution}, crop_px: {crop_px}, dpml_um: {dpml_um:.6f}, pml_px: {pml_px}, cell_um: {cell_um:.6f}")
     print(f"shard_size(samples): {args.shard_size}  => ~{math.ceil((len(params))/args.shard_size)} shards")
     print(f"compress:  {bool(args.compress)}")
     print(f"index-every-shard: {bool(args.index_every_shard)}")
@@ -480,7 +512,7 @@ def main():
     writer_p.start()
 
     tasks = [
-        (w, lam, lj, lb, hb, lo, args.resolution, str(tmp_dir))
+        (w, lam, lj, lb, hb, lo, int(args.resolution), float(dpml_um), int(crop_px), str(tmp_dir))
         for (w, lam, lj, lb, hb, lo) in params
     ]
 

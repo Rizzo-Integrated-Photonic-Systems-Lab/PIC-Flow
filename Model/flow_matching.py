@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from grad_utils import generalized_image_to_b_xy_c  # kept for compatibility (may be used elsewhere)
 from sparams_loss import sparam_loss, extract_sparams
+from modal_sparams import extract_sparams_modal, sparam_loss_modal
 
 # -----------------------------------------------------------------------------
 # Flow-matching path parameters
@@ -681,21 +682,58 @@ def cfm_loss_residual(
                 if "S_pred_head" not in locals():
                     raise RuntimeError("sparam_mode=head but S_pred_head was not produced by model forward.")
                 S_pred = S_pred_head
+                sparam_loss_val = sparam_loss(
+                    S_pred,
+                    st,
+                    port_valid=aux.get("port_valid", None),
+                    in_port_idx=aux.get("in_port_idx", None),
+                    port_ids=aux.get("port_ids", None),
+                )
+            elif sparam_mode == "modal":
+                # MEEP-style modal decomposition for S-parameter extraction
+                # Get dx from helmholtz_op
+                dx_um = float(getattr(helmholtz_op, 'dx', 1.0 / 24.0))
+
+                # Get wavelength - use per-sample wavelength if available, else use global
+                if lambda_um is not None:
+                    # lambda_um is [B, 1] - use mean for extraction (or first sample)
+                    wl_um = float(lambda_um[0, 0].item())
+                else:
+                    # Fallback to omega from helmholtz_op
+                    omega = float(getattr(helmholtz_op, 'omega', 2.0 * 3.14159 / 1.55))
+                    wl_um = 2.0 * 3.14159 / omega
+
+                # Get eps for mode solving - squeeze to [B, H, W]
+                eps_for_modal = eps_phys_only.squeeze(1)  # [B, H, W]
+
+                # Use modal S-parameter loss which computes extraction internally
+                sparam_loss_val = sparam_loss_modal(
+                    E_pred_phys_raw,  # [B, H, W] complex
+                    E_true_phys,      # [B, H, W] complex (for reference if S_true not provided)
+                    pm,
+                    eps_for_modal,
+                    wl_um,
+                    dx_um,
+                    S_true=st,
+                    in_port_idx=aux.get("in_port_idx", None),
+                    port_ids=aux.get("port_ids", None),
+                    port_valid=aux.get("port_valid", None),
+                )
             else:
+                # "project" mode: simple averaging
                 S_pred = extract_sparams(
                     E_pred_phys_raw,
                     pm,
                     in_port_idx=aux.get("in_port_idx", None),
                     port_ids=aux.get("port_ids", None),
                 )
-
-            sparam_loss_val = sparam_loss(
-                S_pred,
-                st,
-                port_valid=aux.get("port_valid", None),
-                in_port_idx=aux.get("in_port_idx", None),
-                port_ids=aux.get("port_ids", None),
-            )
+                sparam_loss_val = sparam_loss(
+                    S_pred,
+                    st,
+                    port_valid=aux.get("port_valid", None),
+                    in_port_idx=aux.get("in_port_idx", None),
+                    port_ids=aux.get("port_ids", None),
+                )
         else:
             # DDP-safe dummy use of head outputs when supervision missing
             if (sparam_mode == "head") and ("S_pred_head" in locals()):
