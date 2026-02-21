@@ -33,7 +33,7 @@ LR=5e-5
 LAMBDA_RESIDUAL=0.6
 RESIDUAL_WARMUP=25
 BATCH_SIZE=32
-DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/Data"
+DATA_ROOT="/dartfs/rc/lab/R/RizzoA/f0071mj/Data"
 
 echo "Starting training job: ${VERSION}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"

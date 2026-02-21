@@ -15,6 +15,7 @@ Drop-in replacement for your current file.
 """
 
 import json
+import os
 import zlib
 import zipfile
 from pathlib import Path
@@ -253,6 +254,8 @@ class FDTDDataset(Dataset):
         # --- Corrupt/Bad sample handling ---
         skip_bad_samples: bool = True,     # Skip corrupted samples instead of crashing
         bad_sample_max_retries: int = 10,  # Max retries before failing
+        # --- Joint training: S-param conditioning ---
+        include_sparams_cond: bool = False, # Append S-params to conditioning vector
     ):
         super().__init__()
         self.root = Path(root_dir)
@@ -311,6 +314,7 @@ class FDTDDataset(Dataset):
         self.x_channels: int = 4 + (self.sdf_n_channels if self.include_sdf else 0)
 
         self._shard_cache: Dict[Path, np.lib.npyio.NpzFile] = {}
+        self._cache_owner_pid: int = os.getpid()
         self._bad_shards: Set[Path] = set()
         self._bad_sample_count = 0
         self._retry_rng = np.random.default_rng(self.split_seed + 12345)
@@ -318,10 +322,17 @@ class FDTDDataset(Dataset):
         self.skip_bad_samples = bool(skip_bad_samples)
         self.bad_sample_max_retries = max(1, int(bad_sample_max_retries))
 
-        # Conditioning (Option A)
-        self.cond_param_names: List[str] = ["wg_width_um"]
+        # Conditioning: wavelength + geometric design parameters
+        self.cond_param_names: List[str] = ["wg_width_um", "gap_um", "wg_length_um"]
         self.device_type_names: List[str] = []  # not used
-        self.cond_dim: int = 2
+        self.include_sparams_cond = bool(include_sparams_cond)
+        # Base cond_dim: wavelength + geom params
+        base_cond_dim = 1 + len(self.cond_param_names)  # 4
+        if self.include_sparams_cond:
+            # +8 for Re/Im of 4 S-params, +4 for port_valid flags = 12 extra
+            self.cond_dim: int = base_cond_dim + 12  # 16
+        else:
+            self.cond_dim: int = base_cond_dim  # 4
 
         self.max_ports: int = 4
 
@@ -379,11 +390,16 @@ class FDTDDataset(Dataset):
         if len(self.sample_refs) == 0:
             raise RuntimeError(f"No samples in {split} split (train_fraction={train_fraction})")
 
+        # Infer canonical spatial orientation once so mixed HxW / WxH samples can be normalized.
+        self.target_hw, self._shape_hist = self._infer_target_hw(max_probe=64)
+
         if stats is None:
             if split != "train":
                 raise ValueError("stats must be provided for non-train splits")
             print(f"[{split}] computing normalization stats from subset...")
             self.stats = self._compute_stats(seed=self.stats_seed)
+            # Important for multi-worker DataLoader: avoid inheriting open NPZ handles after fork.
+            self._clear_shard_cache()
         else:
             self.stats = stats
 
@@ -394,6 +410,11 @@ class FDTDDataset(Dataset):
             pass
 
         print(f"[{split}] dataset size = {len(self.sample_refs)}")
+        if self.target_hw is not None and len(self._shape_hist) > 1:
+            print(
+                f"[{split}] detected mixed sample shapes {dict(self._shape_hist)}; "
+                f"canonicalizing to HxW={self.target_hw}"
+            )
 
     # -----------------------
     # Helpers: refs + splits
@@ -425,6 +446,48 @@ class FDTDDataset(Dataset):
 
     def _stable_hash_u32(self, s: str) -> int:
         return int(zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF)
+
+    def _infer_target_hw(self, max_probe: int = 64) -> Tuple[Optional[Tuple[int, int]], Dict[Tuple[int, int], int]]:
+        """
+        Probe a subset of samples to infer canonical (H, W).
+        This makes loading robust when a dataset accidentally mixes transposed samples.
+        """
+        hist: Dict[Tuple[int, int], int] = {}
+        n_probe = min(int(max_probe), len(self.sample_refs))
+        for i in range(n_probe):
+            ref = self.sample_refs[i]
+            try:
+                ez_r, _, _, _, _ = self._load_raw(ref, dtype_np=np.float32)
+                pml_px = self._pml_px_from_ref(ref)
+                (ez_r_c,) = self._maybe_crop_pml_arrays(pml_px, ez_r)
+                hw = (int(ez_r_c.shape[0]), int(ez_r_c.shape[1]))
+                hist[hw] = hist.get(hw, 0) + 1
+            except Exception:
+                continue
+        if not hist:
+            return None, {}
+        target = sorted(hist.items(), key=lambda kv: (kv[1], kv[0][0] * kv[0][1], kv[0][0], kv[0][1]), reverse=True)[0][0]
+        return target, hist
+
+    def _canonicalize_hw(
+        self,
+        ez_r: np.ndarray,
+        ez_i: np.ndarray,
+        eps: np.ndarray,
+        src: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Ensure arrays match canonical (H, W). If exactly transposed, swap axes.
+        """
+        if self.target_hw is None:
+            return ez_r, ez_i, eps, src
+        h, w = int(ez_r.shape[0]), int(ez_r.shape[1])
+        th, tw = self.target_hw
+        if (h, w) == (th, tw):
+            return ez_r, ez_i, eps, src
+        if (h, w) == (tw, th):
+            return ez_r.T.copy(), ez_i.T.copy(), eps.T.copy(), src.T.copy()
+        raise ValueError(f"Unexpected sample shape {(h, w)}; expected {(th, tw)} or {(tw, th)}")
 
     def _subset_refs_by_sweep(
         self,
@@ -581,7 +644,27 @@ class FDTDDataset(Dataset):
         if self.skip_bad_samples:
             print(f"[dataset.py] WARNING: marking shard as bad: {shard_path} ({type(err).__name__}: {err})")
 
+    def _clear_shard_cache(self) -> None:
+        for _p, fh in list(self._shard_cache.items()):
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._shard_cache.clear()
+
+    def _ensure_cache_pid(self) -> None:
+        """
+        Make shard cache fork-safe.
+        If DataLoader workers fork after cache is populated, inherited file handles can cause
+        random BadZipFile errors. Reopen cache per-process.
+        """
+        pid = os.getpid()
+        if pid != self._cache_owner_pid:
+            self._clear_shard_cache()
+            self._cache_owner_pid = pid
+
     def _get_shard_file(self, shard_path: Path, max_retries: int = 3) -> np.lib.npyio.NpzFile:
+        self._ensure_cache_pid()
         if shard_path in self._bad_shards:
             raise zipfile.BadZipFile(f"Skipping previously marked bad shard: {shard_path}")
         if shard_path not in self._shard_cache:
@@ -819,46 +902,64 @@ class FDTDDataset(Dataset):
         if isinstance(ref, tuple):
             shard_path, slot, _ = ref
             data = self._get_shard_file(shard_path)
-            key = f"s{slot}/dataset"
-            if key in data:
-                v = data[key]
-                try:
-                    item = np.array(v).item()
-                except Exception:
-                    item = v
-                if isinstance(item, bytes):
-                    item = item.decode("utf-8", errors="ignore")
-                return str(item)
+            # Try the 'device' key first (unified_sweep format), then 'dataset'
+            for key_suffix in ("device", "dataset"):
+                key = f"s{slot}/{key_suffix}"
+                if key in data:
+                    v = data[key]
+                    try:
+                        item = np.array(v).item()
+                    except Exception:
+                        item = v
+                    if isinstance(item, bytes):
+                        item = item.decode("utf-8", errors="ignore")
+                    return str(item)
             return ""
         try:
             parent = Path(ref).parent.name.lower()
         except Exception:
             return ""
-        if "coupler" in parent:
-            return "coupler"
+        if "coupler" in parent or "directional_coupler" in parent:
+            return "directional_coupler"
         if "y_branch" in parent or "ybranch" in parent:
-            return "y_branch"
-        if "euler" in parent or "zig" in parent or "bend" in parent:
+            return "ybranch"
+        if "sbend" in parent or "s_bend" in parent:
+            return "sbend"
+        if "taper" in parent:
+            return "taper"
+        if "straight" in parent:
+            return "straight"
+        if "euler" in parent or "zig" in parent:
             return "euler_bend"
+        if "circular" in parent:
+            return "circular_bend"
+        if "crossing" in parent:
+            return "crossing"
         return ""
 
     def _get_param_value_from_ref(self, ref: SampleRef, name: str) -> Optional[float]:
+        alias_map = {
+            "wg_length_um": ["Lc_um"],
+        }
+        names_to_try = [name] + alias_map.get(name, [])
+
         if isinstance(ref, tuple):
             shard_path, slot, _ = ref
             data = self._get_shard_file(shard_path)
             prefix = f"s{slot}/"
 
             # Try multiple key paths: sparams/{name}, params/{name}, {name}
-            for key_path in [f"sparams/{name}", f"params/{name}", name]:
-                full_key = prefix + key_path
-                if full_key in data:
-                    try:
-                        return float(np.array(data[full_key]).item())
-                    except Exception:
+            for n in names_to_try:
+                for key_path in [f"sparams/{n}", f"params/{n}", n]:
+                    full_key = prefix + key_path
+                    if full_key in data:
                         try:
-                            return float(data[full_key])
+                            return float(np.array(data[full_key]).item())
                         except Exception:
-                            continue
+                            try:
+                                return float(data[full_key])
+                            except Exception:
+                                continue
             return None
 
         d = Path(ref)
@@ -869,15 +970,17 @@ class FDTDDataset(Dataset):
             sp = np.load(sp_path)
         except Exception:
             return None
-        if name not in sp:
-            return None
-        try:
-            return float(np.array(sp[name]).item())
-        except Exception:
+        for n in names_to_try:
+            if n not in sp:
+                continue
             try:
-                return float(sp[name])
+                return float(np.array(sp[n]).item())
             except Exception:
-                return None
+                try:
+                    return float(sp[n])
+                except Exception:
+                    continue
+        return None
 
     def _build_cond_vector(self, ref: SampleRef, lam_um: float, dtype_np) -> np.ndarray:
         # wavelength (always present)
@@ -886,23 +989,28 @@ class FDTDDataset(Dataset):
             lam_std = 1.0
         lam_norm = (float(lam_um) - float(self.stats["lambda_um_mean"])) / lam_std
 
-        # waveguide width (if missing, default to mean => normalized 0.0)
-        name = "wg_width_um"
-        v = self._get_param_value_from_ref(ref, name)
-        mean = float(self.stats.get(f"cond_param_{name}_mean", 0.0))
-        std = float(self.stats.get(f"cond_param_{name}_std", 1.0))
-        if std <= 0:
-            std = 1.0
+        cond_vals = [lam_norm]
 
-        if v is None or (not np.isfinite(v)):
-            wg_norm = 0.0
-        else:
-            wg_norm = (float(v) - mean) / std
+        # geometric design parameters (if missing, default to mean => normalized 0.0)
+        for name in self.cond_param_names:
+            v = self._get_param_value_from_ref(ref, name)
+            mean = float(self.stats.get(f"cond_param_{name}_mean", 0.0))
+            std = float(self.stats.get(f"cond_param_{name}_std", 1.0))
+            if std <= 0:
+                std = 1.0
 
-        cond = np.array([lam_norm, wg_norm], dtype=dtype_np)
+            if v is None or (not np.isfinite(v)):
+                cond_vals.append(0.0)
+            else:
+                cond_vals.append((float(v) - mean) / std)
+
+        # Append S-param conditioning placeholders (filled later in _build_sample)
+        if self.include_sparams_cond:
+            # 8 zeros for Re/Im of 4 S-params + 4 zeros for port_valid flags
+            cond_vals.extend([0.0] * 12)
+
+        cond = np.array(cond_vals, dtype=dtype_np)
         return cond
-
-
 
     # -----------------------
     # PML cropping utilities
@@ -1267,6 +1375,7 @@ class FDTDDataset(Dataset):
         # Optional: crop PML out of arrays before downstream processing.
         pml_px = self._pml_px_from_ref(ref)
         ez_r, ez_i, eps, src = self._maybe_crop_pml_arrays(pml_px, ez_r, ez_i, eps, src)
+        ez_r, ez_i, eps, src = self._canonicalize_hw(ez_r, ez_i, eps, src)
 
         # Phase anchor (mask-first, ROI fallback).
         ez_r2, ez_i2, _ = phase_anchor_mask(ez_r, ez_i, (src > 0.5), eps_r=eps, thr_eps=3.0)
@@ -1325,7 +1434,11 @@ class FDTDDataset(Dataset):
         # D4 augmentation: sample one of 8 unique transforms
         d4_idx = 0
         if self.augment:
-            d4_idx = np.random.randint(0, 8)
+            # For rectangular grids, avoid 90/270 rotations that swap H/W and break batching.
+            if x.shape[-2] != x.shape[-1]:
+                d4_idx = int(np.random.choice([0, 2, 4, 6]))  # identity, rot180, hflip, vflip
+            else:
+                d4_idx = np.random.randint(0, 8)
             x = apply_d4_transform_torch(x, d4_idx)
 
         if not self.return_aux:
@@ -1335,6 +1448,23 @@ class FDTDDataset(Dataset):
         # Aux (collate-safe)
         # -----------------------
         aux_np = self._load_aux(ref, dtype_np=dtype_np)
+
+        # Fill in S-param conditioning if enabled
+        if self.include_sparams_cond:
+            sparams_np = aux_np.get("sparams_true", None)
+            base_dim = 1 + len(self.cond_param_names)  # 4
+            if sparams_np is not None:
+                s_arr = np.asarray(sparams_np).reshape(-1)
+                n_s = min(len(s_arr), self.max_ports)
+                for i in range(n_s):
+                    cond_np[base_dim + 2 * i] = float(np.real(s_arr[i]))
+                    cond_np[base_dim + 2 * i + 1] = float(np.imag(s_arr[i]))
+                # port_valid flags (last 4 entries of the 12 appended)
+                port_valid_offset = base_dim + 2 * self.max_ports  # base_dim + 8
+                for i in range(n_s):
+                    cond_np[port_valid_offset + i] = 1.0
+                # Update cond tensor
+                cond = torch.from_numpy(cond_np).to(dtype=x.dtype)
         port_ids_np = aux_np.get("port_ids", None)
         port_masks_np = aux_np.get("port_masks", None)
         sparams_true_np = aux_np.get("sparams_true", None)
@@ -1356,6 +1486,7 @@ class FDTDDataset(Dataset):
         if P is None:
             P = 0
         P = min(int(P), int(self.max_ports))
+        grid_dx_um, grid_dy_um = self._grid_spacing_um_from_ref(ref)
 
         # Build collate-safe tensors with sentinel defaults.
         aux = {
@@ -1365,6 +1496,9 @@ class FDTDDataset(Dataset):
             "port_ids": torch.full((self.max_ports,), -1, dtype=torch.long),
             "port_masks": torch.zeros((self.max_ports, x.shape[1], x.shape[2]), dtype=x.dtype),
             "sparams_true": torch.zeros((self.max_ports,), dtype=(torch.complex128 if self.use_double else torch.complex64)),
+            "grid_dx_um": torch.tensor(float(grid_dx_um), dtype=x.dtype),
+            "grid_dy_um": torch.tensor(float(grid_dy_um), dtype=x.dtype),
+            "device_type": self._infer_device_type_from_ref(ref),
         }
 
         if P > 0:
@@ -1378,6 +1512,11 @@ class FDTDDataset(Dataset):
 
         if port_masks_np is not None and P > 0:
             pm = np.asarray(port_masks_np).astype(dtype_np)  # [P,H,W]
+            # If masks are transposed relative to canonical field orientation, fix them.
+            if self.target_hw is not None and pm.ndim == 3:
+                th, tw = self.target_hw
+                if pm.shape[1] == tw and pm.shape[2] == th:
+                    pm = np.swapaxes(pm, 1, 2).copy()
             # Apply same D4 transform as x
             if self.augment and d4_idx != 0:
                 pm = apply_d4_transform_np(pm, d4_idx)

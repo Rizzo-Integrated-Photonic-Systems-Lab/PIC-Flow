@@ -320,7 +320,7 @@ def extract_sparams_modal(
     Ez: torch.Tensor,
     port_masks: torch.Tensor,
     eps: torch.Tensor,
-    wavelength_um: float,
+    wavelength_um,
     dx_um: float,
     in_port_idx: Optional[int] = None,
     port_ids: Optional[torch.Tensor] = None,
@@ -336,7 +336,7 @@ def extract_sparams_modal(
         Ez: Complex Ez field [B, H, W] or [H, W]
         port_masks: Port location masks [B, P, H, W] or [P, H, W]
         eps: Permittivity map [B, H, W] or [H, W]
-        wavelength_um: Wavelength in microns
+        wavelength_um: Wavelength in microns - float (single) or Tensor [B] (per-sample)
         dx_um: Grid spacing in microns
         in_port_idx: Index of the excited input port (0-based)
         port_ids: Optional port ID labels
@@ -362,6 +362,13 @@ def extract_sparams_modal(
     device = Ez.device
     dtype = Ez.dtype
 
+    # Resolve per-sample wavelengths: accept float or Tensor [B]
+    if torch.is_tensor(wavelength_um):
+        _wl = wavelength_um.detach().reshape(-1)  # [B]
+    else:
+        _wl = None  # scalar path
+    _wl_scalar = float(wavelength_um) if _wl is None else None
+
     # Compute mode amplitudes at each port
     amplitudes = []
 
@@ -371,11 +378,12 @@ def extract_sparams_modal(
             mask_p = port_masks[b, p]
             eps_b = eps[b] if eps.dim() == 3 else eps
             Ez_b = Ez[b]
+            wl_b = float(_wl[b].item()) if _wl is not None else _wl_scalar
 
             # Detect port direction and compute mode
             direction = detect_port_direction(mask_p, eps_b)
             mode_profile, n_eff, t_coords = compute_mode_profile_from_eps(
-                eps_b, mask_p, wavelength_um, dx_um, direction
+                eps_b, mask_p, wl_b, dx_um, direction
             )
 
             # Compute overlap integral
@@ -389,6 +397,13 @@ def extract_sparams_modal(
     a = torch.stack(amplitudes, dim=1)  # [B, P]
 
     # Resolve input port index
+    if (in_port_idx is not None) and (not torch.is_tensor(in_port_idx)):
+        try:
+            if int(in_port_idx) < 0:
+                in_port_idx = None
+        except Exception:
+            in_port_idx = None
+
     if in_port_idx is None:
         if port_ids is not None:
             # Find port with ID = 1
@@ -403,13 +418,25 @@ def extract_sparams_modal(
     # Get input amplitude and compute S-parameters
     # Handle both scalar and batched in_port_idx
     if torch.is_tensor(in_port_idx):
-        idx = in_port_idx.to(device=device).view(-1, 1)  # [B, 1]
+        idx = in_port_idx.to(device=device, dtype=torch.long).view(-1)  # [B]
+        if idx.numel() == 1:
+            idx = idx.expand(B)
+        if port_ids is not None and torch.is_tensor(port_ids) and port_ids.dim() == 2 and port_ids.shape[0] == B:
+            # Replace invalid sentinel entries using port_id==1 fallback.
+            invalid = idx < 0
+            if torch.any(invalid):
+                pid = port_ids.to(device=device)
+                fallback = (pid == 1).to(torch.long).argmax(dim=1)
+                idx = torch.where(invalid, fallback, idx)
+        idx = idx.clamp(0, P - 1).view(-1, 1)
         # Need complex gather - gather doesn't work on complex, so do real/imag separately
         a_real = a.real.gather(1, idx).squeeze(1)  # [B]
         a_imag = a.imag.gather(1, idx).squeeze(1)  # [B]
         a_in = torch.complex(a_real, a_imag)
     else:
-        a_in = a[:, int(in_port_idx)]
+        idx = int(in_port_idx)
+        idx = min(max(idx, 0), P - 1)
+        a_in = a[:, idx]
 
     # Safe division
     eps_div = 1e-10
@@ -439,7 +466,7 @@ def sparam_loss_modal(
     Ez_true: torch.Tensor,
     port_masks: torch.Tensor,
     eps: torch.Tensor,
-    wavelength_um: float,
+    wavelength_um,
     dx_um: float,
     S_true: Optional[torch.Tensor] = None,
     in_port_idx: Optional[int] = None,
@@ -457,7 +484,7 @@ def sparam_loss_modal(
         Ez_true: Ground truth complex Ez field [B, H, W] (used if S_true not provided)
         port_masks: Port location masks [B, P, H, W]
         eps: Permittivity map [B, H, W]
-        wavelength_um: Wavelength in microns
+        wavelength_um: Wavelength in microns - float (single) or Tensor [B] (per-sample)
         dx_um: Grid spacing in microns
         S_true: Optional pre-computed ground truth S-parameters [B, P]
         in_port_idx: Index of excited input port
@@ -504,6 +531,33 @@ def sparam_loss_modal(
         if pv.dim() == 1:
             pv = pv.view(1, -1).expand_as(gate)
         gate = gate * pv
+
+    # Exclude excited input port from direct supervision for total-field projections.
+    P = int(gate.shape[1])
+    if torch.is_tensor(in_port_idx):
+        idx = in_port_idx.to(device=gate.device, dtype=torch.long).view(-1)
+        if idx.numel() == 1:
+            idx = idx.expand(gate.shape[0])
+        if port_ids is not None and torch.is_tensor(port_ids) and port_ids.dim() == 2 and port_ids.shape[0] == gate.shape[0]:
+            invalid = idx < 0
+            if torch.any(invalid):
+                pid = port_ids.to(device=gate.device)
+                fallback = (pid == 1).to(torch.long).argmax(dim=1)
+                idx = torch.where(invalid, fallback, idx)
+        idx = idx.clamp(0, P - 1)
+        in_mask = torch.ones_like(gate)
+        in_mask.scatter_(1, idx.view(-1, 1), 0.0)
+        gate = gate * in_mask
+    elif in_port_idx is not None:
+        try:
+            idx = int(in_port_idx)
+            if idx < 0 and port_ids is not None and torch.is_tensor(port_ids) and port_ids.dim() == 1:
+                hits = (port_ids.to(device=gate.device) == 1).nonzero(as_tuple=False)
+                idx = int(hits[0].item()) if len(hits) > 0 else 0
+            idx = min(max(idx, 0), P - 1)
+            gate[:, idx] = 0.0
+        except Exception:
+            pass
 
     L = (mag_weight * L_mag + phase_weight * L_phase) * gate
 

@@ -31,16 +31,25 @@ def _resolve_in_idx(
         if torch.is_tensor(in_port_idx):
             idx = in_port_idx.detach().flatten()
             if idx.numel() == 1:
-                return int(idx.item())
-            return idx.to(dtype=torch.long)
+                v = int(idx.item())
+                if v >= 0:
+                    return v
+            else:
+                # Keep shape, but prevent negative sentinel values from selecting last column.
+                return idx.to(dtype=torch.long).clamp_min(0)
         # list/tuple/ndarray
         try:
             t = torch.as_tensor(in_port_idx).flatten()
             if t.numel() == 1:
-                return int(t.item())
-            return t.to(dtype=torch.long)
+                v = int(t.item())
+                if v >= 0:
+                    return v
+            else:
+                return t.to(dtype=torch.long).clamp_min(0)
         except Exception:
-            return int(in_port_idx)
+            v = int(in_port_idx)
+            if v >= 0:
+                return v
     if port_ids is not None:
         try:
             pid_t = port_ids.detach() if torch.is_tensor(port_ids) else torch.as_tensor(port_ids)
@@ -142,6 +151,24 @@ def sparam_loss(S_pred: torch.Tensor,
         if pv.dim() == 1:
             pv = pv.view(1, -1).expand_as(gate)
         gate = gate * pv
+
+    # Exclude the excited input port from supervision unless explicit reflected/incident
+    # wave decomposition is used there. Using total-field port projections makes that term
+    # near-constant and can create an artificial loss floor.
+    in_idx = _resolve_in_idx(in_port_idx, port_ids=port_ids)
+    if torch.is_tensor(in_idx):
+        idx = in_idx.to(device=gate.device, dtype=torch.long).view(-1)
+        if idx.numel() == 1:
+            idx = idx.expand(gate.shape[0])
+        idx = idx.clamp(0, gate.shape[1] - 1)
+        in_mask = torch.ones_like(gate)
+        in_mask.scatter_(1, idx.view(-1, 1), 0.0)
+        gate = gate * in_mask
+    else:
+        idx = int(in_idx)
+        if 0 <= idx < gate.shape[1]:
+            gate[:, idx] = 0.0
+
     L = (mag_w * L_mag + phase_w * L_phase) * gate
     # IMPORTANT:
     # Use a masked mean so padded/non-existent ports do not change the effective loss scale.

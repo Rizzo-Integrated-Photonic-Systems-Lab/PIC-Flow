@@ -143,10 +143,13 @@ class FastFDTDDataset(Dataset):
         # Default wg_width to 0 (normalized) if not present
         cond = torch.tensor([lam_norm, 0.0], dtype=x.dtype)
 
-        # D4 augmentation
+        # D4 augmentation (D2-only for rectangular grids: no 90°/270° rotations)
         d4_idx = 0
         if self.augment:
-            d4_idx = np.random.randint(0, 8)
+            if x.shape[-2] != x.shape[-1]:
+                d4_idx = int(np.random.choice([0, 2, 4, 6]))  # D2-only
+            else:
+                d4_idx = np.random.randint(0, 8)  # full D4
             x = apply_d4_transform_torch(x, d4_idx)
 
         if not self.return_aux:

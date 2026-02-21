@@ -842,8 +842,17 @@ class PhysicsUNet(nn.Module):
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
-            zero_module(conv_nd(dims, ch, out_channels, 3, padding=1)),
+            zero_module(conv_nd(dims, ch, min(out_channels, 2), 3, padding=1)),
         )
+
+        # Joint training: separate eps velocity head (real-valued)
+        self.joint_eps_out = None
+        if out_channels == 3:
+            self.joint_eps_out = nn.Sequential(
+                normalization(ch),
+                nn.SiLU(),
+                zero_module(conv_nd(dims, ch, 1, 3, padding=1)),
+            )
 
         # --- normalization flags + stats buffers (set later from dataset stats) ---
         self.normalize_inputs = True   # set True if your x is normalized in the dataloader
@@ -1126,6 +1135,12 @@ class PhysicsUNet(nn.Module):
 
         h = h.type(x.dtype)
         out = self.out(h)
+
+        # Joint training: append eps velocity channel
+        if self.joint_eps_out is not None:
+            v_eps = self.joint_eps_out(h)
+            out = torch.cat([out, v_eps], dim=1)  # [B,3,H,W]
+
         u_t_pred = out * pml_m.to(dtype=out.dtype)
 
         if not return_sparams:

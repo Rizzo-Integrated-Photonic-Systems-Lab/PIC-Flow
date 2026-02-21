@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-#SBATCH --job-name=rayfield-train
-#SBATCH --partition=h200_preemptable
+#SBATCH --job-name=rayfield-finetune
+#SBATCH --partition=a100_preemptable
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:2
@@ -27,9 +27,10 @@ mkdir -p logs
 DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
 
 # -----------------------
-# Run config (v9: physics-embedded, FM + Helmholtz residual w/ curriculum)
+# Run config: finetune from epoch 400 with lower LR + stronger residual
 # -----------------------
-VERSION="coupler_complexphys_v10_fwd"
+VERSION="coupler_complexphys_v10_fwd_ft1"
+RESUME_FROM="logs_physics_unet_pbfm/coupler_complexphys_v10_fwd/checkpoints/0000400.pt"
 
 HIDDEN_SIZE=32
 
@@ -40,21 +41,19 @@ SHARD_INDEX_NAME="index.json"
 INCLUDE_SWEEPS="directional_coupler_sweep_v2"
 
 # Train
-EPOCHS=200
-LR=1e-4
+EPOCHS=600
+LR=1e-5
 BATCH_SIZE=120
 WEIGHT_DECAY=1e-4
 
-# Curriculum: FM-only for 50 epochs, then add residual
-PHASE_A_EPOCHS=10
+# Curriculum: already in PhaseC from previous run, keep epochs low
+PHASE_A_EPOCHS=0
 PHASE_B_EPOCHS=0
 
-# Losses: FM (always on) + Helmholtz residual (from epoch 50)
-# Complex UNet natively handles phase via complex arithmetic + ModReLU.
-# Residual loss enforces Maxwell's equations on predicted fields.
-# Physics input features enabled — k0, eps feed into the network.
-LAMBDA_RESIDUAL=1.0
-RESIDUAL_WARMUP=10
+# Losses: FM + Helmholtz residual (bumped from 1.0 → 1.5)
+# No warmup needed — residual already at full weight from epoch 400.
+LAMBDA_RESIDUAL=1.5
+RESIDUAL_WARMUP=0
 LAMBDA_ENDPOINT=0.0
 LAMBDA_SPARAM=0.0
 LAMBDA_PHASE=0.0
@@ -81,6 +80,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NGPUS=2
 
 echo "Starting training job: ${VERSION}"
+echo "Resuming from: ${RESUME_FROM}"
 echo "Nodes=${SLURM_NNODES} GPUs/node=${NGPUS} WorldGPU=$((SLURM_NNODES * NGPUS))"
 
 # Multi-node DDP setup
@@ -166,8 +166,8 @@ srun torchrun \
   --unroll-steps 0 \
   --fm_steps 100 \
   \
-  --warmup-epochs 10 \
-  --min-lr 5e-6 \
+  --warmup-epochs 0 \
+  --min-lr 1e-6 \
   --weight-decay "${WEIGHT_DECAY}" \
   --log-every 1 \
   \
@@ -186,6 +186,8 @@ srun torchrun \
   --no-config \
   \
   --eps-core 5.8 \
-  --eps-clad 2.09
+  --eps-clad 2.09 \
+  \
+  --resume-from "${RESUME_FROM}"
 
 echo "Training job completed."

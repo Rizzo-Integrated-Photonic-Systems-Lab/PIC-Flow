@@ -7,6 +7,7 @@ import uuid
 import math
 import argparse
 import multiprocessing as mp
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -14,39 +15,41 @@ import numpy as np
 from scipy.stats import qmc
 from tqdm import tqdm
 
-from directional_coupler import DirectionalCoupler2D
+from directional_coupler.directional_coupler import DirectionalCoupler2D
 
 
 # -----------------------------
 # Config defaults (Euler-aligned)
 # -----------------------------
 RESOLUTION_DEFAULT = 20
-CROP_PX_DEFAULT = 384
+CROP_X_PX_DEFAULT = 640   # propagation direction (rectangular)
+CROP_Y_PX_DEFAULT = 128   # transverse direction  (rectangular)
 DPML_DEFAULT = 2.0 / 3.0
 
 N_GEO_DEFAULT = 500
 N_PROCS_DEFAULT = 24
 
-# Geometry and wavelength ranges (um) adjusted to fit 384@20 (non-PML interior = 19.2 um)
-gap_min, gap_max = 0.10, 0.35
+# Geometry and wavelength ranges (um) for rectangular 640x128 @ res 20
+# X interior = 32 um, Y interior = 6.4 um
+gap_min, gap_max = 0.15, 0.35
 
-# Coupling region must fit well inside non-PML interior after margins.
-wg_length_min, wg_length_max = 5.0, 9.0
+# Coupling region: up to 12 um captures most coupling physics.
+# Max device extent: Lc(12) + 2*bend(6) = 24 um, fits in 25.6 um X interior (128x512 @ res20).
+wg_length_min, wg_length_max = 5.0, 12.0
 
-# Bends must fit: with crop=384,res=20,dpml~0.65 => non-PML half-width ~9.6 um.
-# With a 0.5 um margin, bends of ~1..3 um are feasible for Lc up to ~12.
+# Bends: with 32 um X interior, bends of 4-6 um are comfortable.
 bend_length_min, bend_length_max = 4.0, 6.0
 
-wg_width_min, wg_width_max = 0.38, 0.60
+wg_width_min, wg_width_max = 0.375, 0.600
 lambda_min, lambda_max = 1.40, 1.60
 
 lead_gap_min, lead_gap_max = 0.8, 2.5
 
-# Stratify gap (oversample small gap)
+# Stratify gap (oversample small gap where coupling is strongest)
 GAP_STRATA = [
-    (0.10, 0.16, 0.45),
-    (0.16, 0.22, 0.30),
-    (0.22, 0.35, 0.25),
+    (0.150, 0.200, 0.40),
+    (0.200, 0.275, 0.35),
+    (0.275, 0.350, 0.25),
 ]
 
 
@@ -126,12 +129,16 @@ def _allocate_counts(total: int, fracs: list[float]) -> list[int]:
     return counts
 
 
-def _quantize_01(x, x_min, x_max):
-    xq = np.round(x * 100.0) / 100.0
+def _quantize_to_grid(x, x_min, x_max, resolution):
+    """Quantize to half-pixel steps so each value maps to a distinguishable epsilon map."""
+    step = 0.5 / float(resolution)  # half-pixel in um
+    xq = np.round(x / step) * step
     return np.clip(xq, x_min, x_max)
 
 
-def build_param_list(N_GEO: int, seed_base: int = 42) -> list[tuple[float, float, float, float, float, float]]:
+def build_geometry_list(N_GEO: int, resolution: int = 20, seed_base: int = 42) -> list[tuple[float, float, float, float, float]]:
+    """Sample N_GEO geometries in 5D (no wavelength), quantized to half-pixel grid.
+    Returns (wg_width, gap, Lc, bend, lead_gap)."""
     strata_counts = _allocate_counts(N_GEO, [f for (_, _, f) in GAP_STRATA])
 
     u_list = []
@@ -139,34 +146,47 @@ def build_param_list(N_GEO: int, seed_base: int = 42) -> list[tuple[float, float
         n_i = int(strata_counts[si])
         if n_i <= 0:
             continue
-        sampler = qmc.LatinHypercube(d=6, seed=seed_base + si)
+        sampler = qmc.LatinHypercube(d=5, seed=seed_base + si)
         u_i = sampler.random(n_i)
 
         gaps_i = gap_lo + u_i[:, 0] * (gap_hi - gap_lo)
         wg_lengths_i = wg_length_min + u_i[:, 1] * (wg_length_max - wg_length_min)
         bend_lengths_i = bend_length_min + u_i[:, 2] * (bend_length_max - bend_length_min)
         wg_widths_i = wg_width_min + u_i[:, 3] * (wg_width_max - wg_width_min)
-        wavelengths_i = lambda_min + u_i[:, 4] * (lambda_max - lambda_min)
-        lead_gaps_i = lead_gap_min + u_i[:, 5] * (lead_gap_max - lead_gap_min)
+        lead_gaps_i = lead_gap_min + u_i[:, 4] * (lead_gap_max - lead_gap_min)
 
-        u_list.append((gaps_i, wg_lengths_i, bend_lengths_i, wg_widths_i, wavelengths_i, lead_gaps_i))
+        u_list.append((gaps_i, wg_lengths_i, bend_lengths_i, wg_widths_i, lead_gaps_i))
 
     gaps = np.concatenate([t[0] for t in u_list], axis=0)
     wg_lengths = np.concatenate([t[1] for t in u_list], axis=0)
     bend_lengths = np.concatenate([t[2] for t in u_list], axis=0)
     wg_widths = np.concatenate([t[3] for t in u_list], axis=0)
-    wavelengths = np.concatenate([t[4] for t in u_list], axis=0)
-    lead_gaps = np.concatenate([t[5] for t in u_list], axis=0)
+    lead_gaps = np.concatenate([t[4] for t in u_list], axis=0)
 
     assert len(gaps) == N_GEO, f"expected N_GEO={N_GEO}, got {len(gaps)}"
 
-    wg_widths = _quantize_01(wg_widths, wg_width_min, wg_width_max)
-    wavelengths = _quantize_01(wavelengths, lambda_min, lambda_max)
+    # Quantize all geometry parameters to half-pixel grid
+    gaps = _quantize_to_grid(gaps, gap_min, gap_max, resolution)
+    wg_widths = _quantize_to_grid(wg_widths, wg_width_min, wg_width_max, resolution)
+    wg_lengths = _quantize_to_grid(wg_lengths, wg_length_min, wg_length_max, resolution)
+    bend_lengths = _quantize_to_grid(bend_lengths, bend_length_min, bend_length_max, resolution)
+    lead_gaps = _quantize_to_grid(lead_gaps, lead_gap_min, lead_gap_max, resolution)
 
     return [
-        (float(w), float(g), float(L), float(b), float(lead), float(lam))
-        for w, g, L, b, lead, lam in zip(wg_widths, gaps, wg_lengths, bend_lengths, lead_gaps, wavelengths)
+        (float(w), float(g), float(L), float(b), float(lead))
+        for w, g, L, b, lead in zip(wg_widths, gaps, wg_lengths, bend_lengths, lead_gaps)
     ]
+
+
+def build_param_list(N_GEO: int, wavelengths: list[float], resolution: int = 20, seed_base: int = 42) -> list[tuple[float, float, float, float, float, float]]:
+    """Sample N_GEO geometries in 5D, then cross with wavelength list.
+    Returns N_GEO * len(wavelengths) tuples of (wg_width, gap, Lc, bend, lead_gap, wavelength)."""
+    geos = build_geometry_list(N_GEO, resolution=resolution, seed_base=seed_base)
+    params = []
+    for w, g, L, b, lead in geos:
+        for lam in wavelengths:
+            params.append((w, g, L, b, lead, float(lam)))
+    return params
 
 
 # -----------------------------
@@ -181,8 +201,10 @@ def run_fdtd_sim_port1(
     wl: float,
     RESOLUTION: int,
     dpml_um: float,
-    cell_um: float,
-    crop_px: int,
+    cell_x_um: float,
+    cell_y_um: float,
+    crop_x_px: int,
+    crop_y_px: int,
     decay_tol: float,
 ):
     dc = DirectionalCoupler2D(
@@ -192,9 +214,10 @@ def run_fdtd_sim_port1(
         wavelength_um=wl,
         resolution=int(RESOLUTION),
         dpml=float(dpml_um),
-        crop_px=int(crop_px),
-        cell_x_um=float(cell_um),
-        cell_y_um=float(cell_um),
+        crop_x_px=int(crop_x_px),
+        crop_y_px=int(crop_y_px),
+        cell_x_um=float(cell_x_um),
+        cell_y_um=float(cell_y_um),
         pad_y_um=1.0,
         lead_extra_gap_um=lead_extra_gap,
         bend_length_um=bend_length,
@@ -213,7 +236,7 @@ def worker(task):
     Returns:
       ("OK", temp_npz_path_str) or ("ERR", err_string)
     """
-    (wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, dpml_um, cell_um, crop_px, decay_tol, tmp_dir_str) = task
+    (wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, dpml_um, cell_x_um, cell_y_um, crop_x_px, crop_y_px, decay_tol, tmp_dir_str) = task
     tmp_dir = Path(tmp_dir_str)
 
     base = geom_tag(wg_width, gap, wg_length, bend_length, lead_extra_gap, lam)
@@ -222,7 +245,7 @@ def worker(task):
 
     try:
         dc, S_dict, Ez1_full, eps_full, cell = run_fdtd_sim_port1(
-            wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, dpml_um, cell_um, crop_px, decay_tol
+            wg_width, gap, wg_length, bend_length, lead_extra_gap, lam, RESOLUTION, dpml_um, cell_x_um, cell_y_um, crop_x_px, crop_y_px, decay_tol
         )
         if S_dict is None:
             raise RuntimeError("S_dict is None")
@@ -236,9 +259,8 @@ def worker(task):
         Ez1 = Ez1_full[pml_px:-pml_px, pml_px:-pml_px]
 
         ny, nx = eps.shape
-        crop_px = int(crop_px)
-        if (ny, nx) != (crop_px, crop_px):
-            raise RuntimeError(f"Expected cropped ({crop_px},{crop_px}) but got {(ny,nx)}")
+        if (ny, nx) != (int(crop_y_px), int(crop_x_px)):
+            raise RuntimeError(f"Expected cropped ({crop_y_px},{crop_x_px}) but got {(ny,nx)}")
 
         # Source mask for input_port=1 (cropped coords)
         src_px = dc.get_source_region_px(input_port=1, crop_pml=True)
@@ -326,10 +348,28 @@ def _write_shard_npz(out_path: Path, samples: List[Tuple[Dict[str, np.ndarray], 
         for k, v in meta.items():
             save_dict[prefix + k] = np.array(v)
 
-    if compress:
-        np.savez_compressed(out_path, **save_dict)
-    else:
-        np.savez(out_path, **save_dict)
+    # Atomic write to avoid leaving partial/corrupt shards if interrupted.
+    # Write a temporary file in the same directory and then replace.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=str(out_path.parent),
+        prefix=out_path.stem + ".",
+        suffix=".tmp.npz",
+        delete=False,
+    ) as tf:
+        tmp_path = Path(tf.name)
+    try:
+        if compress:
+            np.savez_compressed(tmp_path, **save_dict)
+        else:
+            np.savez(tmp_path, **save_dict)
+        os.replace(tmp_path, out_path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def _atomic_write_index(index_path: Path, index_list: List[Dict[str, object]]):
@@ -525,11 +565,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", type=str, default=None, help="Output root (default: <repo>/Data/coupler_sweep)")
     ap.add_argument("--resolution", type=int, default=RESOLUTION_DEFAULT)
-    ap.add_argument("--crop-px", type=int, default=CROP_PX_DEFAULT, help="Non-PML crop size in pixels (square).")
+    ap.add_argument("--crop-x-px", type=int, default=CROP_X_PX_DEFAULT, help="Non-PML crop X pixels (propagation).")
+    ap.add_argument("--crop-y-px", type=int, default=CROP_Y_PX_DEFAULT, help="Non-PML crop Y pixels (transverse).")
     ap.add_argument("--dpml", type=float, default=DPML_DEFAULT)
     ap.add_argument("--n-geo", type=int, default=N_GEO_DEFAULT)
     ap.add_argument("--n-procs", type=int, default=N_PROCS_DEFAULT)
     ap.add_argument("--decay-tol", type=float, default=1e-5)
+    ap.add_argument("--wavelengths", type=str, default=None,
+                    help="Comma-separated wavelengths in um (e.g. '1.45,1.50,1.55,1.60'). "
+                         "If not set, uses --n-wavelengths evenly spaced points.")
+    ap.add_argument("--n-wavelengths", type=int, default=1,
+                    help="Number of evenly spaced wavelengths in [lambda_min, lambda_max]. "
+                         "Ignored if --wavelengths is set.")
 
     ap.add_argument("--shard-size", type=int, default=100, help="Samples per shard (NOTE: each geometry yields 2 samples).")
     ap.add_argument("--compress", action="store_true")
@@ -550,31 +597,51 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
     shards_dir.mkdir(parents=True, exist_ok=True)
 
-    # Quantize dpml/cell to EXACT integer-pixel sizes (Euler-style).
-    crop_px = int(args.crop_px)
-    if crop_px <= 0:
-        raise ValueError("--crop-px must be > 0")
+    # Quantize dpml/cell to EXACT integer-pixel sizes (rectangular grid).
+    crop_x_px = int(args.crop_x_px)
+    crop_y_px = int(args.crop_y_px)
+    if crop_x_px <= 0 or crop_y_px <= 0:
+        raise ValueError("--crop-x-px and --crop-y-px must be > 0")
 
     pml_px = int(np.round(float(args.dpml) * float(args.resolution)))
     dpml_um = float(pml_px) / float(args.resolution)
-    full_px = int(crop_px + 2 * pml_px)
-    cell_um = float(full_px) / float(args.resolution)
+    full_x_px = int(crop_x_px + 2 * pml_px)
+    full_y_px = int(crop_y_px + 2 * pml_px)
+    cell_x_um = float(full_x_px) / float(args.resolution)
+    cell_y_um = float(full_y_px) / float(args.resolution)
 
-    # Validate cropped shape
-    nx_full = int(np.round(cell_um * float(args.resolution)))
-    nx_crop = nx_full - 2 * pml_px
-    if nx_crop != crop_px:
-        raise ValueError(f"Crop mismatch: expected {crop_px} but got {nx_crop}. Check dpml/resolution/crop-px.")
+    # Validate cropped shapes
+    nx_full = int(np.round(cell_x_um * float(args.resolution)))
+    ny_full = int(np.round(cell_y_um * float(args.resolution)))
+    if (nx_full - 2 * pml_px) != crop_x_px:
+        raise ValueError(f"X crop mismatch: expected {crop_x_px} but got {nx_full - 2*pml_px}.")
+    if (ny_full - 2 * pml_px) != crop_y_px:
+        raise ValueError(f"Y crop mismatch: expected {crop_y_px} but got {ny_full - 2*pml_px}.")
 
-    params = build_param_list(args.n_geo, seed_base=42)
+    # Build wavelength list
+    if args.wavelengths is not None:
+        wavelengths = [float(x.strip()) for x in args.wavelengths.split(",")]
+    else:
+        n_wl = max(1, int(args.n_wavelengths))
+        if n_wl == 1:
+            wavelengths = [0.5 * (lambda_min + lambda_max)]
+        else:
+            wavelengths = np.linspace(lambda_min, lambda_max, n_wl).tolist()
+    wavelengths = sorted(set(round(w, 4) for w in wavelengths))
 
-    print(f"Unique geometries: {len(params)}")
-    print(f"Total samples produced (with symmetry): {2 * len(params)}")
+    params = build_param_list(args.n_geo, wavelengths=wavelengths, resolution=args.resolution, seed_base=42)
+
+    n_sims = len(params)
+    n_geos = args.n_geo
+    print(f"Unique geometries: {n_geos}")
+    print(f"Wavelengths per geometry: {len(wavelengths)}  {wavelengths}")
+    print(f"Total FDTD sims: {n_sims}")
+    print(f"Total samples produced (with symmetry): {2 * n_sims}")
     print(f"OUT_DIR:   {OUT_DIR}")
     print(f"TMP_DIR:   {tmp_dir}  (bounded by queue_max ~ {args.queue_max})")
     print(f"SHARDS:    {shards_dir}")
     print(f"n_procs:   {args.n_procs}")
-    print(f"resolution: {args.resolution}, crop_px: {crop_px}, dpml_um: {dpml_um:.6f}, pml_px: {pml_px}, cell_um: {cell_um:.6f}")
+    print(f"resolution: {args.resolution}, crop: {crop_x_px}x{crop_y_px}, dpml_um: {dpml_um:.6f}, pml_px: {pml_px}, cell: {cell_x_um:.3f}x{cell_y_um:.3f} um")
     print(f"shard_size(samples): {args.shard_size}  => ~{math.ceil((2*len(params))/args.shard_size)} shards")
 
     q: mp.Queue = mp.Queue(maxsize=args.queue_max)
@@ -590,12 +657,13 @@ def main():
             "index.json",
             bool(args.index_every_shard),
         ),
-        daemon=True,
+        # Keep non-daemon so it can finish queued writes on orderly shutdown.
+        daemon=False,
     )
     writer_p.start()
 
     tasks = [
-        (w, g, L, b, lead, lam, int(args.resolution), float(dpml_um), float(cell_um), int(crop_px), float(args.decay_tol), str(tmp_dir))
+        (w, g, L, b, lead, lam, int(args.resolution), float(dpml_um), float(cell_x_um), float(cell_y_um), int(crop_x_px), int(crop_y_px), float(args.decay_tol), str(tmp_dir))
         for (w, g, L, b, lead, lam) in params
     ]
 

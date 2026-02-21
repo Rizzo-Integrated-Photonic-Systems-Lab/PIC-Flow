@@ -59,9 +59,10 @@ class DirectionalCoupler2D(Device2DBase):
         4: right, bottom arm
 
     This version supports deterministic pixel-exact crops like EulerZigZag2D:
-      - Provide crop_px, resolution, dpml and leave cell_x_um/cell_y_um None
+      - Provide crop_x_px/crop_y_px, resolution, dpml and leave cell_x_um/cell_y_um None
       - With quantize_grid=True (default), dpml is snapped to integer pixels and
-        cell is chosen so interior (non-PML) is exactly crop_px×crop_px.
+        cell is chosen so interior (non-PML) is exactly crop_x_px × crop_y_px.
+      - Rectangular grids (crop_x_px ≠ crop_y_px) are supported for elongated devices.
     """
 
     def __init__(
@@ -74,7 +75,9 @@ class DirectionalCoupler2D(Device2DBase):
         n_core: float | None = None,
         n_clad: float = 1.444,
         dpml: float = 2.0 / 3.0,
-        crop_px: int = 384,            # target NON-PML crop in pixels
+        crop_x_px: int = 640,          # target NON-PML crop in X (propagation) pixels
+        crop_y_px: int = 128,          # target NON-PML crop in Y (transverse) pixels
+        crop_px: int | None = None,    # deprecated: if set, overrides both crop_x_px and crop_y_px
         quantize_grid: bool = True,
         pad_y_um: float = 1.0,         # conceptual padding (not used directly in geometry)
         source_shift_um: float = 0.5,  # distance source is upstream of input port [µm]
@@ -86,9 +89,14 @@ class DirectionalCoupler2D(Device2DBase):
         fit_margin_um: float = 0.5,    # safety margin from inner PML faces
         orientation: str = "horizontal",  # "horizontal" (left→right) or "vertical" (top→bottom)
     ):
-        crop_px = int(crop_px)
-        if crop_px <= 0:
-            raise ValueError("crop_px must be > 0")
+        # Handle deprecated square crop_px parameter
+        if crop_px is not None:
+            crop_x_px = int(crop_px)
+            crop_y_px = int(crop_px)
+        crop_x_px = int(crop_x_px)
+        crop_y_px = int(crop_y_px)
+        if crop_x_px <= 0 or crop_y_px <= 0:
+            raise ValueError("crop_x_px and crop_y_px must be > 0")
         resolution = int(resolution)
         if resolution <= 0:
             raise ValueError("resolution must be > 0")
@@ -97,21 +105,24 @@ class DirectionalCoupler2D(Device2DBase):
             raise ValueError("orientation must be 'horizontal' or 'vertical'")
 
         self.orientation = str(orientation)
-        self.crop_px = crop_px
+        self.crop_x_px = crop_x_px
+        self.crop_y_px = crop_y_px
         self.fit_margin_um = float(fit_margin_um)
 
-        # Quantize dpml + cell so (crop_px + 2*pml_px) is integer pixels.
+        # Quantize dpml + cell so (crop_*_px + 2*pml_px) is integer pixels.
         if bool(quantize_grid) and (cell_x_um is None or cell_y_um is None):
             pml_px = int(np.round(float(dpml) * float(resolution)))
             dpml_q = float(pml_px) / float(resolution)
-            full_px = int(crop_px + 2 * pml_px)
-            cell_um_q = float(full_px) / float(resolution)
-            cx = cell_um_q if cell_x_um is None else float(cell_x_um)
-            cy = cell_um_q if cell_y_um is None else float(cell_y_um)
+            full_x_px = int(crop_x_px + 2 * pml_px)
+            full_y_px = int(crop_y_px + 2 * pml_px)
+            cell_x_um_q = float(full_x_px) / float(resolution)
+            cell_y_um_q = float(full_y_px) / float(resolution)
+            cx = cell_x_um_q if cell_x_um is None else float(cell_x_um)
+            cy = cell_y_um_q if cell_y_um is None else float(cell_y_um)
             dpml_use = dpml_q
         else:
-            cx = float(cell_x_um) if cell_x_um is not None else (float(crop_px) / float(resolution) + 2.0 * float(dpml))
-            cy = float(cell_y_um) if cell_y_um is not None else (float(crop_px) / float(resolution) + 2.0 * float(dpml))
+            cx = float(cell_x_um) if cell_x_um is not None else (float(crop_x_px) / float(resolution) + 2.0 * float(dpml))
+            cy = float(cell_y_um) if cell_y_um is not None else (float(crop_y_px) / float(resolution) + 2.0 * float(dpml))
             dpml_use = float(dpml)
 
         super().__init__(cell_x=float(cx), cell_y=float(cy), dpml=float(dpml_use), resolution=int(resolution))

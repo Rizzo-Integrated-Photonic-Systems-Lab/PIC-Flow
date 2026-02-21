@@ -23,7 +23,7 @@ mkdir -p logs
 # FAST DATASET - uses preprocessed .pt files
 # Run preprocess_data.slurm first!
 # -----------------------
-DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data_preprocessed/unified_sweep"
+DATA_ROOT="/dartfs/rc/lab/R/RizzoA/f0071mj/Data_preprocessed/unified_sweep"
 
 VERSION="unified_complexphys_fast_v1"
 HIDDEN_SIZE=64          # Can use larger model now

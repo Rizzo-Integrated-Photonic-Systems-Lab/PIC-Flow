@@ -502,8 +502,8 @@ class ComplexPhysicsUNet(nn.Module):
 
         if dims != 2:
             raise ValueError("ComplexPhysicsUNet is currently implemented for 2D only.")
-        if out_channels != 2:
-            raise ValueError("ComplexPhysicsUNet outputs 2 channels (real+imag velocity). Set out_channels=2.")
+        if out_channels not in (2, 3):
+            raise ValueError("ComplexPhysicsUNet outputs 2 (field velocity) or 3 (field+eps velocity) channels.")
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -606,6 +606,18 @@ class ComplexPhysicsUNet(nn.Module):
         self.out_norm = ComplexGroupNorm(ch)
         self.out_act = ModReLU(ch)
         self.out_conv = ComplexConv2d(ch, 1, kernel_size=3, padding=1)  # 1 complex channel out
+
+        # Joint training: eps velocity head (real-valued, operates on feature magnitudes)
+        self.joint_eps_out = None
+        if out_channels == 3:
+            self.joint_eps_out = nn.Sequential(
+                nn.GroupNorm(min(32, ch), ch),
+                nn.SiLU(),
+                nn.Conv2d(ch, 1, 3, padding=1),  # real-valued
+            )
+            # Zero-init so eps velocity starts at zero (no disruption from old checkpoints)
+            nn.init.zeros_(self.joint_eps_out[-1].weight)
+            nn.init.zeros_(self.joint_eps_out[-1].bias)
 
         # S-param head (optional) - uses ImprovedSParamHead with phase gradient features
         self.enable_sparam_head = enable_sparam_head
@@ -806,6 +818,13 @@ class ComplexPhysicsUNet(nn.Module):
         vr, vi = _maybe_ckpt(self.out_conv, hr, hi)
 
         v = torch.cat([vr, vi], dim=1)
+
+        # Joint training: append eps velocity channel
+        if self.joint_eps_out is not None:
+            feat_mag = torch.sqrt(hr ** 2 + hi ** 2 + 1e-8)
+            v_eps = self.joint_eps_out(feat_mag)  # [B,1,H,W]
+            v = torch.cat([v, v_eps], dim=1)      # [B,3,H,W]
+
         u_t_pred = v * pml_m.to(dtype=v.dtype)
 
         if not return_sparams:
@@ -825,7 +844,7 @@ class ComplexPhysicsUNet(nn.Module):
             t4 = t4.view(-1, 1, 1, 1)
         a = (1.0 - float(sig_min))
         b = (1.0 - a * t4)
-        x1_fields_pred = a * fields_t + b * u_t_pred
+        x1_fields_pred = a * fields_t + b * u_t_pred[:, :2]
 
         dev_type = x.device.type
         with torch.autocast(dev_type, enabled=False):

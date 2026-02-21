@@ -16,7 +16,7 @@ N_GEO_DEFAULT = 2000
 
 WG_WIDTH_MIN, WG_WIDTH_MAX = 0.38, 0.60
 GAP_MIN, GAP_MAX = 0.10, 0.35
-LC_MIN, LC_MAX = 5.0, 9.0
+LC_MIN, LC_MAX = 5.0, 15.0
 BEND_MIN, BEND_MAX = 4.0, 6.0
 LEAD_GAP_MIN, LEAD_GAP_MAX = 0.8, 2.5
 
@@ -30,7 +30,8 @@ def main():
     ap.add_argument("--wavelengths", type=str, default=",".join([str(x) for x in WAVELENGTHS_DEFAULT]))
     ap.add_argument("--resolution", type=int, default=20)
     ap.add_argument("--dpml", type=float, default=2.0 / 3.0)
-    ap.add_argument("--crop-px", type=int, default=384)
+    ap.add_argument("--crop-x-px", type=int, default=640, help="Interior (non-PML) X pixels (propagation direction)")
+    ap.add_argument("--crop-y-px", type=int, default=128, help="Interior (non-PML) Y pixels (transverse direction)")
     ap.add_argument("--decay-tol", type=float, default=1e-5)
     args = ap.parse_args()
 
@@ -88,7 +89,8 @@ def main():
                 wavelength_um=float(lam),
                 resolution=int(args.resolution),
                 dpml=float(args.dpml),
-                crop_px=int(args.crop_px),
+                crop_x_px=int(args.crop_x_px),
+                crop_y_px=int(args.crop_y_px),
                 quantize_grid=True,
                 fit_margin_um=0.5,
             )

@@ -2,8 +2,8 @@
 """
 Unified multi-device sweep for photonic dataset generation.
 
-Generates training data for: straight waveguides, tapers, bends (Euler, circular, S),
-Y-branches, directional couplers, and crossings.
+Generates training data for: straight waveguides, tapers, S-bends,
+Y-branches, and directional couplers.
 
 Each geometry is run at 4 fixed wavelengths. For multi-input devices, one input port
 is randomly selected per geometry and used for all 4 wavelengths.
@@ -30,12 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from straight_waveguide.straight import StraightWaveguide2D
 from taper.taper import TaperWaveguide2D
-from euler_bend.euler_bend import EulerBend2D
-from circular_bend.circular_bend import CircularBend2D
 from sbend.sbend import EulerSBend2D
 from ybranch.ybranch import YBranch2D
 from directional_coupler.directional_coupler import DirectionalCoupler2D
-from crossing.crossing import UniformCrossing2D
 
 from sweep_utils import latin_hypercube, quantize_01, assign_splits
 
@@ -180,40 +177,8 @@ def get_device_masks(dev, device_type: str, input_port: int,
 
         return src_mask, port_ids, port_masks
 
-    elif device_type == "crossing":
-        # Has 4 ports, uses get_ports() and get_sources() methods
-        # Convert from meep.Volume objects
-        sources = dev.get_sources()
-        ports = dev.get_ports()
-
-        # Source mask for the active input port
-        src_vol = sources[f"src_{input_port}"]
-        src_line = _volume_to_line_px(src_vol, cell_x, cell_y, dpml, resolution)
-        src_mask = _draw_thick_line_mask(
-            ny, nx,
-            src_line["line_start_px"][0], src_line["line_start_px"][1],
-            src_line["line_end_px"][0], src_line["line_end_px"][1],
-            thickness_px=thickness_px,
-        )
-
-        port_ids = np.array([1, 2, 3, 4], dtype=np.int32)
-        port_masks = []
-        for p in port_ids.tolist():
-            port_vol = ports[f"port_{p}"]
-            port_line = _volume_to_line_px(port_vol, cell_x, cell_y, dpml, resolution)
-            pm = _draw_thick_line_mask(
-                ny, nx,
-                port_line["line_start_px"][0], port_line["line_start_px"][1],
-                port_line["line_end_px"][0], port_line["line_end_px"][1],
-                thickness_px=thickness_px,
-            )
-            port_masks.append(pm)
-        port_masks = np.stack(port_masks, axis=0).astype(np.float32)
-
-        return src_mask, port_ids, port_masks
-
     else:
-        # 2-port devices: straight, taper, euler_bend, circular_bend, sbend
+        # 2-port devices: straight, taper, sbend
         # These have port_in, port_out, src_vol attributes
         # Source is offset from port by source_shift (typically 0.5 um)
 
@@ -295,7 +260,8 @@ def get_device_masks(dev, device_type: str, input_port: int,
 # The dihedral group D4 has 8 elements: 4 rotations × 2 flip states
 # This gives us 8× the training data from each simulation for free.
 
-AUGMENT_TRANSFORMS = [
+# D4 group (8 elements) — full augmentation for square grids
+AUGMENT_TRANSFORMS_D4 = [
     # (flip_horizontal, rotate_k) where rotate_k is number of 90° CCW rotations
     (False, 0),  # identity
     (False, 1),  # 90° CCW
@@ -306,10 +272,20 @@ AUGMENT_TRANSFORMS = [
     (True, 2),   # horizontal flip + 180° (= vertical flip)
     (True, 3),   # horizontal flip + 270° CCW
 ]
-
-AUGMENT_NAMES = [
+AUGMENT_NAMES_D4 = [
     "orig", "rot90", "rot180", "rot270",
     "flip_h", "flip_h_rot90", "flip_v", "flip_h_rot270"
+]
+
+# D2 subgroup (4 elements) — safe for rectangular grids (no 90°/270° rotations)
+AUGMENT_TRANSFORMS_D2 = [
+    (False, 0),  # identity
+    (False, 2),  # 180°
+    (True, 0),   # horizontal flip
+    (True, 2),   # vertical flip (= horizontal flip + 180°)
+]
+AUGMENT_NAMES_D2 = [
+    "orig", "rot180", "flip_h", "flip_v"
 ]
 
 
@@ -365,83 +341,77 @@ def augment_sample(data: Dict[str, np.ndarray], flip_h: bool, rot_k: int) -> Dic
 # =============================================================================
 WAVELENGTHS = [1.45, 1.50, 1.55, 1.60]
 
-# Default counts for 5,000 total geometries (scaled from 10k spec)
+# Default counts for 10,000 total geometries (5 elongated devices only).
+# Allocation weighted by parameter-space dimensionality.
 DEFAULT_COUNTS = {
-    "straight": 500,
-    "taper": 750,
-    "euler_bend": 500,
-    "circular_bend": 500,
-    "sbend": 250,
-    "ybranch": 750,
-    "directional_coupler": 1000,
-    "crossing": 750,
+    "straight": 1000,            # 2D param space
+    "taper": 1500,               # 3D param space
+    "sbend": 1500,               # 3D param space
+    "ybranch": 2500,             # 5D param space
+    "directional_coupler": 3500, # 5D param space
 }
 
-# Parameter ranges per device
+# Parameter ranges per device (5 elongated device types only).
+# All values should be multiples of 1/(2*resolution) for pixel-grid alignment.
+# At resolution=18: quantum = 1/36 ≈ 0.02778 µm.
+# Ranges tuned for 192×512 interior at res=18 (10.67 × 28.44 µm).
 PARAM_RANGES = {
     "straight": {
-        "wg_width_um": (0.38, 0.60),
-        "dev_length_um": (6.0, 16.0),
+        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36  (8 values)
+        "dev_length_um": (6.0, 22.0),       # plenty of X room
     },
     "taper": {
-        "wg_width_in_um": (0.38, 0.60),
-        "wg_width_out_um": (0.60, 2.50),
-        "taper_length_um": (6.0, 16.0),
-    },
-    "euler_bend": {
-        "wg_width_um": (0.38, 0.60),
-        "R_min_um": (3.0, 8.0),
-    },
-    "circular_bend": {
-        "wg_width_um": (0.38, 0.60),
-        "bend_radius_um": (3.0, 8.0),
+        "wg_width_in_um": (0.3889, 0.5833), # 14/36 – 21/36
+        "wg_width_out_um": (0.6111, 2.5),   # 22/36 – 90/36
+        "taper_length_um": (6.0, 20.0),     # more X room at res 18
     },
     "sbend": {
-        "wg_width_um": (0.38, 0.60),
-        "lateral_offset_um": (2.0, 6.0),
+        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36
+        "lateral_offset_um": (2.0, 7.0),    # was 6.0; more Y room at res 18
         "R_min_um": (3.0, 8.0),
     },
     "ybranch": {
-        "wg_width_um": (0.38, 0.60),
-        "l_junction_um": (1.2, 3.2),
+        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36
+        "l_junction_um": (1.1667, 3.1667),  # 42/36 – 114/36
         "l_bend_um": (4.0, 7.0),
-        "h_bend_um": (0.6, 2.8),
+        "h_bend_um": (0.5556, 3.0),         # 20/36 – 108/36; was 2.8, more Y room
         "l_out_um": (1.0, 6.0),
     },
     "directional_coupler": {
-        "wg_width_um": (0.38, 0.60),
-        "gap_um": (0.10, 0.35),
-        "wg_length_um": (5.0, 9.0),
+        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36
+        "gap_um": (0.1111, 0.3333),         # 4/36 – 12/36  (9 values)
+        "wg_length_um": (5.0, 12.0),        # was 9.0; more X room at res 18
         "bend_length_um": (4.0, 6.0),
-        "lead_extra_gap_um": (0.8, 2.5),
-    },
-    "crossing": {
-        "wg_width_h_um": (0.38, 0.60),
-        "wg_width_v_um": (0.38, 0.60),
+        "lead_extra_gap_um": (0.8056, 2.5), # 29/36 – 90/36
     },
 }
 
-# Number of input ports per device type
+# Number of input ports per device type (5 elongated devices only)
 INPUT_PORTS = {
     "straight": [1, 2],
     "taper": [1, 2],
-    "euler_bend": [1, 2],
-    "circular_bend": [1, 2],
     "sbend": [1, 2],
     "ybranch": [1, 2, 3],  # Port 1 = splitter, Ports 2/3 = combiner
     "directional_coupler": [1, 2],  # Symmetric, use 1 or 2
-    "crossing": [1, 2, 3, 4],  # 4-port, can excite from any
 }
 
 
 # =============================================================================
 # Sampling utilities
 # =============================================================================
-def sample_params(device_type: str, n_geo: int, seed: int) -> List[Dict[str, float]]:
-    """Sample parameters for a device type using Latin Hypercube Sampling."""
+def sample_params(device_type: str, n_geo: int, seed: int, resolution: int = 18) -> List[Dict[str, float]]:
+    """Sample parameters for a device type using Latin Hypercube Sampling.
+
+    Values are quantized to the half-pixel grid (1/(2*resolution)) so that
+    every parameter change maps to a distinct difference in the epsilon map.
+    """
     ranges = PARAM_RANGES[device_type]
     n_dims = len(ranges)
     param_names = list(ranges.keys())
+
+    # Half-pixel quantum: ensures each step shifts an edge by ≥ half a pixel,
+    # producing a measurably different subpixel-averaged epsilon.
+    q = 1.0 / (2.0 * resolution)
 
     u = latin_hypercube(n_geo, d=n_dims, seed=seed)
 
@@ -451,8 +421,8 @@ def sample_params(device_type: str, n_geo: int, seed: int) -> List[Dict[str, flo
         for j, name in enumerate(param_names):
             lo, hi = ranges[name]
             val = lo + u[i, j] * (hi - lo)
-            # Quantize to 0.01 precision
-            val = round(val * 100.0) / 100.0
+            # Snap to half-pixel grid
+            val = round(val / q) * q
             val = max(lo, min(hi, val))
             p[name] = float(val)
         params_list.append(p)
@@ -470,7 +440,7 @@ def make_geom_id(device_type: str) -> str:
 # =============================================================================
 def build_device(device_type: str, params: Dict[str, float], wavelength_um: float,
                  resolution: int, dpml: float, cell_x: float, cell_y: float,
-                 crop_px: int):
+                 crop_x_px: int, crop_y_px: int):
     """Build a device instance based on type and parameters."""
 
     common_kwargs = {
@@ -499,28 +469,6 @@ def build_device(device_type: str, params: Dict[str, float], wavelength_um: floa
             **common_kwargs,
         )
 
-    elif device_type == "euler_bend":
-        return EulerBend2D(
-            wg_width=params["wg_width_um"],
-            R_min_um=params["R_min_um"],
-            bend_angle_deg=90.0,
-            dpml=dpml,
-            cell_x=cell_x,
-            cell_y=cell_y,
-            **common_kwargs,
-        )
-
-    elif device_type == "circular_bend":
-        return CircularBend2D(
-            wg_width=params["wg_width_um"],
-            bend_radius_um=params["bend_radius_um"],
-            bend_angle_deg=90.0,
-            dpml=dpml,
-            cell_x=cell_x,
-            cell_y=cell_y,
-            **common_kwargs,
-        )
-
     elif device_type == "sbend":
         return EulerSBend2D(
             wg_width=params["wg_width_um"],
@@ -540,8 +488,9 @@ def build_device(device_type: str, params: Dict[str, float], wavelength_um: floa
             h_bend_um=params["h_bend_um"],
             l_out_um=params["l_out_um"],
             dpml=dpml,
-            crop_px=crop_px,
-            quantize_grid=True,
+            cell_x_um=cell_x,
+            cell_y_um=cell_y,
+            quantize_grid=False,
             fit_margin_um=0.5,
             **common_kwargs,
         )
@@ -554,19 +503,10 @@ def build_device(device_type: str, params: Dict[str, float], wavelength_um: floa
             bend_length_um=params["bend_length_um"],
             lead_extra_gap_um=params["lead_extra_gap_um"],
             dpml=dpml,
-            crop_px=crop_px,
+            crop_x_px=crop_x_px,
+            crop_y_px=crop_y_px,
             quantize_grid=True,
             fit_margin_um=0.5,
-            **common_kwargs,
-        )
-
-    elif device_type == "crossing":
-        return UniformCrossing2D(
-            wg_width_h=params["wg_width_h_um"],
-            wg_width_v=params["wg_width_v_um"],
-            dpml=dpml,
-            cell_x=cell_x,
-            cell_y=cell_y,
             **common_kwargs,
         )
 
@@ -585,7 +525,7 @@ def run_sim_and_extract(dev, device_type: str, input_port: int, decay_tol: float
     import meep as meep_mp
     from utils import get_mode_alpha_2dir, pick_in_out_from_alpha
 
-    if device_type in ["straight", "taper", "euler_bend", "circular_bend", "sbend"]:
+    if device_type in ["straight", "taper", "sbend"]:
         # 2-port devices
         toward = {1: +1, 2: -1}
         sim, (m1, m2), dft, _fcen = dev._build_sim_single(input_port=int(input_port), df_frac=0.1)
@@ -624,12 +564,6 @@ def run_sim_and_extract(dev, device_type: str, input_port: int, decay_tol: float
             S[f"S{p}{input_port}"] = S_raw[(p, input_port)]
         return eps, Ez, S, cell_size
 
-    elif device_type == "crossing":
-        # 4-port device
-        eps, Ez, S_raw, cell_size = dev.run_sim(input_port=input_port, decay_tol=decay_tol)
-        # S_raw already has keys like 'S11', 'S21', 'S31', 'S41'
-        return eps, Ez, S_raw, cell_size
-
     else:
         raise ValueError(f"Unknown device type: {device_type}")
 
@@ -643,12 +577,12 @@ def worker(task: Tuple) -> Tuple[str, Any]:
     Returns: ("OK", result_dict) or ("ERR", error_string)
     """
     (device_type, geom_id, params, input_port, wavelength_um, split,
-     resolution, dpml, cell_x, cell_y, crop_px, decay_tol, tmp_dir) = task
+     resolution, dpml, cell_x, cell_y, crop_x_px, crop_y_px, decay_tol, tmp_dir) = task
 
     tmp_path = Path(tmp_dir) / f"{geom_id}_lam{wavelength_um:.4f}.npz"
 
     try:
-        dev = build_device(device_type, params, wavelength_um, resolution, dpml, cell_x, cell_y, crop_px)
+        dev = build_device(device_type, params, wavelength_um, resolution, dpml, cell_x, cell_y, crop_x_px, crop_y_px)
         eps_full, Ez_full, S, cell_size = run_sim_and_extract(dev, device_type, input_port, decay_tol)
 
         # Crop PML region - only save the interior (non-PML) window
@@ -720,11 +654,11 @@ def worker(task: Tuple) -> Tuple[str, Any]:
 # =============================================================================
 def shard_writer_process(q: mp.Queue, shards_dir: str, shard_size: int,
                          compress: bool, index_every_shard: bool,
-                         augment: bool = True):
+                         augment: bool = True, rect_grid: bool = False):
     """
     Background process that consolidates temp files into shards.
 
-    If augment=True, applies all 8 D4 transforms to each sample, giving 8× data.
+    If augment=True, applies D4 (8×) for square grids or D2 (4×) for rectangular grids.
     """
     shards_path = Path(shards_dir)
     shards_path.mkdir(parents=True, exist_ok=True)
@@ -799,8 +733,10 @@ def shard_writer_process(q: mp.Queue, shards_dir: str, shard_size: int,
                 data = {key: f[key] for key in f.files}
 
             # Apply augmentations (or just original if augment=False)
-            if augment:
-                transforms_to_apply = list(zip(AUGMENT_TRANSFORMS, AUGMENT_NAMES))
+            if augment and rect_grid:
+                transforms_to_apply = list(zip(AUGMENT_TRANSFORMS_D2, AUGMENT_NAMES_D2))
+            elif augment:
+                transforms_to_apply = list(zip(AUGMENT_TRANSFORMS_D4, AUGMENT_NAMES_D4))
             else:
                 transforms_to_apply = [((False, 0), "orig")]
 
@@ -849,28 +785,23 @@ def main():
                         help="Output directory (default: <repo>/Data/unified_sweep)")
 
     # Geometry counts (can scale all at once or individually)
-    parser.add_argument("--n-geo", type=int, default=5000,
-                        help="Total unique geometries (default: 5000)")
+    parser.add_argument("--n-geo", type=int, default=10000,
+                        help="Total unique geometries (default: 10000)")
     parser.add_argument("--n-straight", type=int, default=None)
     parser.add_argument("--n-taper", type=int, default=None)
-    parser.add_argument("--n-euler-bend", type=int, default=None)
-    parser.add_argument("--n-circular-bend", type=int, default=None)
     parser.add_argument("--n-sbend", type=int, default=None)
     parser.add_argument("--n-ybranch", type=int, default=None)
     parser.add_argument("--n-directional-coupler", type=int, default=None)
-    parser.add_argument("--n-crossing", type=int, default=None)
 
     # Simulation params
     parser.add_argument("--resolution", type=int, default=18,
                         help="Simulation resolution (pixels/µm)")
-    parser.add_argument("--dpml", type=float, default=1.0,
+    parser.add_argument("--dpml", type=float, default=2.0/3.0,
                         help="PML thickness (µm)")
-    parser.add_argument("--cell-x", type=float, default=26.0,
-                        help="Cell size X (µm)")
-    parser.add_argument("--cell-y", type=float, default=26.0,
-                        help="Cell size Y (µm)")
-    parser.add_argument("--crop-px", type=int, default=384,
-                        help="Non-PML crop size for quantized devices")
+    parser.add_argument("--crop-x-px", type=int, default=512,
+                        help="Non-PML interior width in pixels (propagation direction)")
+    parser.add_argument("--crop-y-px", type=int, default=192,
+                        help="Non-PML interior height in pixels (transverse direction)")
     parser.add_argument("--decay-tol", type=float, default=1e-5,
                         help="DFT decay tolerance")
 
@@ -902,6 +833,13 @@ def main():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
 
+    # Compute cell sizes from crop dimensions + PML
+    pml_px = int(round(float(args.dpml) * float(args.resolution)))
+    dpml_q = float(pml_px) / float(args.resolution)
+    args.cell_x = float(args.crop_x_px + 2 * pml_px) / float(args.resolution)
+    args.cell_y = float(args.crop_y_px + 2 * pml_px) / float(args.resolution)
+    args.dpml = dpml_q  # use quantized dpml
+
     # Setup paths
     repo_root = Path(__file__).resolve().parents[1]
     out_dir = Path(args.out_dir) if args.out_dir else (repo_root / "Data" / "unified_sweep")
@@ -920,12 +858,9 @@ def main():
     overrides = {
         "straight": args.n_straight,
         "taper": args.n_taper,
-        "euler_bend": args.n_euler_bend,
-        "circular_bend": args.n_circular_bend,
         "sbend": args.n_sbend,
         "ybranch": args.n_ybranch,
         "directional_coupler": args.n_directional_coupler,
-        "crossing": args.n_crossing,
     }
 
     if any(v is not None for v in overrides.values()):
@@ -942,7 +877,8 @@ def main():
     total_geo = sum(counts.values())
     total_sims = total_geo * len(WAVELENGTHS)
     augment = args.augment  # Default: off (do augmentation during training instead)
-    augment_factor = 8 if augment else 1
+    rect_grid = args.crop_x_px != args.crop_y_px
+    augment_factor = (4 if rect_grid else 8) if augment else 1
     total_samples = total_sims * augment_factor
 
     print(f"=" * 60)
@@ -962,10 +898,14 @@ def main():
     print(f"Augmentation: {'8x (D4 rotations/flips)' if augment else 'disabled'}")
     print(f"Total samples: {total_samples} ({total_sims} sims × {augment_factor})")
     print()
+    q = 1.0 / (2.0 * args.resolution)
     print(f"Simulation params:")
-    print(f"  resolution: {args.resolution} px/µm")
-    print(f"  dpml:       {args.dpml} µm")
-    print(f"  cell:       {args.cell_x} x {args.cell_y} µm")
+    print(f"  resolution: {args.resolution} px/µm (dx = {1.0/args.resolution:.4f} µm)")
+    print(f"  param quantum: {q:.5f} µm (half-pixel)")
+    print(f"  dpml:       {args.dpml:.4f} µm ({pml_px} px)")
+    print(f"  crop:       {args.crop_x_px} x {args.crop_y_px} px (interior)")
+    print(f"  cell:       {args.cell_x:.3f} x {args.cell_y:.3f} µm")
+    print(f"  interior:   {args.crop_x_px/args.resolution:.2f} x {args.crop_y_px/args.resolution:.2f} µm")
     print(f"  decay_tol:  {args.decay_tol}")
     print()
     print(f"Parallelization: {args.n_procs} workers")
@@ -982,8 +922,8 @@ def main():
         if n_geo == 0:
             continue
 
-        # Sample parameters
-        params_list = sample_params(device_type, n_geo, seed=args.seed + seed_offset)
+        # Sample parameters (quantized to half-pixel grid)
+        params_list = sample_params(device_type, n_geo, seed=args.seed + seed_offset, resolution=args.resolution)
         seed_offset += 1
 
         # Assign splits (80/10/10)
@@ -1012,7 +952,7 @@ def main():
                 task = (
                     device_type, geom_id, params, input_port, lam, split,
                     args.resolution, args.dpml, args.cell_x, args.cell_y,
-                    args.crop_px, args.decay_tol, str(tmp_dir)
+                    args.crop_x_px, args.crop_y_px, args.decay_tol, str(tmp_dir)
                 )
                 all_tasks.append(task)
 
@@ -1030,7 +970,8 @@ def main():
     q = mp.Queue(maxsize=args.queue_max)
     writer_proc = mp.Process(
         target=shard_writer_process,
-        args=(q, str(shards_dir), args.shard_size, args.compress, args.index_every_shard, augment),
+        args=(q, str(shards_dir), args.shard_size, args.compress, args.index_every_shard,
+              augment, args.crop_x_px != args.crop_y_px),
         daemon=True,
     )
     writer_proc.start()

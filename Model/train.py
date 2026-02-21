@@ -6,7 +6,7 @@ import csv
 import logging
 import math
 import os
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from time import time
 from types import SimpleNamespace
@@ -36,8 +36,13 @@ from dataset import FDTDDataset
 from dataset_fast import FastFDTDDataset
 from physics_unet import PhysicsUNet, HelmholtzResidual2D
 from complex_physics_unet import ComplexPhysicsUNet
-from flow_matching import psi_t, u_t, sample_t, cfm_loss_residual, sample as fm_sample, SIG_MIN
+from flow_matching import (
+    psi_t, u_t, sample_t, cfm_loss_residual, sample as fm_sample, SIG_MIN,
+    sample_mask_mode, MASK_MODE_FORWARD, MASK_MODE_INVERSE, MASK_MODE_JOINT,
+    binarization_loss, sample_joint, sample_inverse,
+)
 from sparams_loss import extract_sparams
+from modal_sparams import extract_sparams_modal
 
 try:
     from tqdm.auto import tqdm  # type: ignore
@@ -64,10 +69,23 @@ from matplotlib.colors import LogNorm
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.preferred_linalg_library("cusolver")
 
 dtype = torch.float32
+
+
+def _unwrap_model(model):
+    """Unwrap compiled / DDP wrappers to get the raw nn.Module."""
+    m = model
+    if hasattr(m, "_orig_mod"):       # torch.compile wrapper
+        m = m._orig_mod
+    if hasattr(m, "module"):          # DDP wrapper
+        m = m.module
+    if hasattr(m, "_orig_mod"):       # in case compile was inside DDP
+        m = m._orig_mod
+    return m
 
 
 def _save_eval_sample_png(
@@ -122,6 +140,128 @@ def _save_eval_sample_png(
         plt.close(fig)
     except Exception:
         # plotting must never crash training
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
+def _save_inverse_eval_png(
+    *,
+    out_path: str,
+    title: str,
+    eps_gt: np.ndarray,
+    eps_gen: np.ndarray,
+    eps_gen_binary: np.ndarray,
+    mag_gt: np.ndarray,
+    mag_gen: np.ndarray,
+    port_masks_overlay: np.ndarray | None,
+    sparam_text: str,
+    device_type: str,
+    ezr_gt: np.ndarray | None = None,
+    ezi_gt: np.ndarray | None = None,
+    ezr_gen: np.ndarray | None = None,
+    ezi_gen: np.ndarray | None = None,
+) -> None:
+    """
+    Save a 3×3 inverse design evaluation panel:
+      Row 1: GT eps (+ port masks overlay)  |  Gen eps (continuous)  |  Gen eps (binarized)
+      Row 2: GT |Ez|                        |  Gen |Ez|             |  |eps err| map
+      Row 3: Ez_real GT vs Gen              |  Ez_imag GT vs Gen    |  S-param table (text)
+    Falls back to 2×3 if field components are not provided.
+    """
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        has_fields = (ezr_gt is not None and ezi_gt is not None
+                      and ezr_gen is not None and ezi_gen is not None)
+        nrows = 3 if has_fields else 2
+        fig, axes = plt.subplots(nrows, 3, figsize=(14, 4 * nrows))
+        fig.suptitle(f"{title}  [{device_type}]", fontsize=11)
+
+        def im(ax, arr, t, *, cmap="viridis", vmin=None, vmax=None):
+            h = ax.imshow(arr, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax)
+            ax.set_title(t, fontsize=10)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            return h
+
+        colorbar_pairs = []  # (handle, ax) pairs for colorbars
+
+        # Row 1: eps panels
+        h = im(axes[0, 0], eps_gt, "GT eps", cmap="viridis")
+        colorbar_pairs.append((h, axes[0, 0]))
+        if port_masks_overlay is not None:
+            # overlay port masks as semi-transparent colored regions
+            alpha_mask = np.clip(port_masks_overlay, 0, 1) * 0.4
+            overlay = np.zeros((*eps_gt.shape, 4))
+            overlay[..., 0] = 1.0  # red channel
+            overlay[..., 1] = 0.3
+            overlay[..., 3] = alpha_mask
+            axes[0, 0].imshow(overlay, origin="lower")
+        h = im(axes[0, 1], eps_gen, "Gen eps (continuous)", cmap="viridis")
+        colorbar_pairs.append((h, axes[0, 1]))
+        h = im(axes[0, 2], eps_gen_binary, "Gen eps (binary)", cmap="viridis")
+        colorbar_pairs.append((h, axes[0, 2]))
+
+        # Row 2: field magnitude + eps error
+        h = im(axes[1, 0], mag_gt, "GT |Ez|", cmap="magma")
+        colorbar_pairs.append((h, axes[1, 0]))
+        h = im(axes[1, 1], mag_gen, "Gen |Ez|", cmap="magma")
+        colorbar_pairs.append((h, axes[1, 1]))
+
+        eps_err = np.abs(eps_gt - eps_gen)
+        h = im(axes[1, 2], eps_err, "|eps err|", cmap="hot")
+        colorbar_pairs.append((h, axes[1, 2]))
+
+        # Row 3 (if field components available): real/imag fields + S-param text
+        if has_fields:
+            vlim_r = max(np.abs(ezr_gt).max(), np.abs(ezr_gen).max(), 1e-12)
+            vlim_i = max(np.abs(ezi_gt).max(), np.abs(ezi_gen).max(), 1e-12)
+
+            # Real: GT (top half) | Gen (bottom half) side-by-side via vertical concat
+            ezr_compare = np.concatenate([ezr_gt, ezr_gen], axis=0)
+            h = im(axes[2, 0], ezr_compare, "Ez_real  GT(top) | Gen(bot)",
+                   cmap="RdBu", vmin=-vlim_r, vmax=vlim_r)
+            colorbar_pairs.append((h, axes[2, 0]))
+            # Draw separator line at midpoint
+            axes[2, 0].axhline(y=ezr_gt.shape[0] - 0.5, color="k", linewidth=0.8, linestyle="--")
+
+            # Imag: GT (top half) | Gen (bottom half)
+            ezi_compare = np.concatenate([ezi_gt, ezi_gen], axis=0)
+            h = im(axes[2, 1], ezi_compare, "Ez_imag  GT(top) | Gen(bot)",
+                   cmap="RdBu", vmin=-vlim_i, vmax=vlim_i)
+            colorbar_pairs.append((h, axes[2, 1]))
+            axes[2, 1].axhline(y=ezi_gt.shape[0] - 0.5, color="k", linewidth=0.8, linestyle="--")
+
+            # S-param text panel in row 3
+            axes[2, 2].axis("off")
+            axes[2, 2].set_title("S-params", fontsize=10)
+            axes[2, 2].text(
+                0.05, 0.95, sparam_text,
+                transform=axes[2, 2].transAxes,
+                fontsize=8, fontfamily="monospace",
+                verticalalignment="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.5),
+            )
+        else:
+            # No field components: S-param text in row 2 slot (original layout)
+            axes[1, 2].axis("off")
+            axes[1, 2].set_title("S-params", fontsize=10)
+            axes[1, 2].text(
+                0.05, 0.95, sparam_text,
+                transform=axes[1, 2].transAxes,
+                fontsize=8, fontfamily="monospace",
+                verticalalignment="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.5),
+            )
+
+        for h, ax in colorbar_pairs:
+            fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
+
+        fig.tight_layout(rect=[0, 0.02, 1, 0.93])
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+    except Exception:
         try:
             plt.close("all")
         except Exception:
@@ -230,6 +370,8 @@ def _move_aux_to_device(aux, device: torch.device):
     out["port_ids"] = _to(out.get("port_ids", None))
     out["sparams_true"] = _to(out.get("sparams_true", None))
     out["port_valid"] = _to(out.get("port_valid", None), dt=dtype)
+    out["grid_dx_um"] = _to(out.get("grid_dx_um", None), dt=dtype)
+    out["grid_dy_um"] = _to(out.get("grid_dy_um", None), dt=dtype)
 
     if out.get("in_port_idx", None) is not None:
         if torch.is_tensor(out["in_port_idx"]):
@@ -240,7 +382,8 @@ def _move_aux_to_device(aux, device: torch.device):
     return out
 
 
-def _format_sparams_compact(S_true_1d, S_pred_1d, port_valid_1d=None, max_ports=4) -> str:
+def _format_sparams_compact(S_true_1d, S_pred_1d, port_valid_1d=None,
+                            in_port_idx=None, max_ports=4) -> str:
     if S_true_1d is None or S_pred_1d is None:
         return ""
     S_true_1d = S_true_1d.reshape(-1)[:max_ports]
@@ -250,10 +393,22 @@ def _format_sparams_compact(S_true_1d, S_pred_1d, port_valid_1d=None, max_ports=
         pv = port_valid_1d.reshape(-1)[:max_ports].detach().cpu()
         keep = (pv > 0.5).numpy()
 
+    # Resolve input port index to skip (trivially 1.0 due to normalization)
+    in_idx = None
+    if in_port_idx is not None:
+        try:
+            t = torch.as_tensor(in_port_idx).flatten() if not torch.is_tensor(in_port_idx) else in_port_idx.detach().flatten()
+            in_idx = int(t[0].item()) if t.numel() >= 1 else None
+        except Exception:
+            try:
+                in_idx = int(in_port_idx)
+            except Exception:
+                pass
+
     mags_t = torch.abs(S_true_1d).detach().cpu().numpy()
     mags_p = torch.abs(S_pred_1d).detach().cpu().numpy()
     ph_t = torch.angle(S_true_1d).detach().cpu().numpy()
-    ph_p = torch.angle(S_true_1d).detach().cpu().numpy()  # safe if pred missing; overwritten below
+    ph_p = np.zeros_like(ph_t)
     try:
         ph_p = torch.angle(S_pred_1d).detach().cpu().numpy()
     except Exception:
@@ -263,6 +418,8 @@ def _format_sparams_compact(S_true_1d, S_pred_1d, port_valid_1d=None, max_ports=
     for i in range(min(len(mags_t), len(mags_p), max_ports)):
         if keep is not None and (i >= len(keep) or not bool(keep[i])):
             continue
+        if in_idx is not None and i == in_idx:
+            continue  # skip input port (always trivially 1.0)
         parts.append(f"p{i}: |S| {mags_t[i]:.3f}->{mags_p[i]:.3f}, ∠ {ph_t[i]:+.2f}->{ph_p[i]:+.2f}")
     return " ; ".join(parts)
 
@@ -272,7 +429,7 @@ def _ensure_model_pml_cells(model_like, pml_cells: int) -> None:
     Ensure flow_matching.py can reliably read model.(module).helmholtz.pml_cells for PML masking.
     """
     try:
-        m = getattr(model_like, "module", model_like)
+        m = _unwrap_model(model_like)
         if hasattr(m, "helmholtz") and (getattr(m, "helmholtz") is not None):
             h = getattr(m, "helmholtz")
             if hasattr(h, "pml_cells"):
@@ -294,8 +451,12 @@ def _parse_list(s: str) -> list[str]:
 
 
 def main(args):
-    assert torch.cuda.is_available(), "Need CUDA GPUs for DDP training."
-    dist.init_process_group(backend="nccl")
+    assert torch.cuda.is_available(), "Need CUDA GPU(s) for training."
+
+    # Try DDP init; fall back to single-GPU if env vars aren't set (plain python).
+    use_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if use_ddp:
+        dist.init_process_group(backend="nccl")
 
     # Optional: force all enabled losses to start from epoch 1 (disable phased curriculum).
     # Note: a loss only participates if its corresponding lambda > 0.
@@ -318,8 +479,8 @@ def main(args):
         args.sparam_warmup_epochs = 0
         args.endpoint_warmup_epochs = 0
 
-    rank = dist.get_rank()
-    world = dist.get_world_size()
+    rank = dist.get_rank() if use_ddp else 0
+    world = dist.get_world_size() if use_ddp else 1
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
@@ -348,7 +509,10 @@ def main(args):
     ddp_barrier(device)
     logger = create_logger(experiment_dir if is_rank0() else None)
     if is_rank0():
-        logger.info(f"DDP: rank={rank}/{world}, local_rank={local_rank}, device={device}")
+        if use_ddp:
+            logger.info(f"DDP: rank={rank}/{world}, local_rank={local_rank}, device={device}")
+        else:
+            logger.info(f"Single-GPU training on {device}")
     logger.info(f"Experiment dir: {experiment_dir}")
     # NOTE: when --all-losses-from-start is enabled we collapse phaseA/phaseB to 0 above,
     # so @B/@C tau schedules effectively start immediately.
@@ -368,6 +532,9 @@ def main(args):
                     "val_phase_grad_loss",
                     "val_sparam_loss",
                     "sample_residual_mean",
+                    "sample_gt_residual_mean",
+                    "sample_residual_ratio_vs_gt",
+                    "sample_residual_gap_dB",
                 ])
 
     wandb_run = None
@@ -485,6 +652,7 @@ def main(args):
                 pml_cells=int(getattr(args, "pml_cells", 0)),
                 return_aux=True,
                 use_index_split=bool(getattr(args, "use_index_split", False)),
+                include_sparams_cond=bool(getattr(args, "include_sparams_cond", False)),
             )
             stats = train_ds_tmp.get_stats()
         stats = broadcast_object(stats, src=0)
@@ -514,14 +682,47 @@ def main(args):
             pml_cells=int(getattr(args, "pml_cells", 0)),
             augment=bool(getattr(args, "augment", True)),  # D4 augmentation during training
             use_index_split=bool(getattr(args, "use_index_split", False)),
+            include_sparams_cond=bool(getattr(args, "include_sparams_cond", False)),
         )
 
-    train_sampler = DistributedSampler(
-        train_ds, num_replicas=world, rank=rank, shuffle=True, seed=args.global_seed, drop_last=True
-    )
-    val_sampler = DistributedSampler(
-        val_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False
-    )
+        val_ds = FDTDDataset(
+            root_dir=args.data_root,
+            split="val",
+            train_fraction=args.train_fraction,
+            stats=stats,
+            normalize_eps=args.normalize_eps,
+            include_sdf=bool(getattr(args, "include_sdf", False)),
+            normalize_sdf=bool(getattr(args, "normalize_sdf", True)),
+            sdf_thr_eps=float(getattr(args, "sdf_thr_eps", 3.0)),
+            sdf_dx_um=float(getattr(args, "dx", 1.0 / 24.0)),
+            sdf_dy_um=float(getattr(args, "dx", 1.0 / 24.0)),
+            sdf_feature=str(getattr(args, "sdf_feature", "raw")),
+            sdf_sigma_nm=float(getattr(args, "sdf_sigma_nm", 100.0)),
+            use_shards=args.use_shards,
+            shard_subdir=args.shard_subdir,
+            shard_index_name=args.shard_index_name,
+            include_sweeps=include_sweeps,
+            return_aux=True,
+            subset_train_per_sweep=subset_train if subset_train else None,
+            subset_val_per_sweep=subset_val if subset_train or subset_val else None,
+            subset_seed=subset_seed,
+            crop_pml=bool(getattr(args, "crop_pml", False)),
+            pml_cells=int(getattr(args, "pml_cells", 0)),
+            augment=False,
+            use_index_split=bool(getattr(args, "use_index_split", False)),
+            include_sparams_cond=bool(getattr(args, "include_sparams_cond", False)),
+        )
+
+    if use_ddp:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world, rank=rank, shuffle=True, seed=args.global_seed, drop_last=True
+        )
+        val_sampler = DistributedSampler(
+            val_ds, num_replicas=world, rank=rank, shuffle=False, drop_last=False
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
 
     assert args.batch_size % world == 0, f"--batch-size (global) must be divisible by world_size={world}"
     per_gpu_batch = args.batch_size // world
@@ -532,7 +733,7 @@ def main(args):
     train_loader = DataLoader(
         train_ds,
         batch_size=per_gpu_batch,
-        shuffle=False,
+        shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.train_num_workers,
         prefetch_factor=train_prefetch,
@@ -566,6 +767,7 @@ def main(args):
     in_channels = int(getattr(train_ds, "x_channels", int(stats.get("x_channels", 4))))
     enable_physics = bool(getattr(args, "physics_features", True))
     use_complex = bool(getattr(args, "complex_unet", False))
+    attn_res = () if args.no_attention else (8,)
 
     if is_rank0():
         logger.info("Using ComplexPhysicsUNet" if use_complex else "Using PhysicsUNet")
@@ -574,21 +776,27 @@ def main(args):
             sample0 = train_ds[0]
             x0 = sample0[0] if isinstance(sample0, (tuple, list)) else sample0
             h, w = int(x0.shape[-2]), int(x0.shape[-1])
-            logger.info(f"Data resolution: {h}x{w} (attention at ds=8 => {h//8}x{w//8} tokens)")
+            if len(attn_res) == 0:
+                logger.info(f"Data resolution: {h}x{w} (attention disabled)")
+            else:
+                token_desc = ", ".join([f"ds={ds}=>{h//ds}x{w//ds}" for ds in attn_res])
+                logger.info(f"Data resolution: {h}x{w} (attention: {token_desc} tokens)")
         except Exception as exc:  # pragma: no cover
             logger.info(f"Data resolution: <unknown> (probe failed: {exc})")
 
-    attn_res = () if args.no_attention else (8,)
+    joint_training = bool(getattr(args, "joint_training", False))
+    out_channels = 3 if joint_training else 2
+
     model_kwargs = dict(
         in_channels=in_channels,
-        out_channels=2,
+        out_channels=out_channels,
         model_channels=args.hidden_size,
-        num_res_blocks=3,
+        num_res_blocks=2,
         channel_mult=(1, 2, 4, 8,),
         attention_resolutions=attn_res,
         dropout=0.0,
         dims=2,
-        num_heads=4,
+        num_heads=8,
         cond_dim=int(getattr(train_ds, "cond_dim", 1)),
         enable_sparam_head=(args.lambda_sparam > 0 and str(getattr(args, "sparam_mode", "project")) == "head"),
         dx=dx,
@@ -611,21 +819,30 @@ def main(args):
         p.requires_grad = False
     ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
-    enable_head = bool(getattr(base_model, "enable_sparam_head", False))
-    ddp_find_unused = bool(
-        enable_head and (
-            int(getattr(args, "sparam_every", 1)) != 1
-            or (not bool(getattr(args, "sparam_from_start", False)))
-        )
-    )
+    # torch.compile: disable when unroll_steps>0 (variable-length loop causes recompilation).
+    use_compile = int(getattr(args, "unroll_steps", 0)) == 0
+    if use_compile:
+        base_model = torch.compile(base_model)
+        if is_rank0():
+            logger.info("torch.compile enabled on base_model")
 
-    model = DDP(
-        base_model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        find_unused_parameters=ddp_find_unused,
-        broadcast_buffers=False,
-    )
+    if use_ddp:
+        enable_head = bool(getattr(base_model, "enable_sparam_head", False))
+        ddp_find_unused = bool(
+            enable_head and (
+                int(getattr(args, "sparam_every", 1)) != 1
+                or (not bool(getattr(args, "sparam_from_start", False)))
+            )
+        )
+        model = DDP(
+            base_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=ddp_find_unused,
+            broadcast_buffers=False,
+        )
+    else:
+        model = base_model
 
     if is_rank0():
         logger.info(f"Model params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -636,7 +853,8 @@ def main(args):
     opt = torch.optim.AdamW(
         list(model.parameters()),
         lr=args.lr,
-        weight_decay=0.0,
+        weight_decay=float(getattr(args, "weight_decay", 0.0)),
+        fused=True,
     )
 
     amp_enabled = bool(getattr(args, "amp", True))
@@ -675,7 +893,7 @@ def main(args):
     _ensure_model_pml_cells(model, pml_cells=pml_cells)
     _ensure_model_pml_cells(ema, pml_cells=pml_cells)
 
-    update_ema(ema, model.module, decay=0.0)
+    update_ema(_unwrap_model(ema), _unwrap_model(model), decay=0.0)
 
     # -----------------------
     # Resume
@@ -684,13 +902,13 @@ def main(args):
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
 
-        model.module.load_state_dict(checkpoint["model"], strict=False)
-        ema.load_state_dict(checkpoint["ema"], strict=False)
+        _unwrap_model(model).load_state_dict(checkpoint["model"], strict=False)
+        _unwrap_model(ema).load_state_dict(checkpoint["ema"], strict=False)
 
         opt.load_state_dict(checkpoint["opt"])
 
-        model.module.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
-        ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+        _unwrap_model(model).set_normalization_stats(stats, normalize_eps=args.normalize_eps)
+        _unwrap_model(ema).set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
         _ensure_model_pml_cells(model, pml_cells=pml_cells)
         _ensure_model_pml_cells(ema, pml_cells=pml_cells)
@@ -735,6 +953,10 @@ def main(args):
     running_endpoint_loss = 0.0
     running_phase_grad_loss = 0.0
     running_sparam_loss = 0.0
+    running_binarize_loss = 0.0
+    running_geom_loss = 0.0
+    running_grad_norm = 0.0
+    grad_norm_max_epoch = 0.0
     train_steps_epoch = 0
     phase_grad_steps_epoch = 0
     sparam_steps_epoch = 0
@@ -754,9 +976,12 @@ def main(args):
         if is_rank0():
             logger.info("Autograd anomaly detection ENABLED (--detect-anomaly).")
 
+    _prev_weights = None  # track weight changes for log deduplication
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        train_sampler.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         N1 = int(args.phaseA_epochs)
         N2 = int(args.phaseB_epochs)
@@ -781,15 +1006,20 @@ def main(args):
         else:
             phase_weight = 0.0
 
+        # Use tensors (not plain floats) for gates so that torch.compile /
+        # CUDA-Graphs treat them as dynamic values instead of baking each new
+        # value into a graph guard and recompiling (which leaks graph pools).
         phys_gate = 0.0
         if float(args.lambda_residual) > 0:
             phys_gate = float(residual_weight / float(args.lambda_residual))
             phys_gate = max(0.0, min(1.0, phys_gate))
+        phys_gate = torch.tensor(phys_gate)
 
         phase_gate = 0.0
         if float(args.lambda_phase) > 0:
             phase_gate = float(phase_weight / float(args.lambda_phase))
             phase_gate = max(0.0, min(1.0, phase_gate))
+        phase_gate = torch.tensor(phase_gate)
 
         if use_phase_grad:
             phase_grad_start = _phase_start_epoch(getattr(args, "phase_grad_start_phase", "C"), N1=N1, N2=N2)
@@ -859,21 +1089,80 @@ def main(args):
 
             lambda_um = cond[:, 0:1] * lam_std + lam_mean  # [B,1] physical
 
+            # --- Joint training: sample mask mode and handle 3-channel noise ---
+            batch_mask_mode = MASK_MODE_FORWARD
+            v_t_eps_target = None
+            base_cond_dim = 1 + 3  # wavelength + 3 geom params
+
+            if joint_training:
+                batch_mask_mode = sample_mask_mode(
+                    forward_ratio=float(getattr(args, "forward_ratio", 0.5)),
+                    inverse_ratio=float(getattr(args, "inverse_ratio", 0.3)),
+                )
+
+                # CFG dropout: randomly zero S-param conditioning
+                cfg_dropout = float(getattr(args, "cfg_dropout", 0.15))
+                if torch.rand(1).item() < cfg_dropout:
+                    # Zero only S-param Re/Im entries; preserve port_valid flags
+                    n_sparam_reals = 2 * 4  # Re/Im for max 4 ports
+                    cond[:, base_cond_dim:base_cond_dim + n_sparam_reals] = 0.0
+
             x0_fields = torch.randn_like(fields_1)
             t = sample_t(fields_1)  # [B,1,1,1]
             x_t_fields = psi_t(x0_fields, fields_1, t)
             v_t_fields = u_t(x0_fields, fields_1)
 
-            if extra_maps is not None:
-                x_t_input = torch.cat([x_t_fields, eps, src, extra_maps], dim=1)
+            if joint_training:
+                # Noise eps channel
+                x0_eps = torch.randn_like(eps)
+                x_t_eps = psi_t(x0_eps, eps, t)
+                v_t_eps_raw = u_t(x0_eps, eps)
+
+                if batch_mask_mode == MASK_MODE_FORWARD:
+                    # Forward mode: eps is clean (fixed), fields are noised
+                    x_t_eps_input = eps
+                    v_t_eps_target = None  # no eps loss
+                elif batch_mask_mode == MASK_MODE_INVERSE:
+                    # Inverse mode: fields are clean (fixed), eps is noised
+                    x_t_fields = fields_1  # use clean fields
+                    v_t_fields = torch.zeros_like(v_t_fields)  # zero field velocity target
+                    x_t_eps_input = x_t_eps
+                    v_t_eps_target = v_t_eps_raw
+                else:  # MASK_MODE_JOINT
+                    # Both noised
+                    x_t_eps_input = x_t_eps
+                    v_t_eps_target = v_t_eps_raw
+
+                # Build input: [x_t_fields(2), x_t_eps(1), src(1)] = 4 channels
+                if extra_maps is not None:
+                    x_t_input = torch.cat([x_t_fields, x_t_eps_input, src, extra_maps], dim=1)
+                else:
+                    x_t_input = torch.cat([x_t_fields, x_t_eps_input, src], dim=1)
             else:
-                x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
+                if extra_maps is not None:
+                    x_t_input = torch.cat([x_t_fields, eps, src, extra_maps], dim=1)
+                else:
+                    x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
 
             compute_phase_grad_step = (phase_grad_weight > 0.0) and (global_step % int(args.phase_grad_every) == 0)
             compute_sparam_step = (sparam_weight > 0.0) and (global_step % int(args.sparam_every) == 0)
             compute_residual_step = (residual_weight > 0.0)
 
-            fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad_loss, sparam_loss = cfm_loss_residual(
+            # Binarization weight with warmup
+            binarize_weight = 0.0
+            if joint_training and float(getattr(args, "lambda_binarize", 0.0)) > 0.0:
+                binarize_weight = float(args.lambda_binarize) * ramp_linear(
+                    epoch, start_epoch=0, warmup_epochs=int(getattr(args, "binarize_warmup_epochs", 100))
+                )
+
+            # Geometry loss weight with warmup
+            geom_weight = 0.0
+            if joint_training and float(getattr(args, "lambda_geom", 0.0)) > 0.0:
+                geom_weight = float(args.lambda_geom) * ramp_linear(
+                    epoch, start_epoch=0, warmup_epochs=int(getattr(args, "geom_warmup_epochs", 100))
+                )
+
+            fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad_loss, sparam_loss, binarize_loss_val, geom_loss_val = cfm_loss_residual(
                 model,
                 x_t_input,
                 t,
@@ -904,9 +1193,20 @@ def main(args):
                 amp_device_type=autocast_device_type,
                 amp_dtype=torch.float16,
                 sparam_mode=str(getattr(args, "sparam_mode", "project")),
+                joint_training=joint_training,
+                mask_mode=batch_mask_mode,
+                v_t_eps=v_t_eps_target,
+                eps_core=float(getattr(args, "eps_core", 12.25)),
+                eps_clad=float(getattr(args, "eps_clad", 2.07)),
+                lambda_binarize=binarize_weight,
+                eps_1=eps,
+                lambda_geom=geom_weight,
             )
 
-            residual_loss = residual_loss * (dx ** 4)
+            # NOTE: residual is now self-normalized inside cfm_loss_residual
+            # (divided by driving-term scale <(k₀²εE_true)²>), so no dx^4
+            # scaling is needed here.  The returned loss is O(1) and
+            # grid-independent; lambda_residual directly controls its weight.
 
             # -----------------------
             # Step
@@ -934,10 +1234,14 @@ def main(args):
                     loss_items.append(("phg", phase_grad_loss, float(phase_grad_weight)))
                 if compute_sparam_step and sparam_weight > 0.0:
                     loss_items.append(("sp", sparam_loss, float(sparam_weight)))
+                if joint_training and binarize_weight > 0.0:
+                    loss_items.append(("bin", binarize_loss_val, float(binarize_weight)))
+                if joint_training and geom_weight > 0.0:
+                    loss_items.append(("geom", geom_loss_val, float(geom_weight)))
 
                 # Compute a gradient vector per loss term (unweighted, matching your reference implementation).
                 # Note: weights still control participation (which losses are included).
-                params = [p for p in model.module.parameters() if p.requires_grad]
+                params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
                 for i, (_name, L, w) in enumerate(loss_items):
                     if float(w) <= 0.0:
                         continue
@@ -984,7 +1288,10 @@ def main(args):
                         scaler.unscale_(opt)
                     else:
                         fm_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+                    if math.isfinite(gn):
+                        running_grad_norm += gn
+                        grad_norm_max_epoch = max(grad_norm_max_epoch, gn)
                     optimizer_step()
                 else:
                     # DDP-sync: average the combined grad vector across ranks once
@@ -1000,7 +1307,10 @@ def main(args):
                             n = p.numel()
                             p.grad = g_step[start : start + n].view_as(p).to(dtype=p.dtype)
                             start += n
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+                    if math.isfinite(gn):
+                        running_grad_norm += gn
+                        grad_norm_max_epoch = max(grad_norm_max_epoch, gn)
                     opt.step()
 
             else:
@@ -1016,6 +1326,10 @@ def main(args):
                         total_loss = total_loss + phase_grad_weight * phase_grad_loss
                     if compute_sparam_step and sparam_weight > 0.0:
                         total_loss = total_loss + sparam_weight * sparam_loss
+                    if joint_training and binarize_weight > 0.0:
+                        total_loss = total_loss + binarize_weight * binarize_loss_val
+                    if joint_training and geom_weight > 0.0:
+                        total_loss = total_loss + geom_weight * geom_loss_val
 
                     if scaler.is_enabled():
                         scaler.scale(total_loss).backward()
@@ -1023,7 +1337,10 @@ def main(args):
                     else:
                         total_loss.backward()
 
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+                    if math.isfinite(gn):
+                        running_grad_norm += gn
+                        grad_norm_max_epoch = max(grad_norm_max_epoch, gn)
                     optimizer_step()
 
             if use_tqdm:
@@ -1039,7 +1356,7 @@ def main(args):
                 except Exception:
                     pass
 
-            update_ema(ema, model.module)
+            update_ema(_unwrap_model(ema), _unwrap_model(model))
 
             running_fm_loss += float(fm_loss.item())
             running_residual_loss += float(residual_loss.item())
@@ -1053,6 +1370,10 @@ def main(args):
             if compute_sparam_step:
                 running_sparam_loss += float(sparam_loss.item())
                 sparam_steps_epoch += 1
+            if joint_training and binarize_weight > 0.0:
+                running_binarize_loss += float(binarize_loss_val.item())
+            if joint_training and geom_weight > 0.0:
+                running_geom_loss += float(geom_loss_val.item())
 
             train_steps_epoch += 1
             global_step += 1
@@ -1101,7 +1422,7 @@ def main(args):
                     compute_residual_val = (residual_weight > 0.0)
                     compute_sparam_val = (sparam_weight > 0.0)
 
-                    fm_v, res_v, ph_v, end_v, phg_v, sp_v = cfm_loss_residual(
+                    fm_v, res_v, ph_v, end_v, phg_v, sp_v, _, _ = cfm_loss_residual(
                         ema,
                         x_t_input,
                         t,
@@ -1134,7 +1455,8 @@ def main(args):
                         sparam_mode=str(getattr(args, "sparam_mode", "project")),
                     )
 
-                    res_v = res_v * (dx ** 4)
+                    # residual is self-normalized inside cfm_loss_residual
+                    # (no dx^4 needed — see training loop comment)
 
                     eval_fm += float(fm_v.item())
                     eval_res += float(res_v.item())
@@ -1182,7 +1504,7 @@ def main(args):
                             t4 = t_vec.view(B, 1, 1, 1)
                             a = (1.0 - float(SIG_MIN))
                             b = (1.0 - a * t4)
-                            x1_fields_pred = a * fields_t + b * u_t_pred  # normalized
+                            x1_fields_pred = a * fields_t + b * u_t_pred[:, :2]  # normalized (field channels only)
                             Er = x1_fields_pred[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
                             Ei = x1_fields_pred[:, 1] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
                             E_pred_phys_raw = torch.complex(Er, Ei)
@@ -1195,7 +1517,8 @@ def main(args):
                         S_true = aux["sparams_true"]
                         pv0 = aux.get("port_valid", None)
                         pv0 = pv0[0].detach() if pv0 is not None else None
-                        sparams_example = (S_true[0].detach(), S_pred[0].detach(), pv0)
+                        ip0 = aux.get("in_port_idx", None)
+                        sparams_example = (S_true[0].detach(), S_pred[0].detach(), pv0, ip0)
 
                     eval_steps += 1
                     if max_val_batches > 0 and (i + 1) >= max_val_batches:
@@ -1228,13 +1551,16 @@ def main(args):
 
             # Sample eval (rank0 only)
             sample_residual_mean = 0.0
+            sample_gt_residual_mean = 0.0
             sample_amp_err_mean = 0.0
             sample_phase_err_mean = 0.0
             if is_rank0():
                 residuals = []
+                gt_residuals = []
                 amp_errs = []
                 phase_errs = []
                 saved_any = False
+                saved_paths = []
                 with torch.no_grad():
                     n_samples = min(len(val_ds), int(args.sample_eval_limit))
                     for s in range(n_samples):
@@ -1273,12 +1599,27 @@ def main(args):
 
                         B = x1_pred.shape[0]
                         k0 = (2.0 * torch.pi) / lambda_um_s.view(B)
-                        R = helmholtz_op(x1_pred[:, 0:2], x1_pred[:, 2:3], k0=k0)
-                        res_mag = torch.sqrt(R[:, 0:1] ** 2 + R[:, 1:2] ** 2 + 1e-12) * (dx ** 2)
-                        residuals.append(float(res_mag.mean().item()))
 
+                        # Source-free mask: Helmholtz only valid outside source region
+                        src_dilated = F.max_pool2d(src_s, kernel_size=5, stride=1, padding=2)
+                        src_free_m = (src_dilated < 0.5).to(dtype=torch.float32)
+
+                        # Predicted field residual (source-masked)
+                        R = helmholtz_op(x1_pred[:, 0:2], x1_pred[:, 2:3], k0=k0)
+                        R2 = (R[:, 0:1] ** 2 + R[:, 1:2] ** 2) * (dx ** 4)
+                        res_masked = (R2 * src_free_m).sum() / src_free_m.sum().clamp_min(1.0)
+                        residuals.append(float(res_masked.sqrt().item()))
+
+                        # Ground truth residual (source-masked) - baseline reference
                         ezr_gt_s = x_full_s[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
                         ezi_gt_s = x_full_s[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                        gt_fields = torch.cat([ezr_gt_s, ezi_gt_s], dim=1)
+                        R_gt = helmholtz_op(gt_fields, x1_pred[:, 2:3], k0=k0)
+                        R2_gt = (R_gt[:, 0:1] ** 2 + R_gt[:, 1:2] ** 2) * (dx ** 4)
+                        res_gt_masked = (R2_gt * src_free_m).sum() / src_free_m.sum().clamp_min(1.0)
+                        gt_residuals.append(float(res_gt_masked.sqrt().item()))
+
+                        # ezr_gt_s, ezi_gt_s already computed above for GT residual
                         mag_gt_s = torch.sqrt(ezr_gt_s ** 2 + ezi_gt_s ** 2 + 1e-12)
                         mag_pred_s = torch.sqrt(x1_pred[:, 0:1] ** 2 + x1_pred[:, 1:2] ** 2 + 1e-12)
 
@@ -1297,7 +1638,12 @@ def main(args):
                         phase_gt_s = torch.atan2(ezi_gt_s, ezr_gt_s)
                         phase_pred_s = torch.atan2(x1_pred[:, 1:2], x1_pred[:, 0:1])
                         phase_err_s = torch.atan2(torch.sin(phase_pred_s - phase_gt_s), torch.cos(phase_pred_s - phase_gt_s))
-                        phase_errs.append(float((torch.abs(phase_err_s) * m).sum().item() / (m.sum().item() + 1e-12)))
+                        # Amplitude-weighted phase error (consistent with training loss tau-gating)
+                        amp_weight = mag_gt_s.clamp_min(1e-8)
+                        phase_errs.append(
+                            float((torch.abs(phase_err_s) * amp_weight * m).sum().item()
+                                  / ((amp_weight * m).sum().item() + 1e-12))
+                        )
 
                         # Save a qualitative sample panel (rank0 only).
                         # Default behavior: save on every eval epoch, for the first sample only.
@@ -1328,12 +1674,21 @@ def main(args):
                             )
                             if os.path.isfile(out_path):
                                 saved_any = True
+                                saved_paths.append(out_path)
 
                 sample_residual_mean = float(np.mean(residuals)) if residuals else 0.0
+                sample_gt_residual_mean = float(np.mean(gt_residuals)) if gt_residuals else 0.0
                 sample_amp_err_mean = float(np.mean(amp_errs)) if amp_errs else 0.0
                 sample_phase_err_mean = float(np.mean(phase_errs)) if phase_errs else 0.0
 
             if is_rank0():
+                if sample_gt_residual_mean > 0.0:
+                    sample_residual_ratio_vs_gt = float(sample_residual_mean / max(sample_gt_residual_mean, 1e-12))
+                    sample_residual_gap_dB = 10.0 * math.log10(max(sample_residual_ratio_vs_gt, 1e-12))
+                else:
+                    sample_residual_ratio_vs_gt = float("inf")
+                    sample_residual_gap_dB = float("inf")
+
                 msg = f"[epoch {epoch:04d}] val_fm={val_fm_loss:.4e}, val_res={val_res_loss:.4e}"
                 if phase_weight > 0.0:
                     msg += f", val_phase={val_phase_loss:.4e}"
@@ -1349,19 +1704,21 @@ def main(args):
                 if sparam_weight > 0.0:
                     msg += f", val_sparam={val_sparam_loss:.4e}"
                 msg += (
-                    f", sample_residual={sample_residual_mean:.4e}"
-                    f", sample_amp_err={sample_amp_err_mean:.4e}"
-                    f", sample_phase_err={sample_phase_err_mean:.4e}"
+                    f"\n             sample_residual={sample_residual_mean:.4e} (GT={sample_gt_residual_mean:.4e})"
+                    f", ratio={sample_residual_ratio_vs_gt:.3f}x"
+                    f", residual_gap={sample_residual_gap_dB:+.1f}dB"
+                    f", amp_err={sample_amp_err_mean:.4e}"
+                    f", phase_err_w={sample_phase_err_mean:.4e}"
                 )
                 logger.info(msg)
                 if saved_any:
                     logger.info(f"[epoch {epoch:04d}] Saved eval sample(s) to {samples_dir}")
 
                 if (sparam_weight > 0.0) and (sparams_example is not None):
-                    S_true_0, S_pred_0, pv0 = sparams_example
+                    S_true_0, S_pred_0, pv0, ip0 = sparams_example
                     logger.info(
                         f"[epoch {epoch:04d}] Sparams example (true->pred): "
-                        f"{_format_sparams_compact(S_true_0, S_pred_0, port_valid_1d=pv0)}"
+                        f"{_format_sparams_compact(S_true_0, S_pred_0, port_valid_1d=pv0, in_port_idx=ip0)}"
                     )
 
                 with open(val_csv_path, "a", encoding="UTF8", newline="") as f_csv:
@@ -1375,6 +1732,9 @@ def main(args):
                         val_phase_grad_loss if (phase_grad_weight > 0.0) else "",
                         val_sparam_loss if (sparam_weight > 0.0) else "",
                         sample_residual_mean,
+                        sample_gt_residual_mean,
+                        sample_residual_ratio_vs_gt,
+                        sample_residual_gap_dB,
                     ])
 
                 if wandb_run is not None:
@@ -1383,18 +1743,310 @@ def main(args):
                         "val/fm_loss": val_fm_loss,
                         "val/residual_loss": val_res_loss,
                         "val/sample_residual": sample_residual_mean,
+                        "val/sample_gt_residual": sample_gt_residual_mean,
+                        "val/sample_residual_ratio_vs_gt": sample_residual_ratio_vs_gt,
+                        "val/sample_residual_gap_dB": sample_residual_gap_dB,
                         "val/sample_amp_err": sample_amp_err_mean,
-                        "val/sample_phase_err": sample_phase_err_mean,
+                        "val/sample_phase_err_w": sample_phase_err_mean,
                     }
                     if phase_weight > 0.0:
                         log_dict["val/phase_loss"] = val_phase_loss
+                        try:
+                            log_dict["val/phase_rms_deg"] = math.sqrt(max(0.0, 2.0 * val_phase_loss)) * 180.0 / math.pi
+                        except Exception:
+                            pass
                     if use_endpoint:
                         log_dict["val/endpoint_loss"] = val_endpoint_loss
                     if phase_grad_weight > 0.0:
                         log_dict["val/phase_grad_loss"] = val_phase_grad_loss
                     if sparam_weight > 0.0:
                         log_dict["val/sparam_loss"] = val_sparam_loss
+                    # Upload eval sample images to wandb
+                    if saved_paths:
+                        try:
+                            log_dict["val/sample_images"] = [
+                                wandb.Image(p, caption=os.path.basename(p))
+                                for p in saved_paths
+                            ]
+                        except Exception:
+                            pass
                     wandb_run.log(log_dict, step=epoch)
+
+        # -----------------------
+        # Inverse design evaluation (rank0 only, separate frequency)
+        # -----------------------
+        inv_eval_every = int(getattr(args, "inverse_eval_every", 0))
+        if (
+            joint_training
+            and is_rank0()
+            and inv_eval_every > 0
+            and epoch % inv_eval_every == 0
+            and epoch >= int(args.phaseB_epochs)
+        ):
+            inv_samples = min(int(getattr(args, "inverse_eval_samples", 4)), len(val_ds))
+            inv_cfg_scale = float(getattr(args, "inverse_eval_cfg_scale", 3.0))
+            inv_steps = int(getattr(args, "inverse_eval_steps", 30))
+            eps_core = float(getattr(args, "eps_core", 12.25))
+            eps_clad = float(getattr(args, "eps_clad", 2.07))
+            eps_binary_thr = (eps_core + eps_clad) / 2.0
+            sparam_mode_inv = str(getattr(args, "sparam_mode", "project"))
+
+            # Per-device-type metric accumulators
+            inv_metrics_global = defaultdict(list)  # key -> list of floats
+            inv_metrics_per_device = defaultdict(lambda: defaultdict(list))
+            inv_saved_paths = []
+
+            ema.eval()
+            # Epoch-seeded random sample indices for more representative evaluation
+            inv_rng = np.random.default_rng(epoch * 137 + 42)
+            inv_indices = inv_rng.choice(len(val_ds), size=inv_samples, replace=False).tolist()
+            logger.info(f"[epoch {epoch:04d}] Running inverse design eval ({inv_samples} samples, {inv_steps} steps, cfg={inv_cfg_scale})...")
+
+            with torch.no_grad():
+                for s_idx, s in enumerate(inv_indices):
+                    try:
+                        x_full_s, cond_s, aux_s = val_ds[s]
+                        x_full_s = x_full_s.unsqueeze(0).to(device, dtype=dtype)
+                        cond_s = cond_s.unsqueeze(0).to(device, dtype=dtype)
+
+                        # Extract GT info
+                        src_s = x_full_s[:, 3:4]
+                        lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean
+
+                        # Device type
+                        device_type_s = aux_s.get("device_type", "") if isinstance(aux_s, dict) else ""
+                        if not device_type_s:
+                            device_type_s = "unknown"
+
+                        # GT fields (de-normalized)
+                        ezr_gt = x_full_s[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                        ezi_gt = x_full_s[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                        mag_gt_s = torch.sqrt(ezr_gt ** 2 + ezi_gt ** 2 + 1e-12)
+
+                        # GT eps (de-normalized)
+                        eps_gt_s = x_full_s[:, 2:3]
+                        if args.normalize_eps:
+                            eps_gt_s = eps_gt_s * float(stats["eps_std"]) + float(stats["eps_mean"])
+
+                        # Run inverse sampling
+                        gen_out = sample_inverse(
+                            ema,
+                            num_steps=inv_steps,
+                            src_mask=src_s,
+                            cond=cond_s,
+                            lambda_um=lambda_um_s,
+                            cfg_scale=inv_cfg_scale,
+                            sig_min=SIG_MIN,
+                            base_cond_dim=1 + 3,  # wavelength + 3 geom params (NOT cond_dim which includes S-params)
+                        )
+
+                        # De-normalize generated output: [B,3,H,W] = [fields(2), eps(1)]
+                        gen_fields_r = gen_out[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
+                        gen_fields_i = gen_out[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
+                        gen_eps = gen_out[:, 2:3]
+                        if args.normalize_eps:
+                            gen_eps = gen_eps * float(stats["eps_std"]) + float(stats["eps_mean"])
+
+                        mag_gen_s = torch.sqrt(gen_fields_r ** 2 + gen_fields_i ** 2 + 1e-12)
+
+                        # Binarize eps
+                        gen_eps_binary = torch.where(gen_eps > eps_binary_thr,
+                                                     torch.tensor(eps_core, device=device, dtype=dtype),
+                                                     torch.tensor(eps_clad, device=device, dtype=dtype))
+
+                        # Binarization quality: fraction of pixels within 10% of binary values
+                        eps_flat = gen_eps.view(-1)
+                        near_core = (torch.abs(eps_flat - eps_core) < 0.1 * eps_core).float()
+                        near_clad = (torch.abs(eps_flat - eps_clad) < 0.1 * eps_clad).float()
+                        binarize_quality = float((near_core + near_clad).clamp(max=1.0).mean().item())
+
+                        # Eps IoU: intersection-over-union between GT and generated binary masks
+                        gt_binary = (eps_gt_s > eps_binary_thr).float()
+                        gen_binary_mask = (gen_eps > eps_binary_thr).float()
+                        intersection = (gt_binary * gen_binary_mask).sum()
+                        union = ((gt_binary + gen_binary_mask) > 0).float().sum()
+                        eps_iou = float((intersection / union.clamp_min(1.0)).item())
+
+                        inv_metrics_global["binarize_quality"].append(binarize_quality)
+                        inv_metrics_global["eps_iou"].append(eps_iou)
+                        inv_metrics_per_device[device_type_s]["binarize_quality"].append(binarize_quality)
+                        inv_metrics_per_device[device_type_s]["eps_iou"].append(eps_iou)
+
+                        # S-param extraction from generated fields
+                        aux_s_dev = _move_aux_to_device(aux_s, device) if isinstance(aux_s, dict) else {}
+                        port_masks_s = aux_s_dev.get("port_masks", None)
+                        in_port_idx_s = aux_s_dev.get("in_port_idx", None)
+                        port_ids_s = aux_s_dev.get("port_ids", None)
+                        port_valid_s = aux_s_dev.get("port_valid", None)
+                        sparams_true_s = aux_s_dev.get("sparams_true", None)
+                        n_ports_s = int(aux_s_dev.get("n_ports", torch.tensor(0)).item()) if aux_s_dev.get("n_ports") is not None else 0
+
+                        sparam_text_lines = ["Port   |S| GT  |S| Gen  Err    Phase GT  Phase Gen  Err"]
+                        sparam_text_lines.append("-" * 60)
+
+                        if port_masks_s is not None and n_ports_s > 0 and sparams_true_s is not None:
+                            # Build complex E field from generated output
+                            E_gen = torch.complex(gen_fields_r[:, 0], gen_fields_i[:, 0])  # [B, H, W]
+
+                            # Unsqueeze aux tensors for single-sample batch
+                            pm = port_masks_s.unsqueeze(0) if port_masks_s.dim() == 3 else port_masks_s
+                            pid = port_ids_s.unsqueeze(0) if port_ids_s is not None and port_ids_s.dim() == 1 else port_ids_s
+                            ipi = in_port_idx_s
+
+                            # Use binarized eps for modal extraction
+                            eps_for_modal = gen_eps_binary[:, 0]  # [B, H, W]
+
+                            try:
+                                if sparam_mode_inv == "modal":
+                                    S_gen = extract_sparams_modal(
+                                        E_gen, pm, eps_for_modal,
+                                        wavelength_um=lambda_um_s,
+                                        dx_um=dx,
+                                        in_port_idx=ipi,
+                                        port_ids=pid,
+                                    )
+                                else:
+                                    S_gen = extract_sparams(
+                                        E_gen, pm,
+                                        in_port_idx=ipi,
+                                        port_ids=pid,
+                                    )
+                            except Exception:
+                                # Fallback to project method
+                                S_gen = extract_sparams(
+                                    E_gen, pm,
+                                    in_port_idx=ipi,
+                                    port_ids=pid,
+                                )
+
+                            S_true_1 = sparams_true_s.unsqueeze(0) if sparams_true_s.dim() == 1 else sparams_true_s
+                            S_gen_0 = S_gen[0].detach().cpu()
+                            S_true_0 = S_true_1[0].detach().cpu()
+                            pv = port_valid_s.detach().cpu() if port_valid_s is not None else None
+
+                            # Resolve input port index
+                            in_idx_val = 0
+                            if ipi is not None:
+                                if torch.is_tensor(ipi):
+                                    in_idx_val = int(ipi.item()) if ipi.numel() == 1 else int(ipi[0].item())
+                                else:
+                                    in_idx_val = int(ipi)
+                            if in_idx_val < 0:
+                                in_idx_val = 0
+
+                            # Resolve port IDs for labeling
+                            pid_np = port_ids_s.detach().cpu().numpy() if port_ids_s is not None else np.arange(1, n_ports_s + 1)
+                            if pid_np.ndim > 1:
+                                pid_np = pid_np[0]
+                            in_pid = int(pid_np[in_idx_val]) if in_idx_val < len(pid_np) else 1
+
+                            for p in range(n_ports_s):
+                                # Skip input port
+                                if p == in_idx_val:
+                                    continue
+                                if pv is not None and float(pv[p].item() if pv.dim() == 1 else pv[0, p].item()) < 0.5:
+                                    continue
+
+                                out_pid = int(pid_np[p]) if p < len(pid_np) else (p + 1)
+                                label = f"S{out_pid}{in_pid}"
+
+                                mag_true = float(torch.abs(S_true_0[p]).item())
+                                mag_gen = float(torch.abs(S_gen_0[p]).item())
+                                mag_err = abs(mag_true - mag_gen)
+
+                                phase_true = float(torch.angle(S_true_0[p]).item())
+                                phase_gen = float(torch.angle(S_gen_0[p]).item())
+                                phase_diff = float(torch.atan2(
+                                    torch.sin(torch.tensor(phase_gen - phase_true)),
+                                    torch.cos(torch.tensor(phase_gen - phase_true)),
+                                ).item())
+
+                                inv_metrics_global["sparam_mag_err"].append(mag_err)
+                                inv_metrics_global["sparam_phase_err"].append(abs(phase_diff))
+                                inv_metrics_per_device[device_type_s]["sparam_mag_err"].append(mag_err)
+                                inv_metrics_per_device[device_type_s]["sparam_phase_err"].append(abs(phase_diff))
+
+                                sparam_text_lines.append(
+                                    f"{label:6s} {mag_true:6.3f}  {mag_gen:6.3f}  {mag_err:5.3f}   "
+                                    f"{phase_true:+6.2f}     {phase_gen:+6.2f}     {abs(phase_diff):5.2f}"
+                                )
+
+                        sparam_text = "\n".join(sparam_text_lines)
+
+                        # Save PNG for this sample
+                        inv_out_path = os.path.join(samples_dir, f"inverse_epoch_{epoch:04d}_idx{s_idx:03d}.png")
+                        pm_overlay = None
+                        if port_masks_s is not None and n_ports_s > 0:
+                            pm_np = port_masks_s.detach().cpu().numpy()
+                            pm_overlay = pm_np[:n_ports_s].sum(axis=0)  # [H, W]
+
+                        _save_inverse_eval_png(
+                            out_path=inv_out_path,
+                            title=f"epoch={epoch:04d} val[{s}]",
+                            eps_gt=eps_gt_s[0, 0].detach().float().cpu().numpy(),
+                            eps_gen=gen_eps[0, 0].detach().float().cpu().numpy(),
+                            eps_gen_binary=gen_eps_binary[0, 0].detach().float().cpu().numpy(),
+                            mag_gt=mag_gt_s[0, 0].detach().float().cpu().numpy(),
+                            mag_gen=mag_gen_s[0, 0].detach().float().cpu().numpy(),
+                            port_masks_overlay=pm_overlay,
+                            sparam_text=sparam_text,
+                            device_type=device_type_s,
+                            ezr_gt=ezr_gt[0, 0].detach().float().cpu().numpy(),
+                            ezi_gt=ezi_gt[0, 0].detach().float().cpu().numpy(),
+                            ezr_gen=gen_fields_r[0, 0].detach().float().cpu().numpy(),
+                            ezi_gen=gen_fields_i[0, 0].detach().float().cpu().numpy(),
+                        )
+                        if os.path.isfile(inv_out_path):
+                            inv_saved_paths.append(inv_out_path)
+
+                    except Exception as exc:
+                        logger.warning(f"[epoch {epoch:04d}] Inverse eval sample {s} failed: {exc}")
+                        continue
+
+            # Aggregate and log inverse eval metrics
+            def _mean_or_zero(lst):
+                return float(np.mean(lst)) if lst else 0.0
+
+            g_mag_err = _mean_or_zero(inv_metrics_global.get("sparam_mag_err", []))
+            g_phase_err = _mean_or_zero(inv_metrics_global.get("sparam_phase_err", []))
+            g_bin_q = _mean_or_zero(inv_metrics_global.get("binarize_quality", []))
+            g_iou = _mean_or_zero(inv_metrics_global.get("eps_iou", []))
+
+            msg = (
+                f"[epoch {epoch:04d}] INVERSE EVAL: |S| err={g_mag_err:.4f}, "
+                f"phase err={g_phase_err:.4f} rad, binarize_q={g_bin_q:.3f}, eps_IoU={g_iou:.3f}"
+            )
+            for dt_name, dt_metrics in sorted(inv_metrics_per_device.items()):
+                dt_mag = _mean_or_zero(dt_metrics.get("sparam_mag_err", []))
+                dt_ph = _mean_or_zero(dt_metrics.get("sparam_phase_err", []))
+                dt_bq = _mean_or_zero(dt_metrics.get("binarize_quality", []))
+                dt_iou = _mean_or_zero(dt_metrics.get("eps_iou", []))
+                msg += f"\n  [{dt_name}] |S| err={dt_mag:.4f}, phase err={dt_ph:.4f}, binarize_q={dt_bq:.3f}, eps_IoU={dt_iou:.3f}"
+            logger.info(msg)
+
+            if wandb_run is not None:
+                inv_log = {
+                    "epoch": epoch,
+                    "val_inverse/sparam_mag_err": g_mag_err,
+                    "val_inverse/sparam_phase_err": g_phase_err,
+                    "val_inverse/binarize_quality": g_bin_q,
+                    "val_inverse/eps_iou": g_iou,
+                }
+                for dt_name, dt_metrics in inv_metrics_per_device.items():
+                    prefix = f"val_inverse/{dt_name}"
+                    inv_log[f"{prefix}/sparam_mag_err"] = _mean_or_zero(dt_metrics.get("sparam_mag_err", []))
+                    inv_log[f"{prefix}/sparam_phase_err"] = _mean_or_zero(dt_metrics.get("sparam_phase_err", []))
+                    inv_log[f"{prefix}/binarize_quality"] = _mean_or_zero(dt_metrics.get("binarize_quality", []))
+                    inv_log[f"{prefix}/eps_iou"] = _mean_or_zero(dt_metrics.get("eps_iou", []))
+                if inv_saved_paths:
+                    try:
+                        inv_log["val_inverse/sample_images"] = [
+                            wandb.Image(p, caption=os.path.basename(p))
+                            for p in inv_saved_paths
+                        ]
+                    except Exception:
+                        pass
+                wandb_run.log(inv_log, step=epoch)
 
         # -----------------------
         # Train logging
@@ -1422,24 +2074,33 @@ def main(args):
                 ddp_allreduce_mean_(sp_mean)
 
             if is_rank0():
-                msg = f"(epoch={epoch:04d}) train_fm={fm_mean.item():.4e}, train_residual={res_mean.item():.4e}"
+                msg = f"(epoch={epoch:04d}) fm={fm_mean.item():.4e} res={res_mean.item():.4e}"
                 if phase_weight > 0.0:
-                    msg += f", train_phase={ph_mean.item():.4e}"
+                    msg += f" ph={ph_mean.item():.4e}"
                     try:
                         ph_rms_deg = (math.sqrt(max(0.0, 2.0 * float(ph_mean.item()))) * 180.0 / math.pi)
-                        msg += f" (≈{ph_rms_deg:.2f}° rms)"
+                        msg += f"({ph_rms_deg:.1f}°)"
                     except Exception:
                         pass
                 if use_endpoint:
-                    msg += f", train_endpoint={end_mean.item():.4e}"
+                    msg += f" end={end_mean.item():.4e}"
                 if phase_grad_weight > 0.0:
-                    msg += f", train_phase_grad={phg_mean.item():.4e}"
+                    msg += f" phg={phg_mean.item():.4e}"
                 if sparam_weight > 0.0:
-                    msg += f", train_sparam={sp_mean.item():.4e}"
-                msg += f", sec_per_epoch={sec_per_epoch:.3e}"
-                msg += f" | w_res={residual_weight:.3g}, w_phase={phase_weight:.3g}, w_phg={phase_grad_weight:.3g}, w_sp={sparam_weight:.3g}"
-                if phase_grad_weight > 0.0:
-                    msg += f" | phg_steps={int(phase_grad_steps_epoch)}/{int(train_steps_epoch)} (every={int(args.phase_grad_every)})"
+                    msg += f" sp={sp_mean.item():.4e}"
+                if joint_training and binarize_weight > 0.0:
+                    bin_mean_val = running_binarize_loss / max(train_steps_epoch, 1)
+                    msg += f" bin={bin_mean_val:.4e}"
+                if joint_training and geom_weight > 0.0:
+                    geom_mean_val = running_geom_loss / max(train_steps_epoch, 1)
+                    msg += f" geom={geom_mean_val:.4e}"
+                msg += f" gnorm={running_grad_norm / max(train_steps_epoch, 1):.2f}/{grad_norm_max_epoch:.2f}"
+                msg += f" [{sec_per_epoch:.0f}s]"
+                # Only print weights when they change from previous epoch
+                cur_weights = (residual_weight, phase_weight, phase_grad_weight, sparam_weight)
+                if cur_weights != _prev_weights:
+                    msg += f"\n  [weights] res={residual_weight:.3g} ph={phase_weight:.3g} phg={phase_grad_weight:.3g} sp={sparam_weight:.3g}"
+                    _prev_weights = cur_weights
                 logger.info(msg)
 
             if wandb_run is not None and is_rank0():
@@ -1454,9 +2115,15 @@ def main(args):
                     "train/sparam_weight": sparam_weight,
                     "train/device_focus": device_focus,
                     "train/use_config": int(config_active_global and (epoch >= config_start_epoch)),
+                    "train/grad_norm_mean": running_grad_norm / max(train_steps_epoch, 1),
+                    "train/grad_norm_max": grad_norm_max_epoch,
                 }
                 if phase_weight > 0.0:
                     wandb_log_dict["train/phase_loss"] = ph_mean.item()
+                    try:
+                        wandb_log_dict["train/phase_rms_deg"] = math.sqrt(max(0.0, 2.0 * float(ph_mean.item()))) * 180.0 / math.pi
+                    except Exception:
+                        pass
                 if use_endpoint:
                     wandb_log_dict["train/endpoint_loss"] = end_mean.item()
                     wandb_log_dict["train/endpoint_weight"] = endpoint_weight
@@ -1465,6 +2132,10 @@ def main(args):
                     wandb_log_dict["train/phase_grad_steps_epoch"] = int(phase_grad_steps_epoch)
                 if sparam_weight > 0.0:
                     wandb_log_dict["train/sparam_loss"] = sp_mean.item()
+                if joint_training and binarize_weight > 0.0:
+                    wandb_log_dict["train/binarize_loss"] = running_binarize_loss / max(train_steps_epoch, 1)
+                if joint_training and geom_weight > 0.0:
+                    wandb_log_dict["train/geom_loss"] = running_geom_loss / max(train_steps_epoch, 1)
 
                 wandb_run.log(wandb_log_dict, step=epoch)
 
@@ -1475,6 +2146,10 @@ def main(args):
             running_endpoint_loss = 0.0
             running_phase_grad_loss = 0.0
             running_sparam_loss = 0.0
+            running_binarize_loss = 0.0
+            running_geom_loss = 0.0
+            running_grad_norm = 0.0
+            grad_norm_max_epoch = 0.0
             train_steps_epoch = 0
             phase_grad_steps_epoch = 0
             sparam_steps_epoch = 0
@@ -1488,8 +2163,8 @@ def main(args):
             if is_rank0():
                 ckpt_path = os.path.join(ckpt_dir, f"{epoch:07d}.pt")
                 checkpoint = {
-                    "model": model.module.state_dict(),
-                    "ema": ema.state_dict(),
+                    "model": _unwrap_model(model).state_dict(),
+                    "ema": _unwrap_model(ema).state_dict(),
                     "opt": opt.state_dict(),
                     "args": args,
                     "stats": stats,
@@ -1515,7 +2190,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-shards", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--shard-subdir", type=str, default="shards")
     parser.add_argument("--shard-index-name", type=str, default="index.json")
-    parser.add_argument("--include-sweeps", type=str, default="")
+    parser.add_argument("--include-sweeps", type=str, default="directional_coupler_sweep",
+                        help="Comma-separated sweep subdirectory names to include (empty = all)")
     parser.add_argument("--use-index-split", type=bool, default=False, action=argparse.BooleanOptionalAction,
                         help="Use pre-computed split field from index.json (unified_sweep format)")
     parser.add_argument("--use-fast-dataset", type=bool, default=False, action=argparse.BooleanOptionalAction,
@@ -1559,6 +2235,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--warmup-start-factor", type=float, default=0.1)
     parser.add_argument("--min-lr", type=float, default=5e-6)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--grad-clip", type=float, default=5.0, help="Max gradient norm for clipping")
 
     # ConFIG conflict-free gradient combination (uses 'conflictfree' library).
     parser.add_argument("--config", type=bool, default=False, action=argparse.BooleanOptionalAction)
@@ -1597,12 +2275,35 @@ if __name__ == "__main__":
     parser.add_argument("--sparam-warmup-epochs", type=int, default=50)
     parser.add_argument("--sparam-every", type=int, default=1)
     parser.add_argument("--sparam-start-phase", type=str, default="C", choices=["A", "B", "C"])
-    parser.add_argument("--sparam-mode", type=str, default="modal", choices=["project", "modal", "head"])
+    parser.add_argument("--sparam-mode", type=str, default="project", choices=["project", "modal", "head"])
 
     parser.add_argument("--normalize-eps", type=bool, default=True, action=argparse.BooleanOptionalAction)
 
     parser.add_argument("--physics-features", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--complex-unet", type=bool, default=False, action=argparse.BooleanOptionalAction)
+
+    # Joint training (forward + inverse design)
+    parser.add_argument("--joint-training", type=bool, default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--forward-ratio", type=float, default=0.5,
+                        help="Probability of forward mask mode per batch")
+    parser.add_argument("--inverse-ratio", type=float, default=0.3,
+                        help="Probability of inverse mask mode per batch")
+    parser.add_argument("--cfg-dropout", type=float, default=0.15,
+                        help="Probability of zeroing S-param conditioning (for CFG)")
+    parser.add_argument("--eps-core", type=float, default=12.25,
+                        help="Core (silicon) permittivity for binarization loss")
+    parser.add_argument("--eps-clad", type=float, default=2.07,
+                        help="Cladding (oxide) permittivity for binarization loss")
+    parser.add_argument("--lambda-binarize", type=float, default=0.01,
+                        help="Weight for binarization loss on generated eps")
+    parser.add_argument("--binarize-warmup-epochs", type=int, default=100,
+                        help="Epochs to linearly ramp binarization loss")
+    parser.add_argument("--lambda-geom", type=float, default=0.0,
+                        help="Weight for pixel-wise geometry MSE loss on generated eps")
+    parser.add_argument("--geom-warmup-epochs", type=int, default=100,
+                        help="Epochs to linearly ramp geometry loss")
+    parser.add_argument("--include-sparams-cond", type=bool, default=False, action=argparse.BooleanOptionalAction,
+                        help="Include S-params in conditioning vector (required for joint/inverse)")
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--ckpt-every", type=int, default=50)
@@ -1610,6 +2311,16 @@ if __name__ == "__main__":
     parser.add_argument("--sample-eval-limit", type=int, default=16)
     parser.add_argument("--save-eval-samples", dest="save_eval_samples", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--save-eval-samples-limit", dest="save_eval_samples_limit", type=int, default=1)
+
+    # Inverse design evaluation
+    parser.add_argument("--inverse-eval-every", type=int, default=50,
+                        help="Run inverse design eval every N epochs (0=disable)")
+    parser.add_argument("--inverse-eval-samples", type=int, default=4,
+                        help="Number of val samples for inverse eval")
+    parser.add_argument("--inverse-eval-cfg-scale", type=float, default=3.0,
+                        help="CFG scale for inverse design sampling")
+    parser.add_argument("--inverse-eval-steps", type=int, default=30,
+                        help="ODE integration steps for inverse eval")
 
     parser.add_argument("--resume-from", type=str, default="")
 
