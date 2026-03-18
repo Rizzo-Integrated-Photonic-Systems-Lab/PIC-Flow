@@ -4,10 +4,10 @@ import numpy as np
 
 from utils import plot_geometry_2d
 
-DEFAULT_CELL_X_UM = 26.0  # 24.0 μm inner + 2*1.0 μm PML = 384 inner pixels + PML
-DEFAULT_CELL_Y_UM = 26.0  # 24.0 μm inner + 2*1.0 μm PML = 384 inner pixels + PML (square cell)
+DEFAULT_CELL_X_UM = 26.0  # 24.0 μm inner + 2*1.0 μm PML (square cell)
+DEFAULT_CELL_Y_UM = 26.0  # 24.0 μm inner + 2*1.0 μm PML (square cell)
 DEFAULT_DPML_UM = 1.0
-DEFAULT_RESOLUTION = 18
+DEFAULT_RESOLUTION = 14
 
 
 class Device2DBase:

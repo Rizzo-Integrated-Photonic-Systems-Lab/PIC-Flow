@@ -1,0 +1,28 @@
+Silicon photonic devices used in photonic integrated circuits (PICs) enable compact optical systems for
+communications, sensing, and computing, but practical design still depends on full-wave electromagnetic simulation and
+iterative optimization. Finite-difference time domain (FDTD) solvers remain the main tool for accurate prediction
+across device geometries and wavelengths~\cite{TafloveHagness2005FDTD, Teixeira2023FDTDMethods, Oskooi2010Meep}, yet
+repeated FDTD solves become a bottleneck for parameter sweeps and gradient-based inverse design
+loops~\cite{Molesky2018InverseDesign}. This has motivated
+machine-learning surrogates for forward prediction and learning-assisted inverse design. A key remaining challenge is
+accurate full-field prediction of complex electromagnetic responses: phase must be handled consistently, solutions
+should satisfy the wave equation, and models must generalize across device families and wavelengths rather than
+overfitting to one geometry class. Moreover, predictions should yield accurate scattering parameters
+(S-parameters)---the port-to-port transmission and reflection coefficients that are the primary figures of merit in
+photonic device design---without requiring a separate regression head or post-hoc extraction step.
+
+We address this gap with a physics-based complex-valued conditional flow-matching model for fast full-field prediction
+of silicon photonic devices. Building on flow matching for generative modeling~\citep{Lipman2022FlowMatching} and
+physics-based flow matching for PDE-constrained generation~\citep{Baldan2025PBFM}, we train a complex-valued U-Net to
+generate complex field distributions while preserving phase relationships. Physics is enforced through a Helmholtz
+residual loss with an interface-aware mask that excludes dielectric boundary pixels where finite-difference stencil
+errors dominate, yielding a meaningful compliance metric. S-parameter accuracy is enforced through a dedicated loss
+term: at each device port, the predicted field is projected onto the computed fundamental waveguide eigenmode via an
+overlap integral, and the resulting complex mode amplitudes are normalized to obtain S-parameters; the loss then
+penalizes both magnitude and phase errors relative to FDTD-extracted ground truth, with an amplitude gate that
+suppresses supervision on near-zero transmissions. These objectives are introduced through a three-phase training
+curriculum---flow matching only, then Helmholtz residual, then S-parameter supervision---that avoids gradient conflicts
+between the velocity-matching, PDE-compliance, and port-coupling objectives. We evaluate the approach on canonical PIC
+building blocks (bends, tapers, couplers, crossings) and show that a single checkpoint generalizes across device
+classes and wavelengths, producing full-field and S-parameter predictions in a single forward pass that would otherwise
+require minutes of FDTD simulation.

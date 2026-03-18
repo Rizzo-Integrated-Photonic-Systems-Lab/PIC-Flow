@@ -37,7 +37,7 @@ HIDDEN_SIZE=32
 USE_SHARDS="--use-shards"
 SHARD_SUBDIR="shards"
 SHARD_INDEX_NAME="index.json"
-INCLUDE_SWEEPS="directional_coupler_sweep_v2"
+INCLUDE_SWEEPS="unified_sweep"
 
 # Train
 EPOCHS=200
@@ -162,7 +162,7 @@ srun torchrun \
   --pml-cells 0 \
   --physics-features \
   --complex-unet \
-  --dx 0.05 \
+  --dx 0.071428571 \
   --unroll-steps 0 \
   --fm_steps 100 \
   \

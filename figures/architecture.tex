@@ -1,0 +1,171 @@
+% Figure 2: Complex-valued U-Net architecture
+% Compile standalone or \input{} into main document
+% Requires: \usepackage{tikz}
+%           \usetikzlibrary{arrows.meta, positioning, calc, fit, backgrounds, decorations.pathreplacing}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    >=Stealth,
+    node distance=0.6cm and 0.8cm,
+    % Styles
+    enc/.style={draw, fill=blue!15, rounded corners=2pt, minimum width=1.1cm, align=center,
+                font=\tiny},
+    dec/.style={draw, fill=orange!12, rounded corners=2pt, minimum width=1.1cm, align=center,
+                font=\tiny},
+    mid/.style={draw, fill=violet!12, rounded corners=2pt, minimum width=1.3cm, align=center,
+                font=\tiny},
+    io/.style={draw, fill=green!10, rounded corners=2pt, minimum width=1.4cm, align=center,
+               font=\tiny},
+    aux/.style={draw, fill=yellow!15, rounded corners=2pt, minimum width=1.2cm, align=center,
+                font=\tiny},
+    skip/.style={->, gray!60, thick, dashed},
+    arrow/.style={->, thick},
+    label/.style={font=\tiny, text=gray!70!black},
+    darrow/.style={->, thick, dashed},
+]
+
+% ===== INPUTS (left) =====
+\node[io] (er) at (-0.5, 0) {$E_r, E_i$\\(complex field)};
+\node[aux] (helm) at (-0.5, -1.3) {Helmholtz\\residual $H_r, H_i$};
+\node[aux] (auxin) at (-0.5, -2.6) {$\varepsilon$, $m_\text{src}$\\(real aux)};
+
+% RealToComplex bridge
+\node[aux, fill=yellow!25] (r2c) at (1.8, -2.6) {RealTo-\\Complex};
+\draw[arrow] (auxin) -- (r2c);
+
+% Stem
+\node[enc, minimum height=1.2cm, minimum width=1.3cm, fill=blue!8] (stem) at (3.2, -1.0)
+    {Stem\\ComplexConv\\$\to$ 40\,ch};
+\draw[arrow] (er) -| (stem);
+\draw[arrow] (helm) -| (stem);
+\draw[arrow] (r2c) -| (stem);
+
+% ===== ENCODER =====
+% Level 1 (full res, ds=1): 40 complex channels
+\node[enc, minimum height=1.8cm] (e1) at (5.0, -1.0)
+    {CResBlock\\$\times 3$\\[2pt]40\,ch};
+\draw[arrow] (stem) -- (e1);
+
+% Downsample 1
+\node[enc, fill=blue!25, minimum height=0.5cm, font=\tiny] (d1) at (6.2, -1.0) {$\downarrow 2$};
+\draw[arrow] (e1) -- (d1);
+
+% Level 2 (ds=2): 80 complex channels
+\node[enc, minimum height=1.8cm] (e2) at (7.4, -1.0)
+    {CResBlock\\$\times 3$\\[2pt]80\,ch};
+\draw[arrow] (d1) -- (e2);
+
+% Downsample 2
+\node[enc, fill=blue!25, minimum height=0.5cm, font=\tiny] (d2) at (8.6, -1.0) {$\downarrow 2$};
+\draw[arrow] (e2) -- (d2);
+
+% Level 3 (ds=4): 160 complex channels
+\node[enc, minimum height=1.8cm] (e3) at (9.8, -1.0)
+    {CResBlock\\$\times 3$\\[2pt]160\,ch};
+\draw[arrow] (d2) -- (e3);
+
+% Downsample 3
+\node[enc, fill=blue!25, minimum height=0.5cm, font=\tiny] (d3) at (11.0, -1.0) {$\downarrow 2$};
+\draw[arrow] (e3) -- (d3);
+
+% Level 4 (ds=8): 320 complex channels + 8-head attention
+\node[enc, minimum height=2.0cm] (e4) at (12.2, -1.0)
+    {CResBlock\\$\times 3$\\+ CAttn (8h)\\320\,ch};
+\draw[arrow] (d3) -- (e4);
+
+% ===== BOTTLENECK =====
+\node[mid, minimum height=2.2cm, minimum width=1.5cm] (bot) at (12.2, -4.0)
+    {CResBlock\\CAttn (8h)\\CResBlock\\320\,ch};
+\draw[arrow] (e4) -- (bot);
+
+% ===== DECODER =====
+% Level 4 (decoder): 320 ch + attention
+\node[dec, minimum height=2.0cm] (de4) at (12.2, -7.0)
+    {CResBlock\\$\times 4$\\+ CAttn (8h)\\320\,ch};
+\draw[arrow] (bot) -- (de4);
+
+% Upsample 3
+\node[dec, fill=orange!25, minimum height=0.5cm, font=\tiny] (u3) at (11.0, -7.0) {$\uparrow 2$};
+\draw[arrow] (de4) -- (u3);
+
+% Level 3 (decoder): 160 ch
+\node[dec, minimum height=1.8cm] (de3) at (9.8, -7.0)
+    {CResBlock\\$\times 4$\\160\,ch};
+\draw[arrow] (u3) -- (de3);
+
+% Upsample 2
+\node[dec, fill=orange!25, minimum height=0.5cm, font=\tiny] (u2) at (8.6, -7.0) {$\uparrow 2$};
+\draw[arrow] (de3) -- (u2);
+
+% Level 2 (decoder): 80 ch
+\node[dec, minimum height=1.8cm] (de2) at (7.4, -7.0)
+    {CResBlock\\$\times 4$\\80\,ch};
+\draw[arrow] (u2) -- (de2);
+
+% Upsample 1
+\node[dec, fill=orange!25, minimum height=0.5cm, font=\tiny] (u1) at (6.2, -7.0) {$\uparrow 2$};
+\draw[arrow] (de2) -- (u1);
+
+% Level 1 (decoder): 40 ch
+\node[dec, minimum height=1.8cm] (de1) at (5.0, -7.0)
+    {CResBlock\\$\times 4$\\40\,ch};
+\draw[arrow] (u1) -- (de1);
+
+% ===== OUTPUT =====
+\node[io] (out) at (3.2, -7.0) {CGNorm\\ModReLU\\CConv $\to 1$};
+\draw[arrow] (de1) -- (out);
+
+\node[io, fill=orange!20] (vout) at (1.0, -7.0) {$v_r, v_i$\\(velocity)};
+\draw[arrow] (out) -- (vout);
+
+% ===== SKIP CONNECTIONS =====
+\draw[skip] (e1.south) -- ++(0, -1.0) -| (de1.north);
+\draw[skip] (e2.south) -- ++(0, -0.8) -| (de2.north);
+\draw[skip] (e3.south) -- ++(0, -0.6) -| (de3.north);
+\draw[skip] (e4.south west) -- ++(-0.2, -0.5) |- (de4.north west);
+
+% Skip labels
+\node[label] at (5.0, -3.0) {skip};
+\node[label] at (7.4, -3.2) {skip};
+\node[label] at (9.8, -3.4) {skip};
+
+% ===== TIME/COND EMBEDDING =====
+\node[aux, fill=red!10, minimum width=2.0cm] (temb) at (8.0, -4.5)
+    {$t$ sinusoidal emb\\$+\;\lambda_\text{norm}$\\$\to$ MLP $\to$ emb};
+
+% Arrows from temb to all resblocks (simplified: one arrow to encoder, one to decoder)
+\draw[darrow, red!40, ->] (temb.west) -- ++(-2.0, 0) node[label, above, pos=0.5] {modulates all CResBlocks};
+\draw[darrow, red!40, ->] (temb.east) -- ++(2.0, 0);
+
+% ===== INSET: CResBlock =====
+\begin{scope}[shift={(-0.5, -4.8)}, scale=0.85]
+    \node[font=\tiny\bfseries] at (0.8, 0.3) {ComplexResBlock:};
+    \node[enc, minimum width=1.8cm, minimum height=0.35cm] (r1) at (0.8, -0.1) {CGNorm $\to$ CConv};
+    \node[enc, minimum width=1.8cm, minimum height=0.35cm, fill=green!15] (r2) at (0.8, -0.6) {ModReLU};
+    \node[enc, minimum width=1.8cm, minimum height=0.35cm, fill=red!8] (r3) at (0.8, -1.1)
+        {$(s_r{+}is_i) \cdot h + h$};
+    \node[enc, minimum width=1.8cm, minimum height=0.35cm] (r4) at (0.8, -1.6) {CGNorm $\to$ ModReLU};
+    \node[enc, minimum width=1.8cm, minimum height=0.35cm] (r5) at (0.8, -2.1) {CConv (zero-init)};
+    \draw[arrow, thin] (r1) -- (r2);
+    \draw[arrow, thin] (r2) -- (r3);
+    \draw[arrow, thin] (r3) -- (r4);
+    \draw[arrow, thin] (r4) -- (r5);
+    % skip
+    \draw[skip, thin] (-0.5, -0.1) -- (-0.5, -2.1) -- (r5.west);
+    \node[label] at (-0.7, -1.1) {+};
+    % emb annotation
+    \node[font=\tiny, text=red!60!black] at (2.2, -1.1) {$\leftarrow$ emb};
+\end{scope}
+
+\end{tikzpicture}
+\caption{Complex-valued U-Net architecture. The encoder (blue) downsamples through four resolution levels with complex
+residual blocks (CResBlock) and complex self-attention (CAttn) at the coarsest level. Real auxiliary inputs
+($\varepsilon$, source mask) are projected into complex space via a RealToComplex bridge. The Helmholtz residual of the
+current field is concatenated as an additional complex input channel. The timestep $t$ and normalized wavelength
+$\lambda$ are embedded and injected into every residual block via complex scale modulation. Skip connections (dashed
+gray) feed encoder features to the decoder (orange). The inset (bottom left) shows the internal structure of each
+ComplexResBlock: complex group normalization (CGNorm), complex convolution (CConv), ModReLU activation, embedding
+modulation, and a zero-initialized output convolution with residual addition.}
+\label{fig:architecture}
+\end{figure*}

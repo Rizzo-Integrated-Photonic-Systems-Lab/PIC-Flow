@@ -41,7 +41,7 @@ from flow_matching import (
     sample_mask_mode, MASK_MODE_FORWARD, MASK_MODE_INVERSE, MASK_MODE_JOINT,
     binarization_loss, sample_joint, sample_inverse,
 )
-from sparams_loss import extract_sparams
+from sparams_loss import extract_sparams, _resolve_in_idx
 from modal_sparams import extract_sparams_modal
 
 try:
@@ -260,6 +260,328 @@ def _save_inverse_eval_png(
 
         fig.tight_layout(rect=[0, 0.02, 1, 0.93])
         fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
+def _compute_psnr(pred: np.ndarray, gt: np.ndarray, data_range: float = None) -> float:
+    """Peak Signal-to-Noise Ratio in dB."""
+    mse = np.mean((pred - gt) ** 2)
+    if mse < 1e-15:
+        return 100.0
+    if data_range is None:
+        data_range = float(gt.max() - gt.min())
+    if data_range < 1e-15:
+        return 0.0
+    return float(10.0 * np.log10(data_range ** 2 / mse))
+
+
+def _collect_layer_grad_norms(model) -> dict:
+    """Collect per-block gradient L2 norms from model parameters."""
+    group_ss = defaultdict(float)  # sum of squares per group
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        key = ".".join(name.split(".")[:2])
+        group_ss[key] += float(p.grad.data.norm().item()) ** 2
+    return {k: math.sqrt(v) for k, v in group_ss.items()}
+
+
+def _save_enhanced_eval_sample_png(
+    *,
+    out_path: str,
+    title: str,
+    eps_phys: np.ndarray,
+    ezr_gt: np.ndarray,
+    ezi_gt: np.ndarray,
+    ezr_pred: np.ndarray,
+    ezi_pred: np.ndarray,
+    metrics: dict,
+) -> None:
+    """
+    Save a 3x4 evaluation panel with error maps and metrics:
+      Row 0: eps | Ez_real GT | Ez_imag GT | |Ez| GT
+      Row 1: Ez_real pred | Ez_imag pred | |Ez| pred | |err| magnitude
+      Row 2: Real error | Imag error | Phase error (amp-weighted) | Metrics text
+    """
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        mag_gt = np.sqrt(ezr_gt**2 + ezi_gt**2 + 1e-12)
+        mag_pred = np.sqrt(ezr_pred**2 + ezi_pred**2 + 1e-12)
+        mag_err = np.sqrt((ezr_pred - ezr_gt)**2 + (ezi_pred - ezi_gt)**2 + 1e-12)
+        real_err = ezr_pred - ezr_gt
+        imag_err = ezi_pred - ezi_gt
+
+        # Amplitude-weighted phase error map
+        phase_gt = np.arctan2(ezi_gt, ezr_gt)
+        phase_pred = np.arctan2(ezi_pred, ezr_pred)
+        phase_diff = np.arctan2(np.sin(phase_pred - phase_gt), np.cos(phase_pred - phase_gt))
+        amp_weight = mag_gt / (mag_gt.max() + 1e-12)
+        phase_err_map = np.abs(phase_diff) * amp_weight
+
+        fig, axes = plt.subplots(3, 4, figsize=(18, 11))
+        fig.suptitle(title, fontsize=12, fontweight="bold")
+
+        def im(ax, arr, t, *, cmap="magma", vmin=None, vmax=None):
+            h = ax.imshow(arr, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax)
+            ax.set_title(t, fontsize=9)
+            ax.set_xticks([]); ax.set_yticks([])
+            return h
+
+        hs = []
+        # Row 0: Ground truth
+        hs.append(im(axes[0, 0], eps_phys, r"$\varepsilon_r$", cmap="viridis"))
+        vlim_r = max(np.abs(ezr_gt).max(), np.abs(ezr_pred).max(), 1e-12)
+        vlim_i = max(np.abs(ezi_gt).max(), np.abs(ezi_pred).max(), 1e-12)
+        hs.append(im(axes[0, 1], ezr_gt, r"$E_z^{\rm re}$ (GT)", cmap="RdBu", vmin=-vlim_r, vmax=vlim_r))
+        hs.append(im(axes[0, 2], ezi_gt, r"$E_z^{\rm im}$ (GT)", cmap="RdBu", vmin=-vlim_i, vmax=vlim_i))
+        hs.append(im(axes[0, 3], mag_gt, r"$|E_z|$ (GT)", cmap="magma"))
+
+        # Row 1: Prediction + magnitude error
+        hs.append(im(axes[1, 0], ezr_pred, r"$E_z^{\rm re}$ (pred)", cmap="RdBu", vmin=-vlim_r, vmax=vlim_r))
+        hs.append(im(axes[1, 1], ezi_pred, r"$E_z^{\rm im}$ (pred)", cmap="RdBu", vmin=-vlim_i, vmax=vlim_i))
+        hs.append(im(axes[1, 2], mag_pred, r"$|E_z|$ (pred)", cmap="magma"))
+        hs.append(im(axes[1, 3], mag_err, r"$|\Delta E_z|$", cmap="hot"))
+
+        # Row 2: Error maps + metrics text
+        err_vlim_r = max(np.abs(real_err).max(), 1e-12)
+        err_vlim_i = max(np.abs(imag_err).max(), 1e-12)
+        hs.append(im(axes[2, 0], real_err, r"$\Delta E_z^{\rm re}$", cmap="RdBu", vmin=-err_vlim_r, vmax=err_vlim_r))
+        hs.append(im(axes[2, 1], imag_err, r"$\Delta E_z^{\rm im}$", cmap="RdBu", vmin=-err_vlim_i, vmax=err_vlim_i))
+        hs.append(im(axes[2, 2], phase_err_map, r"$|\Delta\phi|$ (amp-weighted)", cmap="inferno"))
+
+        # Metrics text box
+        axes[2, 3].axis("off")
+        axes[2, 3].set_title("Metrics", fontsize=9)
+        metric_lines = []
+        for k in ["psnr", "amp_err", "phase_err", "residual", "gt_residual", "gap_dB"]:
+            v = metrics.get(k, None)
+            if v is not None:
+                if k == "psnr":
+                    metric_lines.append(f"PSNR:         {v:.2f} dB")
+                elif k == "amp_err":
+                    metric_lines.append(f"Amp Error:    {v:.4e}")
+                elif k == "phase_err":
+                    metric_lines.append(f"Phase Error:  {v:.4e}")
+                elif k == "residual":
+                    metric_lines.append(f"Residual:     {v:.4e}")
+                elif k == "gt_residual":
+                    metric_lines.append(f"GT Residual:  {v:.4e}")
+                elif k == "gap_dB":
+                    metric_lines.append(f"Gap:          {v:+.1f} dB")
+        axes[2, 3].text(
+            0.05, 0.95, "\n".join(metric_lines),
+            transform=axes[2, 3].transAxes, fontsize=10, fontfamily="monospace",
+            verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.8),
+        )
+
+        for ax, h in zip(axes[:, :].ravel()[:len(hs)], hs):
+            fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
+
+        fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
+def _save_device_bar_chart_png(
+    *,
+    out_path: str,
+    title: str,
+    metrics_per_device: dict,
+    epoch: int,
+) -> None:
+    """Save a 2x2 bar chart comparing metrics across device types."""
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        if not metrics_per_device:
+            return
+        devices = sorted(metrics_per_device.keys())
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle(title, fontsize=12, fontweight="bold")
+
+        colors = plt.cm.Set2(np.linspace(0, 1, max(len(devices), 1)))
+        x = np.arange(len(devices))
+
+        chart_specs = [
+            ("gap_dB", "Residual Gap (dB)", axes[0, 0]),
+            ("amp_err", "Amplitude Error", axes[0, 1]),
+            ("phase_err", "Phase Error (weighted)", axes[1, 0]),
+            ("psnr", "PSNR (dB)", axes[1, 1]),
+        ]
+        for key, ylabel, ax in chart_specs:
+            vals = [metrics_per_device[d].get(key, 0.0) for d in devices]
+            bars = ax.bar(x, vals, color=colors[:len(devices)], edgecolor="black", linewidth=0.5)
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.set_xticks(x)
+            ax.set_xticklabels(devices, rotation=30, ha="right", fontsize=8)
+            for bar, v in zip(bars, vals):
+                fmt = f"{v:.2f}" if abs(v) < 100 else f"{v:.1f}"
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                        fmt, ha="center", va="bottom", fontsize=7)
+            if key == "gap_dB":
+                ax.axhline(0, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
+            ax.grid(axis="y", alpha=0.3)
+
+        fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
+def _save_gradient_health_png(
+    *,
+    out_path: str,
+    title: str,
+    layer_grad_norms: dict,
+    epoch: int,
+) -> None:
+    """Save a bar chart of per-layer-group gradient L2 norms (log scale)."""
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        if not layer_grad_norms:
+            return
+        names = list(layer_grad_norms.keys())
+        norms = [layer_grad_norms[n] for n in names]
+
+        fig, ax = plt.subplots(figsize=(max(10, len(names) * 0.5), 5))
+        fig.suptitle(title, fontsize=12, fontweight="bold")
+        x = np.arange(len(names))
+        colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(names)))
+        ax.bar(x, norms, color=colors, edgecolor="black", linewidth=0.5)
+        ax.set_yscale("log")
+        ax.set_ylabel("Gradient L2 Norm", fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+        ax.grid(axis="y", alpha=0.3)
+
+        fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
+def _save_training_curves_png(
+    *,
+    out_path: str,
+    val_csv_path: str,
+    epoch: int,
+) -> None:
+    """Read validation.csv and plot training curves over epochs."""
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        if not os.path.isfile(val_csv_path):
+            return
+        with open(val_csv_path, "r", encoding="UTF8") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            rows = list(reader)
+        if not rows:
+            return
+
+        def col(name):
+            if name in header:
+                idx = header.index(name)
+                vals = []
+                for r in rows:
+                    try:
+                        v = float(r[idx]) if r[idx] != "" else float("nan")
+                    except (IndexError, ValueError):
+                        v = float("nan")
+                    vals.append(v)
+                return np.array(vals)
+            return None
+
+        epochs = col("epoch")
+        if epochs is None:
+            return
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle(f"Training Curves (epoch {epoch})", fontsize=12, fontweight="bold")
+
+        # (0,0) FM loss
+        fm = col("val_fm_loss")
+        if fm is not None:
+            mask = np.isfinite(fm) & (fm > 0)
+            if mask.any():
+                axes[0, 0].semilogy(epochs[mask], fm[mask], "b-o", markersize=2, label="FM loss")
+                axes[0, 0].set_ylabel("FM Loss")
+                axes[0, 0].legend(fontsize=8)
+                axes[0, 0].grid(alpha=0.3)
+        axes[0, 0].set_title("Flow Matching Loss", fontsize=9)
+
+        # (0,1) Residual loss
+        res = col("val_residual_loss")
+        if res is not None:
+            mask = np.isfinite(res) & (res > 0)
+            if mask.any():
+                axes[0, 1].semilogy(epochs[mask], res[mask], "r-o", markersize=2, label="Residual")
+                axes[0, 1].legend(fontsize=8)
+                axes[0, 1].grid(alpha=0.3)
+        axes[0, 1].set_title("Residual Loss", fontsize=9)
+        axes[0, 1].set_ylabel("Residual Loss")
+
+        # (1,0) Residual gap dB
+        gap = col("sample_residual_gap_dB")
+        if gap is not None:
+            mask = np.isfinite(gap)
+            if mask.any():
+                axes[1, 0].plot(epochs[mask], gap[mask], "g-o", markersize=2, label="Gap (dB)")
+                axes[1, 0].axhline(0, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
+                axes[1, 0].legend(fontsize=8)
+                axes[1, 0].grid(alpha=0.3)
+        axes[1, 0].set_title("Residual Gap vs GT", fontsize=9)
+        axes[1, 0].set_ylabel("Gap (dB)")
+        axes[1, 0].set_xlabel("Epoch")
+
+        # (1,1) Amp error + phase error
+        amp = col("sample_amp_err_mean")
+        ph = col("sample_phase_err_mean")
+        ax_right = axes[1, 1]
+        has_amp = amp is not None and np.isfinite(amp).any()
+        has_ph = ph is not None and np.isfinite(ph).any()
+        if has_amp:
+            mask_a = np.isfinite(amp)
+            ax_right.plot(epochs[mask_a], amp[mask_a], "m-o", markersize=2, label="Amp Error")
+        if has_ph:
+            mask_p = np.isfinite(ph)
+            ax2 = ax_right.twinx()
+            ax2.plot(epochs[mask_p], ph[mask_p], "c-s", markersize=2, label="Phase Error")
+            ax2.set_ylabel("Phase Error", fontsize=8, color="c")
+            ax2.tick_params(axis="y", labelcolor="c")
+        ax_right.set_title("Amp & Phase Error", fontsize=9)
+        ax_right.set_ylabel("Amp Error", fontsize=8, color="m")
+        ax_right.set_xlabel("Epoch")
+        ax_right.grid(alpha=0.3)
+        lines1, labels1 = ax_right.get_legend_handles_labels()
+        if has_ph:
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax_right.legend(lines1 + lines2, labels1 + labels2, fontsize=7)
+        elif has_amp:
+            ax_right.legend(fontsize=7)
+
+        for ax in axes.ravel():
+            ax.tick_params(labelsize=8)
+
+        fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(out_path, dpi=200)
         plt.close(fig)
     except Exception:
         try:
@@ -491,13 +813,21 @@ def main(args):
 
     results_dir = "logs_physics_unet_pbfm"
     experiment_dir = os.path.join(results_dir, args.version)
-    ckpt_dir = os.path.join(experiment_dir, "checkpoints")
+    checkpoint_root = os.environ.get("RAYFIELD_CKPT_ROOT", results_dir)
+    ckpt_experiment_dir = os.path.join(checkpoint_root, args.version)
+    ckpt_dir = os.path.join(ckpt_experiment_dir, "checkpoints")
     samples_dir = os.path.join(experiment_dir, "samples")
 
     if is_rank0():
         os.makedirs(results_dir, exist_ok=True)
         if (not args.resume_from) and os.path.exists(experiment_dir):
             for root, dirs, files in os.walk(experiment_dir, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+        if (not args.resume_from) and (ckpt_experiment_dir != experiment_dir) and os.path.exists(ckpt_experiment_dir):
+            for root, dirs, files in os.walk(ckpt_experiment_dir, topdown=False):
                 for name in files:
                     os.remove(os.path.join(root, name))
                 for name in dirs:
@@ -514,6 +844,7 @@ def main(args):
         else:
             logger.info(f"Single-GPU training on {device}")
     logger.info(f"Experiment dir: {experiment_dir}")
+    logger.info(f"Checkpoint dir: {ckpt_dir}")
     # NOTE: when --all-losses-from-start is enabled we collapse phaseA/phaseB to 0 above,
     # so @B/@C tau schedules effectively start immediately.
 
@@ -535,6 +866,9 @@ def main(args):
                     "sample_gt_residual_mean",
                     "sample_residual_ratio_vs_gt",
                     "sample_residual_gap_dB",
+                    "sample_amp_err_mean",
+                    "sample_phase_err_mean",
+                    "sample_psnr_mean",
                 ])
 
     wandb_run = None
@@ -549,6 +883,10 @@ def main(args):
     include_sweeps = None
     if args.include_sweeps:
         include_sweeps = [s.strip() for s in args.include_sweeps.split(",") if s.strip()]
+
+    exclude_devices = None
+    if getattr(args, "exclude_devices", ""):
+        exclude_devices = [s.strip() for s in args.exclude_devices.split(",") if s.strip()]
 
     # sdf sigma px -> nm
     sdf_sigma_px = float(getattr(args, "sdf_sigma_px", 0.0) or 0.0)
@@ -628,6 +966,7 @@ def main(args):
         )
     else:
         # Regular dataset: load from NPZ shards
+        _canvas_hw = tuple(args.canvas_hw) if getattr(args, "canvas_hw", None) else None
         if is_rank0():
             train_ds_tmp = FDTDDataset(
                 root_dir=args.data_root,
@@ -645,6 +984,7 @@ def main(args):
                 shard_subdir=args.shard_subdir,
                 shard_index_name=args.shard_index_name,
                 include_sweeps=include_sweeps,
+                exclude_devices=exclude_devices,
                 subset_train_per_sweep=subset_train if subset_train else None,
                 subset_val_per_sweep=subset_val if subset_train or subset_val else None,
                 subset_seed=subset_seed,
@@ -653,6 +993,7 @@ def main(args):
                 return_aux=True,
                 use_index_split=bool(getattr(args, "use_index_split", False)),
                 include_sparams_cond=bool(getattr(args, "include_sparams_cond", False)),
+                canvas_hw=_canvas_hw,
             )
             stats = train_ds_tmp.get_stats()
         stats = broadcast_object(stats, src=0)
@@ -674,15 +1015,17 @@ def main(args):
             shard_subdir=args.shard_subdir,
             shard_index_name=args.shard_index_name,
             include_sweeps=include_sweeps,
+            exclude_devices=exclude_devices,
             return_aux=True,
             subset_train_per_sweep=subset_train if subset_train else None,
             subset_val_per_sweep=subset_val if subset_train or subset_val else None,
             subset_seed=subset_seed,
             crop_pml=bool(getattr(args, "crop_pml", False)),
             pml_cells=int(getattr(args, "pml_cells", 0)),
-            augment=bool(getattr(args, "augment", True)),  # D4 augmentation during training
+            augment=bool(getattr(args, "augment", True)),
             use_index_split=bool(getattr(args, "use_index_split", False)),
             include_sparams_cond=bool(getattr(args, "include_sparams_cond", False)),
+            canvas_hw=_canvas_hw,
         )
 
         val_ds = FDTDDataset(
@@ -702,6 +1045,7 @@ def main(args):
             shard_subdir=args.shard_subdir,
             shard_index_name=args.shard_index_name,
             include_sweeps=include_sweeps,
+            exclude_devices=exclude_devices,
             return_aux=True,
             subset_train_per_sweep=subset_train if subset_train else None,
             subset_val_per_sweep=subset_val if subset_train or subset_val else None,
@@ -711,6 +1055,7 @@ def main(args):
             augment=False,
             use_index_split=bool(getattr(args, "use_index_split", False)),
             include_sparams_cond=bool(getattr(args, "include_sparams_cond", False)),
+            canvas_hw=_canvas_hw,
         )
 
     if use_ddp:
@@ -767,7 +1112,12 @@ def main(args):
     in_channels = int(getattr(train_ds, "x_channels", int(stats.get("x_channels", 4))))
     enable_physics = bool(getattr(args, "physics_features", True))
     use_complex = bool(getattr(args, "complex_unet", False))
-    attn_res = () if args.no_attention else (8,)
+    if args.no_attention:
+        attn_res = ()
+    else:
+        attn_res = tuple(int(x) for x in args.attn_resolutions.split(",") if x.strip())
+
+    channel_mult = tuple(int(x) for x in args.channel_mult.split(",") if x.strip())
 
     if is_rank0():
         logger.info("Using ComplexPhysicsUNet" if use_complex else "Using PhysicsUNet")
@@ -791,12 +1141,12 @@ def main(args):
         in_channels=in_channels,
         out_channels=out_channels,
         model_channels=args.hidden_size,
-        num_res_blocks=2,
-        channel_mult=(1, 2, 4, 8,),
+        num_res_blocks=args.num_res_blocks,
+        channel_mult=channel_mult,
         attention_resolutions=attn_res,
-        dropout=0.0,
+        dropout=args.model_dropout,
         dims=2,
-        num_heads=8,
+        num_heads=args.num_heads,
         cond_dim=int(getattr(train_ds, "cond_dim", 1)),
         enable_sparam_head=(args.lambda_sparam > 0 and str(getattr(args, "sparam_mode", "project")) == "head"),
         dx=dx,
@@ -822,6 +1172,8 @@ def main(args):
     # torch.compile: disable when unroll_steps>0 (variable-length loop causes recompilation).
     use_compile = int(getattr(args, "unroll_steps", 0)) == 0
     if use_compile:
+        import torch._functorch.config as _ftc
+        _ftc.donated_buffer = False
         base_model = torch.compile(base_model)
         if is_rank0():
             logger.info("torch.compile enabled on base_model")
@@ -858,13 +1210,18 @@ def main(args):
     )
 
     amp_enabled = bool(getattr(args, "amp", True))
+    amp_dtype_str = str(getattr(args, "amp_dtype", "float16"))
+    amp_dtype = torch.bfloat16 if amp_dtype_str == "bfloat16" else torch.float16
+    # BF16 has the same exponent range as FP32 — no overflow, so GradScaler is unnecessary
+    use_scaler = amp_enabled and (amp_dtype == torch.float16)
     if _AMP_NEW_API:
-        scaler = _GradScaler("cuda", enabled=amp_enabled)
+        scaler = _GradScaler("cuda", enabled=use_scaler)
         autocast_device_type = "cuda"
     else:
-        scaler = _GradScaler(enabled=amp_enabled)
+        scaler = _GradScaler(enabled=use_scaler)
         autocast_device_type = "cuda"
-    amp_enabled = scaler.is_enabled()
+    if amp_enabled:
+        logger.info(f"AMP enabled with dtype={amp_dtype}, GradScaler={'on' if use_scaler else 'off'}")
 
     def optimizer_step():
         if scaler.is_enabled():
@@ -924,6 +1281,23 @@ def main(args):
         start_epoch = last_epoch + 1
         scheduler.last_epoch = last_epoch
 
+        # Optionally reset LR schedule for a fresh cosine cycle from args.lr
+        if getattr(args, 'reset_lr_on_resume', False):
+            for pg in opt.param_groups:
+                pg['lr'] = args.lr
+            remaining = args.epochs - last_epoch
+            if warmup_epochs > 0:
+                warmup_sf = float(getattr(args, "warmup_start_factor", 0.1))
+                warmup_sf = min(max(warmup_sf, 1e-6), 1.0)
+                warmup_r = LinearLR(opt, start_factor=warmup_sf, total_iters=warmup_epochs)
+                cos_T_r = max(1, remaining - warmup_epochs)
+                cosine_r = CosineAnnealingLR(opt, T_max=cos_T_r, eta_min=min_lr)
+                scheduler = SequentialLR(opt, schedulers=[warmup_r, cosine_r], milestones=[warmup_epochs])
+            else:
+                scheduler = CosineAnnealingLR(opt, T_max=max(1, remaining), eta_min=min_lr)
+            if is_rank0():
+                logger.info(f"Reset LR: fresh cosine {args.lr:.2e} over {remaining} epochs (min_lr={min_lr:.2e})")
+
     # -----------------------
     # Training settings
     # -----------------------
@@ -957,6 +1331,7 @@ def main(args):
     running_geom_loss = 0.0
     running_grad_norm = 0.0
     grad_norm_max_epoch = 0.0
+    layer_grad_norms_accum = defaultdict(list)  # per-block gradient norms (sampled periodically)
     train_steps_epoch = 0
     phase_grad_steps_epoch = 0
     sparam_steps_epoch = 0
@@ -969,6 +1344,9 @@ def main(args):
         logger.info("Objective: fixed weighted sum")
         cfg_log = f"enabled={config_active_global} start_epoch={config_start_epoch}" if use_config else "disabled"
         logger.info(f"Conflict-free grads (ConFIG): {cfg_log}")
+        t_phys_min = float(getattr(args, "t_physics_min", 0.0))
+        if t_phys_min > 0.0:
+            logger.info(f"Time-gating: physics losses only for t >= {t_phys_min}")
 
     detect_anomaly = bool(getattr(args, "detect_anomaly", False))
     if detect_anomaly:
@@ -986,9 +1364,15 @@ def main(args):
         N1 = int(args.phaseA_epochs)
         N2 = int(args.phaseB_epochs)
 
-        endpoint_weight = float(args.lambda_endpoint)
-        if int(args.endpoint_warmup_epochs) > 0 and endpoint_weight > 0:
-            endpoint_weight *= min(1.0, epoch / float(args.endpoint_warmup_epochs))
+        if use_endpoint:
+            endpoint_start = _phase_start_epoch(
+                getattr(args, "endpoint_start_phase", "B"), N1=N1, N2=N2
+            )
+            endpoint_weight = float(args.lambda_endpoint) * ramp_linear(
+                epoch, start_epoch=endpoint_start, warmup_epochs=int(args.endpoint_warmup_epochs)
+            )
+        else:
+            endpoint_weight = 0.0
 
         if use_residual:
             residual_start = 0 if getattr(args, "residual_start_phase", "B") == "A" else N1
@@ -1108,7 +1492,8 @@ def main(args):
                     cond[:, base_cond_dim:base_cond_dim + n_sparam_reals] = 0.0
 
             x0_fields = torch.randn_like(fields_1)
-            t = sample_t(fields_1)  # [B,1,1,1]
+            t = sample_t(fields_1, mode=args.t_sample_mode,
+                          loc=args.t_sample_loc, scale=args.t_sample_scale)  # [B,1,1,1]
             x_t_fields = psi_t(x0_fields, fields_1, t)
             v_t_fields = u_t(x0_fields, fields_1)
 
@@ -1186,12 +1571,13 @@ def main(args):
                 phys_gate=phys_gate,
                 phase_gate=phase_gate,
                 compute_residual=compute_residual_step,
+                interface_thr=float(getattr(args, "interface_thr", 0.0)),
                 unroll_steps=int(getattr(args, "unroll_steps", 0)),
                 unroll_phase=bool(getattr(args, "unroll_phase", False)),
                 phase_amp_tau=float(getattr(args, "phase_amp_tau", 0.2)),
                 amp_enabled=amp_enabled,
                 amp_device_type=autocast_device_type,
-                amp_dtype=torch.float16,
+                amp_dtype=amp_dtype,
                 sparam_mode=str(getattr(args, "sparam_mode", "project")),
                 joint_training=joint_training,
                 mask_mode=batch_mask_mode,
@@ -1201,6 +1587,8 @@ def main(args):
                 lambda_binarize=binarize_weight,
                 eps_1=eps,
                 lambda_geom=geom_weight,
+                t_physics_min=float(getattr(args, "t_physics_min", 0.0)),
+                residual_t_power=float(getattr(args, "residual_t_power", 0.0)),
             )
 
             # NOTE: residual is now self-normalized inside cfm_loss_residual
@@ -1242,13 +1630,17 @@ def main(args):
                 # Compute a gradient vector per loss term (unweighted, matching your reference implementation).
                 # Note: weights still control participation (which losses are included).
                 params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
+                # When GradScaler is active, scale each loss so fp16 gradients
+                # don't underflow.  We unscale the combined vector after ConFIG.
+                _config_scale = scaler.get_scale() if scaler.is_enabled() else 1.0
                 for i, (_name, L, w) in enumerate(loss_items):
                     if float(w) <= 0.0:
                         continue
                     retain = (i != len(loss_items) - 1)
+                    L_scaled = L * _config_scale if _config_scale != 1.0 else L
 
                     g_list = torch.autograd.grad(
-                        outputs=L,
+                        outputs=L_scaled,
                         inputs=params,
                         retain_graph=retain,
                         create_graph=False,
@@ -1273,12 +1665,24 @@ def main(args):
                             ok = False
                             break
                     if ok:
-                        g_config = _ConFIG_update(grads)
+                        try:
+                            g_config = _ConFIG_update(grads)
+                        except Exception:
+                            g_config = None
+                        # Sanitize ConFIG output — the library can produce
+                        # NaN/Inf when gradient vectors are near-zero or
+                        # perfectly opposing.
+                        if g_config is not None and (not torch.isfinite(g_config).all()):
+                            g_config = None
 
                 if g_config is None:
                     g_step = grads[0] if len(grads) > 0 else None
                 else:
                     g_step = g_config
+
+                # Undo GradScaler scaling so the optimizer sees true magnitudes.
+                if g_step is not None and _config_scale != 1.0:
+                    g_step = g_step / _config_scale
 
                 if g_step is None:
                     # ultra fallback (shouldn't happen): do plain FM backward
@@ -1311,7 +1715,7 @@ def main(args):
                     if math.isfinite(gn):
                         running_grad_norm += gn
                         grad_norm_max_epoch = max(grad_norm_max_epoch, gn)
-                    opt.step()
+                    optimizer_step()
 
             else:
                 # Plain weighted sum (default / when ConFIG disabled)
@@ -1357,6 +1761,15 @@ def main(args):
                     pass
 
             update_ema(_unwrap_model(ema), _unwrap_model(model))
+
+            # Sample per-layer gradient norms periodically (every 50 steps)
+            if train_steps_epoch % 50 == 0 and is_rank0():
+                try:
+                    step_gnorms = _collect_layer_grad_norms(_unwrap_model(model))
+                    for k, v in step_gnorms.items():
+                        layer_grad_norms_accum[k].append(v)
+                except Exception:
+                    pass
 
             running_fm_loss += float(fm_loss.item())
             running_residual_loss += float(residual_loss.item())
@@ -1409,7 +1822,8 @@ def main(args):
                     lambda_um = cond[:, 0:1] * lam_std + lam_mean
 
                     x0_fields = torch.randn_like(fields_1)
-                    t = sample_t(fields_1)
+                    t = sample_t(fields_1, mode=args.t_sample_mode,
+                                  loc=args.t_sample_loc, scale=args.t_sample_scale)
                     x_t_fields = psi_t(x0_fields, fields_1, t)
                     v_t_fields = u_t(x0_fields, fields_1)
 
@@ -1446,13 +1860,16 @@ def main(args):
                         phys_gate=phys_gate,
                         phase_gate=phase_gate,
                         compute_residual=compute_residual_val,
+                        interface_thr=float(getattr(args, "interface_thr", 0.0)),
                         unroll_steps=int(getattr(args, "unroll_steps", 0)),
                         unroll_phase=bool(getattr(args, "unroll_phase", False)),
                         phase_amp_tau=float(getattr(args, "phase_amp_tau", 0.2)),
                         amp_enabled=amp_enabled,
                         amp_device_type=autocast_device_type,
-                        amp_dtype=torch.float16,
+                        amp_dtype=amp_dtype,
                         sparam_mode=str(getattr(args, "sparam_mode", "project")),
+                        t_physics_min=float(getattr(args, "t_physics_min", 0.0)),
+                        residual_t_power=float(getattr(args, "residual_t_power", 0.0)),
                     )
 
                     # residual is self-normalized inside cfm_loss_residual
@@ -1549,21 +1966,63 @@ def main(args):
                 val_phase_grad_loss = float(phg_t.item()) if (phase_grad_weight > 0.0) else 0.0
                 val_sparam_loss = float(sp_t.item()) if (sparam_weight > 0.0) else 0.0
 
-            # Sample eval (rank0 only)
+            # Sample eval (rank0 only) — per-device-type sampling
             sample_residual_mean = 0.0
             sample_gt_residual_mean = 0.0
             sample_amp_err_mean = 0.0
             sample_phase_err_mean = 0.0
+            sample_psnr_mean = 0.0
+            sample_metrics_per_device = {}  # {device_type: {metric: value}}
             if is_rank0():
                 residuals = []
                 gt_residuals = []
                 amp_errs = []
                 phase_errs = []
+                psnr_list = []
                 saved_any = False
                 saved_paths = []
+
+                # Build per-device-type index of val samples (lazy, once)
+                if not hasattr(val_ds, "_device_type_index"):
+                    dt_index = defaultdict(list)  # device_type -> [sample_idx, ...]
+                    for idx in range(len(val_ds)):
+                        try:
+                            _, _, aux_idx = val_ds[idx]
+                            dt = aux_idx.get("device_type", "") if isinstance(aux_idx, dict) else ""
+                            if not dt:
+                                dt = "unknown"
+                            dt_index[dt].append(idx)
+                        except Exception:
+                            pass
+                    val_ds._device_type_index = dict(dt_index)
+                    if dt_index:
+                        logger.info(f"[sample eval] Device-type index: {', '.join(f'{k}({len(v)})' for k, v in sorted(dt_index.items()))}")
+
+                dt_index = val_ds._device_type_index
+                n_per_device = max(1, int(args.sample_eval_limit) // max(len(dt_index), 1))
+
+                # Select samples: n_per_device from each device type (epoch-seeded)
+                sample_rng = np.random.default_rng(epoch * 137 + 7)
+                sample_indices = []  # (global_idx, device_type)
+                for dt_name in sorted(dt_index.keys()):
+                    dt_pool = dt_index[dt_name]
+                    n = min(n_per_device, len(dt_pool))
+                    chosen = sample_rng.choice(len(dt_pool), size=n, replace=False)
+                    for c in chosen:
+                        sample_indices.append((dt_pool[c], dt_name))
+
+                # Per-device accumulators
+                dev_residuals = defaultdict(list)
+                dev_gt_residuals = defaultdict(list)
+                dev_amp_errs = defaultdict(list)
+                dev_phase_errs = defaultdict(list)
+                dev_psnr = defaultdict(list)
+                dev_sparam_mag_errs = defaultdict(list)
+                dev_sparam_phase_errs = defaultdict(list)
+                ode_sparams_example = None  # S-param example from clean ODE-sampled fields
+
                 with torch.no_grad():
-                    n_samples = min(len(val_ds), int(args.sample_eval_limit))
-                    for s in range(n_samples):
+                    for s_idx, (s, dt_name) in enumerate(sample_indices):
                         x_full_s, cond_s, aux_s = val_ds[s]
                         x_full_s = x_full_s.unsqueeze(0).to(device, dtype=dtype)
                         cond_s = cond_s.unsqueeze(0).to(device, dtype=dtype)
@@ -1590,6 +2049,7 @@ def main(args):
                             phys_gate=1.0,
                             phase_gate=1.0,
                             sig_min=SIG_MIN,
+                            time_grid=getattr(args, "time_grid", "quadratic"),
                         )
                         x1_pred = torch.cat([x1_fields_pred, eps_s], dim=1)
                         x1_pred[:, 0] = x1_pred[:, 0] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
@@ -1604,24 +2064,55 @@ def main(args):
                         src_dilated = F.max_pool2d(src_s, kernel_size=5, stride=1, padding=2)
                         src_free_m = (src_dilated < 0.5).to(dtype=torch.float32)
 
-                        # Predicted field residual (source-masked)
+                        # Interface mask: exclude pixels where 5-point Laplacian stencil
+                        # spans a sharp eps discontinuity (same as training in flow_matching.py)
+                        eps_phys_for_iface = x1_pred[:, 2:3]
+                        interface_thr_val = float(getattr(args, "interface_thr", 0.0))
+                        if interface_thr_val > 0.0 and helmholtz_op is not None:
+                            grad_eps_x = helmholtz_op.diff.diff_x(eps_phys_for_iface)
+                            grad_eps_y = helmholtz_op.diff.diff_y(eps_phys_for_iface)
+                            grad_eps_mag = (grad_eps_x ** 2 + grad_eps_y ** 2).sqrt()
+                            interface_free = (grad_eps_mag < interface_thr_val).to(dtype=torch.float32)
+                            residual_mask = src_free_m * interface_free
+                        else:
+                            residual_mask = src_free_m
+
+                        # Predicted field residual (source + interface masked)
                         R = helmholtz_op(x1_pred[:, 0:2], x1_pred[:, 2:3], k0=k0)
                         R2 = (R[:, 0:1] ** 2 + R[:, 1:2] ** 2) * (dx ** 4)
-                        res_masked = (R2 * src_free_m).sum() / src_free_m.sum().clamp_min(1.0)
-                        residuals.append(float(res_masked.sqrt().item()))
+                        res_masked = (R2 * residual_mask).sum() / residual_mask.sum().clamp_min(1.0)
+                        res_val = float(res_masked.sqrt().item())
+                        residuals.append(res_val)
+                        dev_residuals[dt_name].append(res_val)
 
-                        # Ground truth residual (source-masked) - baseline reference
+                        # Ground truth residual (same masking) - baseline reference
                         ezr_gt_s = x_full_s[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
                         ezi_gt_s = x_full_s[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
                         gt_fields = torch.cat([ezr_gt_s, ezi_gt_s], dim=1)
                         R_gt = helmholtz_op(gt_fields, x1_pred[:, 2:3], k0=k0)
                         R2_gt = (R_gt[:, 0:1] ** 2 + R_gt[:, 1:2] ** 2) * (dx ** 4)
-                        res_gt_masked = (R2_gt * src_free_m).sum() / src_free_m.sum().clamp_min(1.0)
-                        gt_residuals.append(float(res_gt_masked.sqrt().item()))
+                        res_gt_masked = (R2_gt * residual_mask).sum() / residual_mask.sum().clamp_min(1.0)
+                        gt_res_val = float(res_gt_masked.sqrt().item())
+                        gt_residuals.append(gt_res_val)
+                        dev_gt_residuals[dt_name].append(gt_res_val)
 
                         # ezr_gt_s, ezi_gt_s already computed above for GT residual
                         mag_gt_s = torch.sqrt(ezr_gt_s ** 2 + ezi_gt_s ** 2 + 1e-12)
-                        mag_pred_s = torch.sqrt(x1_pred[:, 0:1] ** 2 + x1_pred[:, 1:2] ** 2 + 1e-12)
+
+                        # --- Global phase alignment before eval metrics ---
+                        # The model may predict fields with a global phase offset.
+                        # Align pred to GT via amplitude-weighted phase projection
+                        # (same method used in training endpoint loss).
+                        E_gt_eval = torch.complex(ezr_gt_s, ezi_gt_s)       # [B,1,H,W]
+                        E_pred_eval = torch.complex(x1_pred[:, 0:1], x1_pred[:, 1:2])  # [B,1,H,W]
+                        w_eval = (mag_gt_s ** 2).clamp_min(1e-12)            # amplitude^2 weight
+                        dot_eval = (w_eval * torch.conj(E_pred_eval) * E_gt_eval).sum(dim=(2, 3))  # [B,1]
+                        mag_dot = torch.abs(dot_eval).clamp_min(1e-8)
+                        rot_eval = dot_eval / mag_dot                        # unit phasor [B,1]
+                        E_pred_aligned = E_pred_eval * rot_eval.unsqueeze(-1).unsqueeze(-1)  # [B,1,H,W]
+                        x1_pred_aligned = torch.stack([E_pred_aligned.real, E_pred_aligned.imag], dim=1).squeeze(2)  # [B,2,H,W]
+
+                        mag_pred_s = torch.sqrt(x1_pred_aligned[:, 0:1] ** 2 + x1_pred_aligned[:, 1:2] ** 2 + 1e-12)
 
                         eps_phys_s = x1_pred[:, 2:3]
                         m = (eps_phys_s > float(args.eps_thr)).to(dtype=torch.float32)
@@ -1633,53 +2124,154 @@ def main(args):
                             m = torch.ones_like(m)
 
                         amp_err_map_s = torch.abs(mag_pred_s - mag_gt_s)
-                        amp_errs.append(float((amp_err_map_s * m).sum().item() / (m.sum().item() + 1e-12)))
+                        ae_val = float((amp_err_map_s * m).sum().item() / (m.sum().item() + 1e-12))
+                        amp_errs.append(ae_val)
+                        dev_amp_errs[dt_name].append(ae_val)
 
                         phase_gt_s = torch.atan2(ezi_gt_s, ezr_gt_s)
-                        phase_pred_s = torch.atan2(x1_pred[:, 1:2], x1_pred[:, 0:1])
+                        phase_pred_s = torch.atan2(x1_pred_aligned[:, 1:2], x1_pred_aligned[:, 0:1])
                         phase_err_s = torch.atan2(torch.sin(phase_pred_s - phase_gt_s), torch.cos(phase_pred_s - phase_gt_s))
                         # Amplitude-weighted phase error (consistent with training loss tau-gating)
                         amp_weight = mag_gt_s.clamp_min(1e-8)
-                        phase_errs.append(
-                            float((torch.abs(phase_err_s) * amp_weight * m).sum().item()
-                                  / ((amp_weight * m).sum().item() + 1e-12))
-                        )
+                        pe_val = float((torch.abs(phase_err_s) * amp_weight * m).sum().item()
+                                       / ((amp_weight * m).sum().item() + 1e-12))
+                        phase_errs.append(pe_val)
+                        dev_phase_errs[dt_name].append(pe_val)
 
-                        # Save a qualitative sample panel (rank0 only).
-                        # Default behavior: save on every eval epoch, for the first sample only.
+                        # PSNR on magnitude field (within device mask)
+                        mag_gt_np = (mag_gt_s * m)[0, 0].detach().float().cpu().numpy()
+                        mag_pred_np = (mag_pred_s * m)[0, 0].detach().float().cpu().numpy()
+                        psnr_val = _compute_psnr(mag_pred_np, mag_gt_np)
+                        psnr_list.append(psnr_val)
+                        dev_psnr[dt_name].append(psnr_val)
+
+                        # --- S-param extraction from clean ODE-sampled fields ---
+                        if (sparam_weight > 0.0) and isinstance(aux_s, dict):
+                            pm_s = aux_s.get("port_masks", None)
+                            st_s = aux_s.get("sparams_true", None)
+                            pv_s = aux_s.get("port_valid", None)
+                            ip_s = aux_s.get("in_port_idx", None)
+                            pid_s = aux_s.get("port_ids", None)
+                            if pm_s is not None and st_s is not None:
+                                # Move to device (aux_s comes raw from dataset)
+                                pm_dev = pm_s.unsqueeze(0).to(device, dtype=dtype) if pm_s.dim() == 3 else pm_s.to(device, dtype=dtype)
+                                st_dev = st_s.unsqueeze(0).to(device) if st_s.dim() == 1 else st_s.to(device)
+                                ip_dev = ip_s.to(device) if torch.is_tensor(ip_s) else ip_s
+                                pid_dev = pid_s.to(device) if torch.is_tensor(pid_s) else pid_s
+                                pv_1d = pv_s.detach() if torch.is_tensor(pv_s) else None
+
+                                # Build complex E from un-aligned predicted fields (alignment corrupts phase for S-params)
+                                E_ode = torch.complex(x1_pred[:, 0:1].squeeze(1), x1_pred[:, 1:2].squeeze(1))  # [B,H,W]
+                                S_pred_ode = extract_sparams(E_ode, pm_dev, in_port_idx=ip_dev, port_ids=pid_dev)
+
+                                # Per-port magnitude and phase errors (exclude input port, invalid ports)
+                                in_idx_val = _resolve_in_idx(ip_dev, port_ids=pid_dev)
+                                in_idx_int = int(in_idx_val) if not torch.is_tensor(in_idx_val) else int(in_idx_val.flatten()[0].item())
+                                S_true_1d = st_dev[0] if st_dev.dim() == 2 else st_dev
+                                S_pred_1d = S_pred_ode[0]
+                                pv_np = pv_1d.cpu().numpy() if pv_1d is not None else np.ones(S_true_1d.shape[0])
+                                for pi in range(min(len(S_true_1d), len(S_pred_1d))):
+                                    if pv_np[pi] < 0.5 or pi == in_idx_int:
+                                        continue
+                                    mag_err = abs(abs(S_pred_1d[pi].item()) - abs(S_true_1d[pi].item()))
+                                    # Phase error (wrap-safe)
+                                    dp = S_pred_1d[pi] * S_true_1d[pi].conj()
+                                    ph_err = abs(float(torch.angle(dp).item()))
+                                    dev_sparam_mag_errs[dt_name].append(mag_err)
+                                    dev_sparam_phase_errs[dt_name].append(ph_err)
+
+                                # Capture first example for logging
+                                if ode_sparams_example is None:
+                                    ode_sparams_example = (S_true_1d.detach().cpu(), S_pred_1d.detach().cpu(), pv_1d, ip_dev)
+
+                        # Save one qualitative sample panel per device type
                         save_eval_samples = bool(getattr(args, "save_eval_samples", True))
-                        save_limit = int(getattr(args, "save_eval_samples_limit", 1))
-                        if save_eval_samples and (s < max(0, save_limit)):
-                            # eps (phys) for display: prefer GT eps if available
-                            eps_gt_phys = x_full_s[:, 2:3]
-                            if args.normalize_eps:
-                                eps_gt_phys = eps_gt_phys * float(stats["eps_std"]) + float(stats["eps_mean"])
-                            eps_img = eps_gt_phys[0, 0].detach().float().cpu().numpy()
+                        if save_eval_samples and s_idx < len(sample_indices):
+                            # Only save first sample of each device type
+                            n_already_saved_this_dt = sum(1 for prev_i, (_, prev_dt) in enumerate(sample_indices[:s_idx]) if prev_dt == dt_name)
+                            if n_already_saved_this_dt == 0:
+                                # eps (phys) for display: prefer GT eps if available
+                                eps_gt_phys = x_full_s[:, 2:3]
+                                if args.normalize_eps:
+                                    eps_gt_phys = eps_gt_phys * float(stats["eps_std"]) + float(stats["eps_mean"])
+                                eps_img = eps_gt_phys[0, 0].detach().float().cpu().numpy()
 
-                            ezr_gt_img = ezr_gt_s[0, 0].detach().float().cpu().numpy()
-                            ezi_gt_img = ezi_gt_s[0, 0].detach().float().cpu().numpy()
-                            ezr_pred_img = x1_pred[:, 0:1][0, 0].detach().float().cpu().numpy()
-                            ezi_pred_img = x1_pred[:, 1:2][0, 0].detach().float().cpu().numpy()
+                                ezr_gt_img = ezr_gt_s[0, 0].detach().float().cpu().numpy()
+                                ezi_gt_img = ezi_gt_s[0, 0].detach().float().cpu().numpy()
+                                ezr_pred_img = x1_pred_aligned[:, 0:1][0, 0].detach().float().cpu().numpy()
+                                ezi_pred_img = x1_pred_aligned[:, 1:2][0, 0].detach().float().cpu().numpy()
 
-                            out_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_idx{s:03d}.png")
-                            title = f"epoch={epoch:04d} idx={s:03d}"
-                            _save_eval_sample_png(
-                                out_path=out_path,
-                                title=title,
-                                eps_phys=eps_img,
-                                ezr_gt=ezr_gt_img,
-                                ezi_gt=ezi_gt_img,
-                                ezr_pred=ezr_pred_img,
-                                ezi_pred=ezi_pred_img,
-                            )
-                            if os.path.isfile(out_path):
-                                saved_any = True
-                                saved_paths.append(out_path)
+                                out_path = os.path.join(samples_dir, f"sample_epoch_{epoch:04d}_{dt_name}.png")
+                                title = f"epoch={epoch:04d} [{dt_name}]"
+                                sample_metrics = {
+                                    "psnr": psnr_val,
+                                    "amp_err": ae_val,
+                                    "phase_err": pe_val,
+                                    "residual": res_val,
+                                    "gt_residual": gt_res_val,
+                                    "gap_dB": 10.0 * math.log10(max(res_val / max(gt_res_val, 1e-12), 1e-12)),
+                                }
+                                _save_enhanced_eval_sample_png(
+                                    out_path=out_path,
+                                    title=title,
+                                    eps_phys=eps_img,
+                                    ezr_gt=ezr_gt_img,
+                                    ezi_gt=ezi_gt_img,
+                                    ezr_pred=ezr_pred_img,
+                                    ezi_pred=ezi_pred_img,
+                                    metrics=sample_metrics,
+                                )
+                                if os.path.isfile(out_path):
+                                    saved_any = True
+                                    saved_paths.append(out_path)
 
                 sample_residual_mean = float(np.mean(residuals)) if residuals else 0.0
                 sample_gt_residual_mean = float(np.mean(gt_residuals)) if gt_residuals else 0.0
                 sample_amp_err_mean = float(np.mean(amp_errs)) if amp_errs else 0.0
                 sample_phase_err_mean = float(np.mean(phase_errs)) if phase_errs else 0.0
+                sample_psnr_mean = float(np.mean(psnr_list)) if psnr_list else 0.0
+
+                # Aggregate per-device metrics
+                for dt_name in sorted(dev_residuals.keys()):
+                    dr = dev_residuals[dt_name]
+                    dgr = dev_gt_residuals[dt_name]
+                    dae = dev_amp_errs[dt_name]
+                    dpe = dev_phase_errs[dt_name]
+                    dpsnr = dev_psnr.get(dt_name, [])
+                    dt_res = float(np.mean(dr))
+                    dt_gt_res = float(np.mean(dgr))
+                    dt_ratio = dt_res / max(dt_gt_res, 1e-12)
+                    dt_gap_dB = 10.0 * math.log10(max(dt_ratio, 1e-12))
+                    dt_metrics = {
+                        "residual": dt_res,
+                        "gt_residual": dt_gt_res,
+                        "ratio": dt_ratio,
+                        "gap_dB": dt_gap_dB,
+                        "amp_err": float(np.mean(dae)),
+                        "phase_err": float(np.mean(dpe)),
+                        "psnr": float(np.mean(dpsnr)) if dpsnr else 0.0,
+                        "n_samples": len(dr),
+                    }
+                    # Add ODE-sampled S-param metrics if available
+                    dsme = dev_sparam_mag_errs.get(dt_name, [])
+                    dspe = dev_sparam_phase_errs.get(dt_name, [])
+                    if dsme:
+                        dt_metrics["sparam_mag_err"] = float(np.mean(dsme))
+                        dt_metrics["sparam_phase_err_deg"] = float(np.degrees(np.mean(dspe)))
+                    sample_metrics_per_device[dt_name] = dt_metrics
+
+                # Save per-device bar chart dashboard and training curves
+                _save_device_bar_chart_png(
+                    out_path=os.path.join(samples_dir, f"dashboard_epoch_{epoch:04d}.png"),
+                    title=f"Validation Dashboard - Epoch {epoch}",
+                    metrics_per_device=sample_metrics_per_device,
+                    epoch=epoch,
+                )
+                _save_training_curves_png(
+                    out_path=os.path.join(samples_dir, f"training_curves_epoch_{epoch:04d}.png"),
+                    val_csv_path=val_csv_path,
+                    epoch=epoch,
+                )
 
             if is_rank0():
                 if sample_gt_residual_mean > 0.0:
@@ -1709,15 +2301,32 @@ def main(args):
                     f", residual_gap={sample_residual_gap_dB:+.1f}dB"
                     f", amp_err={sample_amp_err_mean:.4e}"
                     f", phase_err_w={sample_phase_err_mean:.4e}"
+                    f", psnr={sample_psnr_mean:.2f}dB"
                 )
+                # Per-device breakdown
+                if sample_metrics_per_device:
+                    msg += "\n             --- per-device ---"
+                    for dt_name, dt_m in sorted(sample_metrics_per_device.items()):
+                        line = (
+                            f"\n             {dt_name:>20s} (n={dt_m['n_samples']:d}): "
+                            f"res={dt_m['residual']:.4e}, gap={dt_m['gap_dB']:+.1f}dB, "
+                            f"amp_err={dt_m['amp_err']:.4e}, phase_err={dt_m['phase_err']:.4e}, "
+                            f"psnr={dt_m['psnr']:.2f}dB"
+                        )
+                        if "sparam_mag_err" in dt_m:
+                            line += f", |S|_err={dt_m['sparam_mag_err']:.4f}, S_ph_err={dt_m['sparam_phase_err_deg']:.1f}°"
+                        msg += line
                 logger.info(msg)
                 if saved_any:
                     logger.info(f"[epoch {epoch:04d}] Saved eval sample(s) to {samples_dir}")
 
-                if (sparam_weight > 0.0) and (sparams_example is not None):
-                    S_true_0, S_pred_0, pv0, ip0 = sparams_example
+                # Prefer ODE-sampled S-param example (clean fields) over noisy single-step estimate
+                _sparam_ex = ode_sparams_example if ode_sparams_example is not None else sparams_example
+                if (sparam_weight > 0.0) and (_sparam_ex is not None):
+                    S_true_0, S_pred_0, pv0, ip0 = _sparam_ex
+                    src_label = "ODE-sampled" if ode_sparams_example is not None else "single-step"
                     logger.info(
-                        f"[epoch {epoch:04d}] Sparams example (true->pred): "
+                        f"[epoch {epoch:04d}] Sparams ({src_label}) example (true->pred): "
                         f"{_format_sparams_compact(S_true_0, S_pred_0, port_valid_1d=pv0, in_port_idx=ip0)}"
                     )
 
@@ -1735,6 +2344,9 @@ def main(args):
                         sample_gt_residual_mean,
                         sample_residual_ratio_vs_gt,
                         sample_residual_gap_dB,
+                        sample_amp_err_mean,
+                        sample_phase_err_mean,
+                        sample_psnr_mean,
                     ])
 
                 if wandb_run is not None:
@@ -1748,6 +2360,7 @@ def main(args):
                         "val/sample_residual_gap_dB": sample_residual_gap_dB,
                         "val/sample_amp_err": sample_amp_err_mean,
                         "val/sample_phase_err_w": sample_phase_err_mean,
+                        "val/sample_psnr_mean": sample_psnr_mean,
                     }
                     if phase_weight > 0.0:
                         log_dict["val/phase_loss"] = val_phase_loss
@@ -1761,6 +2374,16 @@ def main(args):
                         log_dict["val/phase_grad_loss"] = val_phase_grad_loss
                     if sparam_weight > 0.0:
                         log_dict["val/sparam_loss"] = val_sparam_loss
+                    # Per-device metrics to wandb
+                    for dt_name, dt_m in sample_metrics_per_device.items():
+                        log_dict[f"val_device/{dt_name}/residual"] = dt_m["residual"]
+                        log_dict[f"val_device/{dt_name}/residual_gap_dB"] = dt_m["gap_dB"]
+                        log_dict[f"val_device/{dt_name}/amp_err"] = dt_m["amp_err"]
+                        log_dict[f"val_device/{dt_name}/phase_err"] = dt_m["phase_err"]
+                        log_dict[f"val_device/{dt_name}/psnr"] = dt_m["psnr"]
+                        if "sparam_mag_err" in dt_m:
+                            log_dict[f"val_device/{dt_name}/sparam_mag_err"] = dt_m["sparam_mag_err"]
+                            log_dict[f"val_device/{dt_name}/sparam_phase_err_deg"] = dt_m["sparam_phase_err_deg"]
                     # Upload eval sample images to wandb
                     if saved_paths:
                         try:
@@ -1770,6 +2393,14 @@ def main(args):
                             ]
                         except Exception:
                             pass
+                    # Upload dashboard and training curves plots
+                    for plot_name in ["dashboard", "training_curves"]:
+                        plot_path = os.path.join(samples_dir, f"{plot_name}_epoch_{epoch:04d}.png")
+                        if os.path.isfile(plot_path):
+                            try:
+                                log_dict[f"val/{plot_name}"] = wandb.Image(plot_path)
+                            except Exception:
+                                pass
                     wandb_run.log(log_dict, step=epoch)
 
         # -----------------------
@@ -2097,9 +2728,9 @@ def main(args):
                 msg += f" gnorm={running_grad_norm / max(train_steps_epoch, 1):.2f}/{grad_norm_max_epoch:.2f}"
                 msg += f" [{sec_per_epoch:.0f}s]"
                 # Only print weights when they change from previous epoch
-                cur_weights = (residual_weight, phase_weight, phase_grad_weight, sparam_weight)
+                cur_weights = (residual_weight, phase_weight, phase_grad_weight, sparam_weight, endpoint_weight)
                 if cur_weights != _prev_weights:
-                    msg += f"\n  [weights] res={residual_weight:.3g} ph={phase_weight:.3g} phg={phase_grad_weight:.3g} sp={sparam_weight:.3g}"
+                    msg += f"\n  [weights] res={residual_weight:.3g} ph={phase_weight:.3g} phg={phase_grad_weight:.3g} sp={sparam_weight:.3g} end={endpoint_weight:.3g}"
                     _prev_weights = cur_weights
                 logger.info(msg)
 
@@ -2139,6 +2770,23 @@ def main(args):
 
                 wandb_run.log(wandb_log_dict, step=epoch)
 
+            # Gradient health plot (rank0 only, during eval epochs)
+            if is_rank0() and layer_grad_norms_accum and epoch % int(args.eval_every) == 0:
+                # Average accumulated per-layer norms across the epoch
+                layer_grad_norms = {k: float(np.mean(v)) for k, v in layer_grad_norms_accum.items()}
+                grad_health_path = os.path.join(samples_dir, f"grad_health_epoch_{epoch:04d}.png")
+                _save_gradient_health_png(
+                    out_path=grad_health_path,
+                    title=f"Gradient Health - Epoch {epoch}",
+                    layer_grad_norms=layer_grad_norms,
+                    epoch=epoch,
+                )
+                if wandb_run is not None and os.path.isfile(grad_health_path):
+                    try:
+                        wandb_run.log({"train/grad_health": wandb.Image(grad_health_path)}, step=epoch)
+                    except Exception:
+                        pass
+
             start_time = time()
             running_fm_loss = 0.0
             running_residual_loss = 0.0
@@ -2150,6 +2798,7 @@ def main(args):
             running_geom_loss = 0.0
             running_grad_norm = 0.0
             grad_norm_max_epoch = 0.0
+            layer_grad_norms_accum = defaultdict(list)
             train_steps_epoch = 0
             phase_grad_steps_epoch = 0
             sparam_steps_epoch = 0
@@ -2192,6 +2841,8 @@ if __name__ == "__main__":
     parser.add_argument("--shard-index-name", type=str, default="index.json")
     parser.add_argument("--include-sweeps", type=str, default="directional_coupler_sweep",
                         help="Comma-separated sweep subdirectory names to include (empty = all)")
+    parser.add_argument("--exclude-devices", type=str, default="",
+                        help="Comma-separated device types to exclude (e.g. 'straight,mmi')")
     parser.add_argument("--use-index-split", type=bool, default=False, action=argparse.BooleanOptionalAction,
                         help="Use pre-computed split field from index.json (unified_sweep format)")
     parser.add_argument("--use-fast-dataset", type=bool, default=False, action=argparse.BooleanOptionalAction,
@@ -2219,8 +2870,11 @@ if __name__ == "__main__":
     parser.add_argument("--crop-pml", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--pml-cells", type=int, default=0)
 
+    parser.add_argument("--canvas-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
+                        help="Center-pad all samples to (H, W) for mixed-domain datasets, e.g. --canvas-hw 320 480")
+
     parser.add_argument("--augment", type=bool, default=True, action=argparse.BooleanOptionalAction,
-                        help="Enable D4 augmentation during training (8x effective data)")
+                        help="Enable D4/D2 augmentation during training (D2 for rectangular canvas)")
 
     parser.add_argument("--include-sdf", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--normalize-sdf", type=bool, default=True, action=argparse.BooleanOptionalAction)
@@ -2230,7 +2884,12 @@ if __name__ == "__main__":
     parser.add_argument("--sdf-sigma-nm", type=float, default=100.0)
 
     parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--num-res-blocks", type=int, default=2, help="Residual blocks per UNet level")
+    parser.add_argument("--channel-mult", type=str, default="1,2,4,8", help="Channel multipliers per level (comma-separated)")
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--attn-resolutions", type=str, default="8", help="Attention at these downsample factors (comma-separated, empty=none)")
     parser.add_argument("--no-attention", action="store_true", help="Disable attention layers to reduce memory")
+    parser.add_argument("--model-dropout", type=float, default=0.0, help="Dropout rate in residual blocks")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--warmup-start-factor", type=float, default=0.1)
@@ -2248,6 +2907,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--use-stoc-samp", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--amp", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"],
+                        help="AMP dtype: float16 (needs GradScaler) or bfloat16 (no scaler, more stable)")
     parser.add_argument("--detect-anomaly", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--use-checkpoint", type=bool, default=False, action=argparse.BooleanOptionalAction)
 
@@ -2264,6 +2925,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--lambda-endpoint", type=float, default=0.0)
     parser.add_argument("--endpoint-warmup-epochs", type=int, default=0)
+    parser.add_argument("--endpoint-start-phase", type=str, default="B", choices=["A", "B", "C"])
 
     parser.add_argument("--lambda-phase-grad", type=float, default=0.0)
     parser.add_argument("--phase-grad-warmup-epochs", type=int, default=100)
@@ -2323,6 +2985,28 @@ if __name__ == "__main__":
                         help="ODE integration steps for inverse eval")
 
     parser.add_argument("--resume-from", type=str, default="")
+    parser.add_argument("--reset-lr-on-resume", action="store_true", default=False,
+                        help="Reset LR schedule to fresh cosine from --lr on resume")
+    parser.add_argument("--t-physics-min", type=float, default=0.0,
+                        help="Min t for physics losses (residual/phase/sparam). FM always at all t.")
+
+    # Time sampling distribution
+    parser.add_argument("--t-sample-mode", dest="t_sample_mode", type=str, default="uniform",
+                        choices=["uniform", "logit_normal", "mixture"],
+                        help="Time sampling distribution for FM training.")
+    parser.add_argument("--t-sample-loc", dest="t_sample_loc", type=float, default=0.0,
+                        help="Location param for logit-normal time sampling (logit-space mean).")
+    parser.add_argument("--t-sample-scale", dest="t_sample_scale", type=float, default=1.0,
+                        help="Scale param for logit-normal time sampling (logit-space std).")
+
+    # Residual t-power weighting
+    parser.add_argument("--residual-t-power", dest="residual_t_power", type=float, default=0.0,
+                        help="If >0, weight per-sample residual loss by t^p (upweights clean high-t reconstructions).")
+
+    # ODE sampler time grid
+    parser.add_argument("--time-grid", dest="time_grid", type=str, default="quadratic",
+                        choices=["quadratic", "linear"],
+                        help="ODE sampler time grid: 'quadratic' (more steps near t=0) or 'linear' (uniform).")
 
     parser.add_argument("--use-wandb", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--wandb-project", type=str, default="Rayfield")
@@ -2336,6 +3020,10 @@ if __name__ == "__main__":
     parser.add_argument("--w-min", type=float, default=0.1)
     parser.add_argument("--eps-thr", type=float, default=3.0)
     parser.add_argument("--dilate", type=int, default=9)
+    parser.add_argument("--interface-thr", type=float, default=0.0,
+                        help="Exclude pixels with |grad(eps)| > thr from Helmholtz residual "
+                             "(removes dielectric interface artifacts). 0 = disabled. "
+                             "Recommended: 1.0 for physical-unit eps.")
 
     parser.add_argument("--val-batches", type=int, default=16)
 

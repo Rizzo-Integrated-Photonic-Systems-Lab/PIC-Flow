@@ -74,9 +74,9 @@ class DirectionalCoupler2D(Device2DBase):
         resolution: int = 20,
         n_core: float | None = None,
         n_clad: float = 1.444,
-        dpml: float = 2.0 / 3.0,
-        crop_x_px: int = 640,          # target NON-PML crop in X (propagation) pixels
-        crop_y_px: int = 128,          # target NON-PML crop in Y (transverse) pixels
+        dpml: float = 5.0 / 7.0,
+        crop_x_px: int = 336,          # target NON-PML crop in X (propagation) pixels
+        crop_y_px: int = 112,          # target NON-PML crop in Y (transverse) pixels
         crop_px: int | None = None,    # deprecated: if set, overrides both crop_x_px and crop_y_px
         quantize_grid: bool = True,
         pad_y_um: float = 1.0,         # conceptual padding (not used directly in geometry)

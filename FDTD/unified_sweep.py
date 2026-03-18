@@ -2,11 +2,12 @@
 """
 Unified multi-device sweep for photonic dataset generation.
 
-Generates training data for: straight waveguides, tapers, S-bends,
-Y-branches, and directional couplers.
+Generates training data for 9 device types:
+  Rectangular domain (480x160 px): straight, taper, sbend, ybranch, directional_coupler, mmi
+  Square domain (320x320 px): euler_bend, circular_bend, crossing
 
-Each geometry is run at 4 fixed wavelengths. For multi-input devices, one input port
-is randomly selected per geometry and used for all 4 wavelengths.
+Each geometry is run at 5 fixed wavelengths (1.48-1.62 µm, C-band).
+For multi-input devices, one input port is randomly selected per geometry.
 
 Split: 80/10/10 by geometry_id (no leakage across wavelengths).
 """
@@ -29,10 +30,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from straight_waveguide.straight import StraightWaveguide2D
-from taper.taper import TaperWaveguide2D
+from mmi.mmi import MMI2x2
 from sbend.sbend import EulerSBend2D
 from ybranch.ybranch import YBranch2D
 from directional_coupler.directional_coupler import DirectionalCoupler2D
+from taper.taper import TaperWaveguide2D
+from euler_bend.euler_bend import EulerBend2D
+from circular_bend.circular_bend import CircularBend2D
+from crossing.crossing import UniformCrossing2D
 
 from sweep_utils import latin_hypercube, quantize_01, assign_splits
 
@@ -127,7 +132,7 @@ def get_device_masks(dev, device_type: str, input_port: int,
     """
 
     # Device types with get_source_region_px / get_port_region_px methods
-    if device_type == "directional_coupler":
+    if device_type in ["directional_coupler", "mmi"]:
         # Has 4 ports, uses crop_pml=True methods
         src_px = dev.get_source_region_px(input_port=input_port, crop_pml=True)
         src_mask = _draw_thick_line_mask(
@@ -177,38 +182,71 @@ def get_device_masks(dev, device_type: str, input_port: int,
 
         return src_mask, port_ids, port_masks
 
+    elif device_type == "crossing":
+        # 4-port device with port_1..port_4 and src_vol_1..src_vol_4
+        src_vols = {1: dev.src_vol_1, 2: dev.src_vol_2, 3: dev.src_vol_3, 4: dev.src_vol_4}
+        src_vol = src_vols[int(input_port)]
+        src_line = _volume_to_line_px(src_vol, cell_x, cell_y, dpml, resolution)
+        src_mask = _draw_thick_line_mask(
+            ny, nx,
+            src_line["line_start_px"][0], src_line["line_start_px"][1],
+            src_line["line_end_px"][0], src_line["line_end_px"][1],
+            thickness_px=thickness_px,
+        )
+
+        port_ids = np.array([1, 2, 3, 4], dtype=np.int32)
+        port_vols = {1: dev.port_1, 2: dev.port_2, 3: dev.port_3, 4: dev.port_4}
+        port_masks = []
+        for p in port_ids.tolist():
+            pr = _volume_to_line_px(port_vols[p], cell_x, cell_y, dpml, resolution)
+            pm = _draw_thick_line_mask(
+                ny, nx,
+                pr["line_start_px"][0], pr["line_start_px"][1],
+                pr["line_end_px"][0], pr["line_end_px"][1],
+                thickness_px=thickness_px,
+            )
+            port_masks.append(pm)
+        port_masks = np.stack(port_masks, axis=0).astype(np.float32)
+
+        return src_mask, port_ids, port_masks
+
     else:
-        # 2-port devices: straight, taper, sbend
-        # These have port_in, port_out, src_vol attributes
+        # 2-port devices: straight, taper, sbend, euler_bend, circular_bend
+        # These have port_in, port_out attributes
         # Source is offset from port by source_shift (typically 0.5 um)
+        # Direction of shift is away from device center, along port normal
 
         source_shift = getattr(dev, 'source_shift', 0.5)  # Default 0.5 um
 
         if int(input_port) == 1:
-            # Source near port_in, shifted inward (toward +x for left port)
             port_vol = dev.port_in
-            # Source is upstream of port (further left for left-side port)
-            src_cx = float(port_vol.center.x) - source_shift
-            src_cy = float(port_vol.center.y)
         else:
-            # Source near port_out, shifted inward (toward -x for right port)
             port_vol = dev.port_out
-            # Source is upstream of port (further right for right-side port)
-            src_cx = float(port_vol.center.x) + source_shift
-            src_cy = float(port_vol.center.y)
 
-        # Create source line in pixel coordinates
-        src_half_span = float(port_vol.size.y) / 2.0 if port_vol.size.y > 0 else float(port_vol.size.x) / 2.0
-        if port_vol.size.y > port_vol.size.x:
-            # Vertical line source
+        pcx = float(port_vol.center.x)
+        pcy = float(port_vol.center.y)
+        psx = float(port_vol.size.x)
+        psy = float(port_vol.size.y)
+
+        if psy >= psx:
+            # Vertical line → port is on left/right edge → shift along x
+            # Shift away from center (upstream of port)
+            sign = -1.0 if pcx < 0 else +1.0
+            src_cx = pcx + sign * source_shift
+            src_cy = pcy
+            src_half_span = psy / 2.0
+            src_x0 = src_x1 = src_cx
             src_y0 = src_cy - src_half_span
             src_y1 = src_cy + src_half_span
-            src_x0 = src_x1 = src_cx
         else:
-            # Horizontal line source
+            # Horizontal line → port is on top/bottom edge → shift along y
+            sign = -1.0 if pcy < 0 else +1.0
+            src_cx = pcx
+            src_cy = pcy + sign * source_shift
+            src_half_span = psx / 2.0
+            src_y0 = src_y1 = src_cy
             src_x0 = src_cx - src_half_span
             src_x1 = src_cx + src_half_span
-            src_y0 = src_y1 = src_cy
 
         # Convert to cropped pixel coordinates
         src_px_x0 = _meep_coord_to_cropped_px(src_x0, cell_x, dpml, resolution)
@@ -216,14 +254,10 @@ def get_device_masks(dev, device_type: str, input_port: int,
         src_px_y0 = _meep_coord_to_cropped_px(src_y0, cell_y, dpml, resolution)
         src_px_y1 = _meep_coord_to_cropped_px(src_y1, cell_y, dpml, resolution)
 
-        src_line = {
-            "line_start_px": (src_px_x0, src_px_y0),
-            "line_end_px": (src_px_x1, src_px_y1),
-        }
         src_mask = _draw_thick_line_mask(
             ny, nx,
-            src_line["line_start_px"][0], src_line["line_start_px"][1],
-            src_line["line_end_px"][0], src_line["line_end_px"][1],
+            src_px_x0, src_px_y0,
+            src_px_x1, src_px_y1,
             thickness_px=thickness_px,
         )
 
@@ -337,69 +371,115 @@ def augment_sample(data: Dict[str, np.ndarray], flip_h: bool, rot_k: int) -> Dic
 
 
 # =============================================================================
+# Domain Configuration
+# =============================================================================
+DOMAIN_RECTANGULAR = "rectangular"
+DOMAIN_SQUARE = "square"
+DEVICE_DOMAIN = {
+    "straight": DOMAIN_RECTANGULAR,
+    "taper": DOMAIN_RECTANGULAR,
+    "sbend": DOMAIN_RECTANGULAR,
+    "ybranch": DOMAIN_RECTANGULAR,
+    "directional_coupler": DOMAIN_RECTANGULAR,
+    "mmi": DOMAIN_RECTANGULAR,
+    "euler_bend": DOMAIN_RECTANGULAR,
+    "circular_bend": DOMAIN_RECTANGULAR,
+    "crossing": DOMAIN_RECTANGULAR,
+}
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
-WAVELENGTHS = [1.45, 1.50, 1.55, 1.60]
+WAVELENGTHS = [1.48, 1.53, 1.58, 1.62]
 
-# Default counts for 10,000 total geometries (5 elongated devices only).
-# Allocation weighted by parameter-space dimensionality.
+# Default counts for ~14,300 total geometries (9 device types).
+# Allocation weighted by parameter-space dimensionality and physics complexity.
 DEFAULT_COUNTS = {
-    "straight": 1000,            # 2D param space
-    "taper": 1500,               # 3D param space
-    "sbend": 1500,               # 3D param space
-    "ybranch": 2500,             # 5D param space
-    "directional_coupler": 3500, # 5D param space
+    "straight": 200,              # 2D param space (baseline only)
+    "taper": 800,                 # 3D param space
+    "mmi": 2500,                  # 5D param space (rich multimode interference)
+    "sbend": 800,                 # 3D param space
+    "ybranch": 1500,              # 5D param space
+    "directional_coupler": 2500,  # 5D param space
+    "euler_bend": 1500,           # 2D param space (square domain, D4)
+    "circular_bend": 1500,        # 2D param space (square domain, D4)
+    "crossing": 3000,             # 2D param space (4-port, square domain)
 }
 
-# Parameter ranges per device (5 elongated device types only).
+# Parameter ranges per device (9 device types).
 # All values should be multiples of 1/(2*resolution) for pixel-grid alignment.
-# At resolution=18: quantum = 1/36 ≈ 0.02778 µm.
-# Ranges tuned for 192×512 interior at res=18 (10.67 × 28.44 µm).
+# At resolution=20: quantum = 1/40 = 0.025 µm.
+# Rectangular domain: 480×160 interior at res=20 (24.0 × 8.0 µm).
+# Square domain: 320×320 interior at res=20 (16.0 × 16.0 µm).
 PARAM_RANGES = {
     "straight": {
-        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36  (8 values)
-        "dev_length_um": (6.0, 22.0),       # plenty of X room
+        "wg_width_um": (0.40, 0.575),       # 8/20 – 11.5/20 (≥8 px per wg width)
+        "dev_length_um": (6.0, 18.0),        # fit in 24 µm X
     },
     "taper": {
-        "wg_width_in_um": (0.3889, 0.5833), # 14/36 – 21/36
-        "wg_width_out_um": (0.6111, 2.5),   # 22/36 – 90/36
-        "taper_length_um": (6.0, 20.0),     # more X room at res 18
+        "wg_width_in": (0.40, 0.575),        # narrow end
+        "wg_width_out": (0.60, 2.0),         # wide end
+        "taper_length_um": (3.0, 15.0),      # fit in 24 µm X
+    },
+    "mmi": {
+        "wg_width_um":    (0.40, 0.575),     # 8/20 – 11.5/20
+        "mmi_width_um":   (2.5, 5.5),        # fit in 8 µm Y
+        "mmi_length_um":  (8.0, 15.0),       # fit in 24 µm X
+        "taper_width_um": (0.575, 1.5),      # 11.5/20 – 1.5
+        "taper_length_um":(1.0, 3.0),        # taper length per side
     },
     "sbend": {
-        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36
-        "lateral_offset_um": (2.0, 7.0),    # was 6.0; more Y room at res 18
-        "R_min_um": (3.0, 8.0),
+        "wg_width_um": (0.40, 0.575),        # 8/20 – 11.5/20
+        "lateral_offset_um": (2.0, 5.5),     # fit in 8 µm Y
+        "R_min_um": (3.0, 7.0),              # reduce X extent
     },
     "ybranch": {
-        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36
-        "l_junction_um": (1.1667, 3.1667),  # 42/36 – 114/36
+        "wg_width_um": (0.40, 0.575),        # 8/20 – 11.5/20
+        "l_junction_um": (1.0, 3.0),
         "l_bend_um": (4.0, 7.0),
-        "h_bend_um": (0.5556, 3.0),         # 20/36 – 108/36; was 2.8, more Y room
-        "l_out_um": (1.0, 6.0),
+        "h_bend_um": (0.575, 2.5),           # fit in 8 µm Y
+        "l_out_um": (1.0, 4.0),              # fit in 24 µm X
     },
     "directional_coupler": {
-        "wg_width_um": (0.3889, 0.5833),   # 14/36 – 21/36
-        "gap_um": (0.1111, 0.3333),         # 4/36 – 12/36  (9 values)
-        "wg_length_um": (5.0, 12.0),        # was 9.0; more X room at res 18
+        "wg_width_um": (0.40, 0.575),        # 8/20 – 11.5/20
+        "gap_um": (0.10, 0.35),              # 2/20 – 7/20 (≥2 px across gap)
+        "wg_length_um": (5.0, 8.0),          # fit in 24 µm X
         "bend_length_um": (4.0, 6.0),
-        "lead_extra_gap_um": (0.8056, 2.5), # 29/36 – 90/36
+        "lead_extra_gap_um": (0.825, 2.0),   # fit in 8 µm Y
+    },
+    "euler_bend": {
+        "wg_width": (0.40, 0.575),           # 8/20 – 11.5/20
+        "R_min_um": (2.0, 3.5),              # fit in 8 µm rect height
+    },
+    "circular_bend": {
+        "wg_width": (0.40, 0.575),           # 8/20 – 11.5/20
+        "bend_radius_um": (2.0, 3.5),        # fit in 8 µm rect height
+    },
+    "crossing": {
+        "wg_width_h": (0.40, 0.575),         # horizontal WG width
+        "wg_width_v": (0.40, 0.575),         # vertical WG width
     },
 }
 
-# Number of input ports per device type (5 elongated devices only)
+# Number of input ports per device type (9 device types)
 INPUT_PORTS = {
     "straight": [1, 2],
     "taper": [1, 2],
+    "mmi": [1, 2],
     "sbend": [1, 2],
-    "ybranch": [1, 2, 3],  # Port 1 = splitter, Ports 2/3 = combiner
-    "directional_coupler": [1, 2],  # Symmetric, use 1 or 2
+    "ybranch": [1, 2, 3],              # Port 1 = splitter, Ports 2/3 = combiner
+    "directional_coupler": [1, 2],     # Symmetric, use 1 or 2
+    "euler_bend": [1, 2],
+    "circular_bend": [1, 2],
+    "crossing": [1, 2, 3, 4],          # 4-port device
 }
 
 
 # =============================================================================
 # Sampling utilities
 # =============================================================================
-def sample_params(device_type: str, n_geo: int, seed: int, resolution: int = 18) -> List[Dict[str, float]]:
+def sample_params(device_type: str, n_geo: int, seed: int, resolution: int = 14) -> List[Dict[str, float]]:
     """Sample parameters for a device type using Latin Hypercube Sampling.
 
     Values are quantized to the half-pixel grid (1/(2*resolution)) so that
@@ -430,8 +510,16 @@ def sample_params(device_type: str, n_geo: int, seed: int, resolution: int = 18)
     return params_list
 
 
-def make_geom_id(device_type: str) -> str:
-    """Generate a unique geometry ID."""
+def make_geom_id(device_type: str, seed: Optional[int] = None) -> str:
+    """Generate a unique geometry ID.
+
+    If seed is provided, produces a deterministic ID (needed for resume support).
+    Otherwise falls back to random UUID.
+    """
+    if seed is not None:
+        import hashlib
+        h = hashlib.sha256(f"{device_type}_{seed}".encode()).hexdigest()[:12]
+        return f"{device_type}_{h}"
     return f"{device_type}_{uuid.uuid4().hex[:12]}"
 
 
@@ -458,14 +546,18 @@ def build_device(device_type: str, params: Dict[str, float], wavelength_um: floa
             **common_kwargs,
         )
 
-    elif device_type == "taper":
-        return TaperWaveguide2D(
-            wg_width_in=params["wg_width_in_um"],
-            wg_width_out=params["wg_width_out_um"],
+    elif device_type == "mmi":
+        return MMI2x2(
+            wg_width_um=params["wg_width_um"],
+            mmi_width_um=params["mmi_width_um"],
+            mmi_length_um=params["mmi_length_um"],
+            taper_width_um=params["taper_width_um"],
             taper_length_um=params["taper_length_um"],
             dpml=dpml,
-            cell_x=cell_x,
-            cell_y=cell_y,
+            crop_x_px=crop_x_px,
+            crop_y_px=crop_y_px,
+            quantize_grid=True,
+            fit_margin_um=0.5,
             **common_kwargs,
         )
 
@@ -510,6 +602,49 @@ def build_device(device_type: str, params: Dict[str, float], wavelength_um: floa
             **common_kwargs,
         )
 
+    elif device_type == "taper":
+        return TaperWaveguide2D(
+            wg_width_in=params["wg_width_in"],
+            wg_width_out=params["wg_width_out"],
+            taper_length_um=params["taper_length_um"],
+            dpml=dpml,
+            cell_x=cell_x,
+            cell_y=cell_y,
+            **common_kwargs,
+        )
+
+    elif device_type == "euler_bend":
+        return EulerBend2D(
+            wg_width=params["wg_width"],
+            R_min_um=params["R_min_um"],
+            bend_angle_deg=90.0,
+            dpml=dpml,
+            cell_x=cell_x,
+            cell_y=cell_y,
+            **common_kwargs,
+        )
+
+    elif device_type == "circular_bend":
+        return CircularBend2D(
+            wg_width=params["wg_width"],
+            bend_radius_um=params["bend_radius_um"],
+            bend_angle_deg=90.0,
+            dpml=dpml,
+            cell_x=cell_x,
+            cell_y=cell_y,
+            **common_kwargs,
+        )
+
+    elif device_type == "crossing":
+        return UniformCrossing2D(
+            wg_width_h=params["wg_width_h"],
+            wg_width_v=params["wg_width_v"],
+            dpml=dpml,
+            cell_x=cell_x,
+            cell_y=cell_y,
+            **common_kwargs,
+        )
+
     else:
         raise ValueError(f"Unknown device type: {device_type}")
 
@@ -525,8 +660,8 @@ def run_sim_and_extract(dev, device_type: str, input_port: int, decay_tol: float
     import meep as meep_mp
     from utils import get_mode_alpha_2dir, pick_in_out_from_alpha
 
-    if device_type in ["straight", "taper", "sbend"]:
-        # 2-port devices
+    if device_type in ["straight", "sbend", "taper", "euler_bend", "circular_bend"]:
+        # 2-port devices using _build_sim_single
         toward = {1: +1, 2: -1}
         sim, (m1, m2), dft, _fcen = dev._build_sim_single(input_port=int(input_port), df_frac=0.1)
         sim.run(until_after_sources=meep_mp.stop_when_dft_decayed(tol=float(decay_tol)))
@@ -548,6 +683,11 @@ def run_sim_and_extract(dev, device_type: str, input_port: int, decay_tol: float
         sim.reset_meep()
         return eps, Ez, S, (dev.cell_x, dev.cell_y)
 
+    elif device_type == "crossing":
+        # 4-port device — call run_sim directly (already returns correct format)
+        eps, Ez, S, cell_size = dev.run_sim(input_port=input_port, decay_tol=decay_tol)
+        return eps, Ez, S, cell_size
+
     elif device_type == "ybranch":
         # 3-port device: port 1 = splitter, ports 2/3 = combiner
         eps, Ez, _Hx, _Hy, S_raw, cell_size = dev.run_sim(input_port=input_port, decay_tol=decay_tol)
@@ -556,7 +696,7 @@ def run_sim_and_extract(dev, device_type: str, input_port: int, decay_tol: float
             S[f"S{p}{input_port}"] = S_raw[(p, input_port)]
         return eps, Ez, S, cell_size
 
-    elif device_type == "directional_coupler":
+    elif device_type in ["directional_coupler", "mmi"]:
         # 4-port device
         eps, Ez, _Hx, _Hy, S_raw, cell_size = dev.run_sim(input_port=input_port, decay_tol=decay_tol)
         S = {}
@@ -600,6 +740,18 @@ def worker(task: Tuple) -> Tuple[str, Any]:
             interior_y = cell_size[1]
 
         ny, nx = eps.shape
+
+        # Quality checks
+        if np.any(np.isnan(Ez)) or np.any(np.isinf(Ez)):
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: NaN/Inf in Ez field")
+        if np.any(np.isnan(eps)) or np.any(np.isinf(eps)):
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: NaN/Inf in epsilon")
+        ez_max = float(np.max(np.abs(Ez)))
+        if ez_max < 1e-6:
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: near-zero field (|Ez|_max={ez_max:.2e})")
+        sparam_power = sum(abs(v)**2 for v in S.values())
+        if sparam_power > 1.5:
+            print(f"[QC WARNING] {geom_id}_{wavelength_um:.4f}: S-param power={sparam_power:.3f} > 1.0")
 
         # Generate source and port masks (using cropped interior coordinates)
         src_mask, port_ids, port_masks = get_device_masks(
@@ -654,11 +806,13 @@ def worker(task: Tuple) -> Tuple[str, Any]:
 # =============================================================================
 def shard_writer_process(q: mp.Queue, shards_dir: str, shard_size: int,
                          compress: bool, index_every_shard: bool,
-                         augment: bool = True, rect_grid: bool = False):
+                         augment: bool = True, resume: bool = False):
     """
     Background process that consolidates temp files into shards.
 
     If augment=True, applies D4 (8×) for square grids or D2 (4×) for rectangular grids.
+    Domain shape is detected per-sample from nx vs ny.
+    If resume=True, loads existing index and continues shard numbering.
     """
     shards_path = Path(shards_dir)
     shards_path.mkdir(parents=True, exist_ok=True)
@@ -666,9 +820,24 @@ def shard_writer_process(q: mp.Queue, shards_dir: str, shard_size: int,
     index: List[Dict[str, Any]] = []
     index_path = shards_path / "index.json"
 
+    # Resume: load existing index and find next shard ID
+    shard_id = 0
+    if resume and index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        # Find max shard ID from existing entries
+        for entry in index:
+            sname = entry.get("shard", "")
+            # Parse shard_XXXXX.npz
+            try:
+                sid = int(sname.replace("shard_", "").replace(".npz", ""))
+                shard_id = max(shard_id, sid + 1)
+            except (ValueError, AttributeError):
+                pass
+        print(f"[shard_writer] Resume: loaded {len(index)} existing entries, next shard_id={shard_id}")
+
     # Buffer holds (data_dict, meta_dict) tuples ready for writing
     buffer: List[Tuple[Dict[str, np.ndarray], Dict[str, Any]]] = []
-    shard_id = 0
 
     def write_shard():
         nonlocal shard_id, buffer, index
@@ -733,7 +902,11 @@ def shard_writer_process(q: mp.Queue, shards_dir: str, shard_size: int,
                 data = {key: f[key] for key in f.files}
 
             # Apply augmentations (or just original if augment=False)
-            if augment and rect_grid:
+            # Detect domain shape per-sample: square grids get D4, rectangular get D2
+            sample_nx = int(data["nx"])
+            sample_ny = int(data["ny"])
+            is_rect = sample_nx != sample_ny
+            if augment and is_rect:
                 transforms_to_apply = list(zip(AUGMENT_TRANSFORMS_D2, AUGMENT_NAMES_D2))
             elif augment:
                 transforms_to_apply = list(zip(AUGMENT_TRANSFORMS_D4, AUGMENT_NAMES_D4))
@@ -785,23 +958,29 @@ def main():
                         help="Output directory (default: <repo>/Data/unified_sweep)")
 
     # Geometry counts (can scale all at once or individually)
-    parser.add_argument("--n-geo", type=int, default=10000,
-                        help="Total unique geometries (default: 10000)")
+    parser.add_argument("--n-geo", type=int, default=14300,
+                        help="Total unique geometries (default: 14300)")
     parser.add_argument("--n-straight", type=int, default=None)
     parser.add_argument("--n-taper", type=int, default=None)
+    parser.add_argument("--n-mmi", type=int, default=None)
     parser.add_argument("--n-sbend", type=int, default=None)
     parser.add_argument("--n-ybranch", type=int, default=None)
     parser.add_argument("--n-directional-coupler", type=int, default=None)
+    parser.add_argument("--n-euler-bend", type=int, default=None)
+    parser.add_argument("--n-circular-bend", type=int, default=None)
+    parser.add_argument("--n-crossing", type=int, default=None)
 
     # Simulation params
-    parser.add_argument("--resolution", type=int, default=18,
+    parser.add_argument("--resolution", type=int, default=20,
                         help="Simulation resolution (pixels/µm)")
-    parser.add_argument("--dpml", type=float, default=2.0/3.0,
+    parser.add_argument("--dpml", type=float, default=1.0,
                         help="PML thickness (µm)")
-    parser.add_argument("--crop-x-px", type=int, default=512,
-                        help="Non-PML interior width in pixels (propagation direction)")
-    parser.add_argument("--crop-y-px", type=int, default=192,
-                        help="Non-PML interior height in pixels (transverse direction)")
+    parser.add_argument("--crop-x-px", type=int, default=480,
+                        help="Non-PML interior width in pixels for rectangular domain")
+    parser.add_argument("--crop-y-px", type=int, default=160,
+                        help="Non-PML interior height in pixels for rectangular domain")
+    parser.add_argument("--crop-sq-px", type=int, default=320,
+                        help="Non-PML interior size in pixels for square domain")
     parser.add_argument("--decay-tol", type=float, default=1e-5,
                         help="DFT decay tolerance")
 
@@ -823,6 +1002,10 @@ def main():
     parser.add_argument("--augment", action="store_true",
                         help="Enable D4 augmentation during generation (default: off, do during training)")
 
+    # Resume support
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing index: skip already-completed geometry+wavelength combos")
+
     # Seeds
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split-seed", type=int, default=123)
@@ -833,12 +1016,29 @@ def main():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
 
-    # Compute cell sizes from crop dimensions + PML
+    # Compute cell sizes from crop dimensions + PML for both domains
     pml_px = int(round(float(args.dpml) * float(args.resolution)))
     dpml_q = float(pml_px) / float(args.resolution)
-    args.cell_x = float(args.crop_x_px + 2 * pml_px) / float(args.resolution)
-    args.cell_y = float(args.crop_y_px + 2 * pml_px) / float(args.resolution)
     args.dpml = dpml_q  # use quantized dpml
+
+    # Rectangular domain (for elongated devices)
+    rect_cell_x = float(args.crop_x_px + 2 * pml_px) / float(args.resolution)
+    rect_cell_y = float(args.crop_y_px + 2 * pml_px) / float(args.resolution)
+
+    # Square domain (for bends/crossings)
+    sq_cell = float(args.crop_sq_px + 2 * pml_px) / float(args.resolution)
+
+    # Store both domain configs
+    domain_configs = {
+        DOMAIN_RECTANGULAR: {
+            "cell_x": rect_cell_x, "cell_y": rect_cell_y,
+            "crop_x_px": args.crop_x_px, "crop_y_px": args.crop_y_px,
+        },
+        DOMAIN_SQUARE: {
+            "cell_x": sq_cell, "cell_y": sq_cell,
+            "crop_x_px": args.crop_sq_px, "crop_y_px": args.crop_sq_px,
+        },
+    }
 
     # Setup paths
     repo_root = Path(__file__).resolve().parents[1]
@@ -858,9 +1058,13 @@ def main():
     overrides = {
         "straight": args.n_straight,
         "taper": args.n_taper,
+        "mmi": args.n_mmi,
         "sbend": args.n_sbend,
         "ybranch": args.n_ybranch,
         "directional_coupler": args.n_directional_coupler,
+        "euler_bend": args.n_euler_bend,
+        "circular_bend": args.n_circular_bend,
+        "crossing": args.n_crossing,
     }
 
     if any(v is not None for v in overrides.values()):
@@ -877,12 +1081,9 @@ def main():
     total_geo = sum(counts.values())
     total_sims = total_geo * len(WAVELENGTHS)
     augment = args.augment  # Default: off (do augmentation during training instead)
-    rect_grid = args.crop_x_px != args.crop_y_px
-    augment_factor = (4 if rect_grid else 8) if augment else 1
-    total_samples = total_sims * augment_factor
 
     print(f"=" * 60)
-    print(f"Unified Multi-Device Photonic Sweep")
+    print(f"Unified Multi-Device Photonic Sweep (9 device types)")
     print(f"=" * 60)
     print(f"Output directory: {out_dir}")
     print(f"Temp directory:   {tmp_dir}")
@@ -890,22 +1091,22 @@ def main():
     print()
     print(f"Device counts:")
     for dtype, n in counts.items():
-        print(f"  {dtype:25s}: {n:6d} geometries")
+        domain = DEVICE_DOMAIN[dtype]
+        tag = "rect" if domain == DOMAIN_RECTANGULAR else "sq"
+        print(f"  {dtype:25s}: {n:6d} geometries  [{tag}]")
     print(f"  {'TOTAL':25s}: {total_geo:6d} geometries")
     print()
     print(f"Wavelengths: {WAVELENGTHS}")
     print(f"Total simulations: {total_sims}")
-    print(f"Augmentation: {'8x (D4 rotations/flips)' if augment else 'disabled'}")
-    print(f"Total samples: {total_samples} ({total_sims} sims × {augment_factor})")
+    print(f"Augmentation: {'enabled (D4/D2 per domain)' if augment else 'disabled'}")
     print()
-    q = 1.0 / (2.0 * args.resolution)
+    q_half = 1.0 / (2.0 * args.resolution)
     print(f"Simulation params:")
     print(f"  resolution: {args.resolution} px/µm (dx = {1.0/args.resolution:.4f} µm)")
-    print(f"  param quantum: {q:.5f} µm (half-pixel)")
+    print(f"  param quantum: {q_half:.5f} µm (half-pixel)")
     print(f"  dpml:       {args.dpml:.4f} µm ({pml_px} px)")
-    print(f"  crop:       {args.crop_x_px} x {args.crop_y_px} px (interior)")
-    print(f"  cell:       {args.cell_x:.3f} x {args.cell_y:.3f} µm")
-    print(f"  interior:   {args.crop_x_px/args.resolution:.2f} x {args.crop_y_px/args.resolution:.2f} µm")
+    print(f"  rect domain: {args.crop_x_px} x {args.crop_y_px} px ({rect_cell_x:.1f} x {rect_cell_y:.1f} µm cell)")
+    print(f"  sq domain:   {args.crop_sq_px} x {args.crop_sq_px} px ({sq_cell:.1f} x {sq_cell:.1f} µm cell)")
     print(f"  decay_tol:  {args.decay_tol}")
     print()
     print(f"Parallelization: {args.n_procs} workers")
@@ -931,7 +1132,7 @@ def main():
         seed_offset += 1
 
         for i, params in enumerate(params_list):
-            geom_id = make_geom_id(device_type)
+            geom_id = make_geom_id(device_type, seed=args.seed * 100000 + seed_offset * 10000 + i)
             split = splits[i]
 
             # Choose input port for this geometry
@@ -947,19 +1148,44 @@ def main():
                 **params,
             })
 
+            # Get domain config for this device type
+            domain = DEVICE_DOMAIN[device_type]
+            dc = domain_configs[domain]
+
             # Create task for each wavelength
             for lam in WAVELENGTHS:
                 task = (
                     device_type, geom_id, params, input_port, lam, split,
-                    args.resolution, args.dpml, args.cell_x, args.cell_y,
-                    args.crop_x_px, args.crop_y_px, args.decay_tol, str(tmp_dir)
+                    args.resolution, args.dpml, dc["cell_x"], dc["cell_y"],
+                    dc["crop_x_px"], dc["crop_y_px"], args.decay_tol, str(tmp_dir)
                 )
                 all_tasks.append(task)
+
+    # Resume: filter out already-completed tasks
+    if args.resume:
+        index_path = shards_dir / "index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                existing_index = json.load(f)
+            # Build set of (geometry_id, wavelength_um_rounded) already done
+            done = set()
+            for entry in existing_index:
+                gid = entry.get("geometry_id", "")
+                wl = round(float(entry.get("wavelength_um", 0)), 4)
+                done.add((gid, wl))
+            before = len(all_tasks)
+            all_tasks = [
+                t for t in all_tasks
+                if (t[1], round(float(t[4]), 4)) not in done  # t[1]=geom_id, t[4]=wavelength_um
+            ]
+            print(f"Resume: {before - len(all_tasks)} tasks already done, {len(all_tasks)} remaining")
+        else:
+            print("Resume: no existing index found, starting fresh")
 
     # Shuffle tasks for better load balancing
     rng.shuffle(all_tasks)
 
-    # Write geometries.jsonl
+    # Write geometries.jsonl (always overwrite — deterministic from seeds)
     geom_path = out_dir / "geometries.jsonl"
     with open(geom_path, "w") as f:
         for row in geom_meta:
@@ -971,7 +1197,7 @@ def main():
     writer_proc = mp.Process(
         target=shard_writer_process,
         args=(q, str(shards_dir), args.shard_size, args.compress, args.index_every_shard,
-              augment, args.crop_x_px != args.crop_y_px),
+              augment, args.resume),
         daemon=True,
     )
     writer_proc.start()
@@ -1015,7 +1241,8 @@ def main():
     print(f"COMPLETE")
     print(f"=" * 60)
     print(f"Simulations: {successes} succeeded, {failures} failed")
-    print(f"Total samples: {successes * augment_factor} (with {'8x D4 augmentation' if augment else 'no augmentation'})")
+    aug_str = "D4/D2 augmentation per domain" if augment else "no augmentation"
+    print(f"Augmentation: {aug_str}")
     print(f"Shards:    {shards_dir / 'shard_*.npz'}")
     print(f"Index:     {shards_dir / 'index.json'}")
     print(f"Metadata:  {geom_path}")

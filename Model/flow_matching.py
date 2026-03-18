@@ -75,13 +75,39 @@ def u_t(
     return x_1 - (1.0 - sig_min) * x_0
 
 
-def sample_t(x_1: torch.Tensor) -> torch.Tensor:
+def sample_t(
+    x_1: torch.Tensor,
+    mode: str = "uniform",
+    loc: float = 0.0,
+    scale: float = 1.0,
+) -> torch.Tensor:
     """
     Time sampling for FM training.
-    Uniform on [0, 1], shape [B, 1, 1, 1] (broadcastable to images).
+    Returns shape [B, 1, 1, 1] (broadcastable to images).
+
+    Modes:
+        "uniform"       — U[0, 1]  (original default)
+        "logit_normal"  — t = sigmoid(loc + scale * z),  z ~ N(0,1)
+                          Concentrates samples around sigmoid(loc) ≈ 0.5
+                          and avoids the extremes, giving a bell-shaped
+                          density on (0, 1).  scale controls spread.
+        "mixture"       — 50% uniform + 50% logit_normal.
+                          Ensures good coverage at t near 0 and 1 (where
+                          quadratic ODE grids spend most steps) while still
+                          concentrating training near t=0.5 for hard samples.
     """
     B = x_1.shape[0]
-    t = torch.rand((B,), device=x_1.device)
+    if mode == "logit_normal":
+        z = torch.randn((B,), device=x_1.device)
+        t = torch.sigmoid(loc + scale * z)
+    elif mode == "mixture":
+        t_uniform = torch.rand((B,), device=x_1.device)
+        z = torch.randn((B,), device=x_1.device)
+        t_logit = torch.sigmoid(loc + scale * z)
+        mask = torch.rand((B,), device=x_1.device) < 0.5
+        t = torch.where(mask, t_uniform, t_logit)
+    else:  # uniform
+        t = torch.rand((B,), device=x_1.device)
     return t.view(B, 1, 1, 1)
 
 
@@ -273,6 +299,9 @@ def cfm_loss_residual(
     lambda_binarize: float = 0.0,
     eps_1: torch.Tensor = None,  # [B,1,H,W] GT clean eps (normalized) for geometry loss
     lambda_geom: float = 0.0,
+    t_physics_min: float = 0.0,  # minimum t for physics losses (residual/phase/sparam); FM always at all t
+    residual_t_power: float = 0.0,  # if >0, weight per-sample residual by t^p (upweights high-t = cleaner reconstructions)
+    interface_thr: float = 0.0,  # if >0, mask out pixels where |∇ε| > thr from residual (removes interface artifacts)
 ):
     """
     Conditional FM loss + physics residual + phase loss + endpoint loss (+ optional sparam loss).
@@ -288,6 +317,15 @@ def cfm_loss_residual(
     else:
         t_view = t.view(B, 1, 1, 1)
         t_vec = t_view.view(B)
+
+    # Time-gating: only compute physics losses for samples where t >= threshold.
+    # The x1 reconstruction is noisy at low t, producing uninformative physics gradients.
+    if t_physics_min > 0.0:
+        physics_mask = (t_vec >= t_physics_min).to(dtype=torch.float32)  # [B]
+        physics_frac = physics_mask.mean().clamp_min(1e-8)  # scalar
+    else:
+        physics_mask = None
+        physics_frac = None
 
     # wavelength
     lambda_um_model = None
@@ -492,6 +530,16 @@ def cfm_loss_residual(
 
     w_fm = (w0 + df * dev_m) * pml_m  # [B,1,H,W] fp32 (for FM/endpoint loss)
     w_residual = w_fm * src_free_m     # [B,1,H,W] fp32 (for Helmholtz - excludes sources)
+
+    # Mask out dielectric interface pixels where the 5-point Laplacian stencil
+    # spans a sharp ε discontinuity (Si/SiO₂), producing spurious residuals.
+    if float(interface_thr) > 0.0 and helmholtz_op is not None:
+        grad_eps_x = helmholtz_op.diff.diff_x(eps_phys_only)  # [B,1,H,W]
+        grad_eps_y = helmholtz_op.diff.diff_y(eps_phys_only)  # [B,1,H,W]
+        grad_eps_mag = (grad_eps_x ** 2 + grad_eps_y ** 2).sqrt()
+        interface_free = (grad_eps_mag < float(interface_thr)).to(dtype=torch.float32)
+        w_residual = w_residual * interface_free
+
     m_focus = (pml_m * dev_m).squeeze(1)  # [B,H,W]
 
     # -----------------------
@@ -546,14 +594,38 @@ def cfm_loss_residual(
             compute_phase = False
             compute_phase_grad = False
 
+    # Time-gating early-out: if no samples have t >= t_physics_min, skip all physics
+    if physics_mask is not None and physics_mask.sum() == 0:
+        compute_residual = False
+        compute_phase = False
+        compute_phase_grad = False
+        compute_sparam = False
+
     # -----------------------
-    # 9) Endpoint loss (normalized, aligned)
+    # 9) Endpoint loss (aligned + unaligned blend)
+    #    The aligned component ignores global phase offset.
+    #    The unaligned component forces the model to learn correct global phase.
+    #    Blend: endpoint_loss = 0.5 * aligned + 0.5 * unaligned
     # -----------------------
     if bool(compute_endpoint):
-        diff_end = x1_fields_pred_aligned - fields_1_f
-        end_num = (w_fm * (diff_end ** 2)).sum(dim=(2, 3))
+        # Aligned endpoint loss
+        diff_end_aligned = x1_fields_pred_aligned - fields_1_f
+        end_num_a = (w_fm * (diff_end_aligned ** 2)).sum(dim=(2, 3))
         end_den = w_fm.sum(dim=(2, 3)).clamp_min(1.0)
-        endpoint_loss = (end_num / end_den).mean()
+        per_sample_end_a = (end_num_a / end_den).mean(dim=-1)  # [B]
+
+        # Unaligned endpoint loss (raw prediction vs GT — penalizes global phase offset)
+        diff_end_raw = x1_fields_pred - fields_1_f
+        end_num_r = (w_fm * (diff_end_raw ** 2)).sum(dim=(2, 3))
+        per_sample_end_r = (end_num_r / end_den).mean(dim=-1)  # [B]
+
+        # Blend: half aligned, half unaligned
+        per_sample_end = 0.5 * per_sample_end_a + 0.5 * per_sample_end_r
+
+        if physics_mask is not None:
+            endpoint_loss = (per_sample_end * physics_mask).sum() / physics_mask.sum().clamp_min(1.0)
+        else:
+            endpoint_loss = per_sample_end.mean()
     else:
         endpoint_loss = torch.zeros((), device=device, dtype=torch.float32)
 
@@ -583,6 +655,8 @@ def cfm_loss_residual(
 
     if bool(compute_phase_grad):
         phase_grad = phase_grad_loss(E_pred, E_true, m_focus, tau=float(phase_amp_tau))
+        if physics_frac is not None:
+            phase_grad = phase_grad * physics_frac
     else:
         phase_grad = torch.zeros((), device=device, dtype=torch.float32)
 
@@ -600,7 +674,11 @@ def cfm_loss_residual(
 
         phase_num = (phase_err * w_phase * m_phase).sum(dim=(1, 2))
         phase_den = (w_phase * m_phase).sum(dim=(1, 2)).clamp_min(1.0)
-        phase_loss = (phase_num / phase_den).mean()
+        per_sample_phase = phase_num / phase_den  # [B]
+        if physics_mask is not None:
+            phase_loss = (per_sample_phase * physics_mask).sum() / physics_mask.sum().clamp_min(1.0)
+        else:
+            phase_loss = per_sample_phase.mean()
     else:
         phase_loss = torch.zeros((), device=device, dtype=torch.float32)
 
@@ -626,13 +704,28 @@ def cfm_loss_residual(
             norm_mask = w_residual
             res_num = (w_residual * R2).sum(dim=(2, 3))
             res_den = w_residual.sum(dim=(2, 3)).clamp_min(1.0)
-            residual_loss = (res_num / res_den).mean()
         else:
             # Still mask out sources even without device weighting
             norm_mask = src_free_m
             res_num = (src_free_m * R2).sum(dim=(2, 3))
             res_den = src_free_m.sum(dim=(2, 3)).clamp_min(1.0)
-            residual_loss = (res_num / res_den).mean()
+
+        # Per-sample residual, then time-gated (and optionally t-weighted) average.
+        # When residual_t_power > 0, samples with higher t (cleaner x1 reconstruction)
+        # contribute more to the loss, effectively decoupling the residual from
+        # noisy low-t reconstructions without requiring a second forward pass.
+        per_sample_res = (res_num / res_den).squeeze(-1)  # [B]
+        if residual_t_power > 0.0:
+            t_w = t_vec.detach().clamp(0.0, 1.0) ** residual_t_power  # [B]
+            if physics_mask is not None:
+                tw = t_w * physics_mask
+            else:
+                tw = t_w
+            residual_loss = (per_sample_res * tw).sum() / tw.sum().clamp_min(1e-8)
+        elif physics_mask is not None:
+            residual_loss = (per_sample_res * physics_mask).sum() / physics_mask.sum().clamp_min(1.0)
+        else:
+            residual_loss = per_sample_res.mean()
 
         # Normalize by driving-term scale: weighted-mean of (k₀²εE_true)².
         # The Helmholtz equation is ∇²E + k₀²εE = 0; the dominant term scale
@@ -732,6 +825,10 @@ def cfm_loss_residual(
     else:
         sparam_loss_val = torch.zeros((), device=device, dtype=torch.float32)
 
+    # Apply time-gating to S-param loss
+    if physics_frac is not None:
+        sparam_loss_val = sparam_loss_val * physics_frac
+
     # -----------------------
     # 13) Binarization loss (joint training: push generated eps toward binary)
     # -----------------------
@@ -774,10 +871,16 @@ def sample(
     phys_gate=1.0,
     phase_gate=1.0,
     sig_min: float = SIG_MIN,
+    time_grid: str = "quadratic",
 ) -> torch.Tensor:
     """
     Flow-matching sampler for fields, conditioned on spatial maps (eps, and optionally src).
-    Integrates dx/dt = u_theta(x,t) on t in [0,1] using RK2/Heun with a quadratic time grid.
+    Integrates dx/dt = u_theta(x,t) on t in [0,1] using RK2/Heun.
+
+    time_grid:
+        "quadratic" — base**2, allocates more steps near t=0 (original)
+        "linear"    — uniform spacing, matches uniform/mixture training distribution
+
     If sig_min > 0, returns clean x1 via the exact debias identity:
         x1 = (1 - s) x(1) + s u(1).
     """
@@ -789,7 +892,10 @@ def sample(
     cond_maps = cond_maps.to(device=device, dtype=dtype)
 
     base = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
-    time_steps = base ** 2  # allocate more steps near t=0
+    if time_grid == "quadratic":
+        time_steps = base ** 2  # allocate more steps near t=0
+    else:
+        time_steps = base  # linear spacing
 
     x_new = x_0.clone()
 

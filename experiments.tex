@@ -1,0 +1,185 @@
+\section{\label{sec:experiments}Experiments}
+
+\subsection{Training configuration}
+
+We train on 2 NVIDIA H200 GPUs using distributed data parallel (DDP) with bfloat16 mixed-precision (model forward pass
+in bfloat16, all loss computation in float32 for numerical stability). The complex-valued U-Net uses a base channel
+count of 40, channel multipliers $(1, 2, 4, 8)$, 3 residual blocks per level, and 8-head complex self-attention at the
+$8\times$-downsampled resolution. We use AdamW~\cite{Loshchilov2019AdamW} with learning rate $10^{-4}$, weight decay
+$5 \times 10^{-5}$, and a schedule combining 10-epoch linear warmup with cosine decay to a minimum of $5 \times
+10^{-6}$. The global batch size is 160 across both GPUs. An exponential moving average (EMA) of model weights with
+decay 0.999 is maintained and used for all evaluation.
+
+The training curriculum is: Phase~A for 30 epochs (FM only), Phase~B from epoch 30 to 100 (add Helmholtz residual
+$\lambda_R = 1.0$ with 20-epoch linear warmup), and Phase~C from epoch 100 onward (add phase loss $\lambda_\phi =
+0.1$ and S-parameter loss $\lambda_S = 0.1$, each with 30-epoch warmups). S-parameters are extracted using the
+projection method. Physics losses are time-gated to samples with $t \geq 0.5$, and the Helmholtz residual is
+additionally weighted by $t^4$ to upweight clean, high-$t$ reconstructions. Interface masking with threshold $\tau =
+1.0$ excludes dielectric boundary pixels from the residual. Conflict-free gradient surgery
+(ConFIG)~\cite{ConFIG2025} activates at epoch 100 when all four losses are simultaneously active.
+Time is sampled from a 50/50 mixture of uniform and logit-normal distributions. Inference uses Heun integration with
+30 steps on a linear time grid. Training runs for 400 epochs total.
+
+\subsection{Evaluation metrics}
+
+\paragraph{Field quality.}
+We report peak signal-to-noise ratio (PSNR) on the field magnitude $|E_z|$ and relative $L_2$ amplitude error, both
+computed on the held-out test set after global phase alignment. Phase error is reported as the root-mean-square angular
+deviation (in degrees) between predicted and ground-truth unit phasors, weighted by $|E_z^\text{true}|^2$ and gated by
+an amplitude threshold to suppress noise in low-signal regions.
+
+\paragraph{Physics compliance.}
+The Helmholtz residual ratio (Sec.~\ref{sec:method}) with interface masking, computed on predicted fields and
+normalized by the driving-term scale. We report this relative to the ground-truth floor: a ratio of $1.0\times$~GT
+indicates the model satisfies the Helmholtz equation as well as the FDTD reference solution itself.
+
+\paragraph{S-parameter accuracy.}
+Mean absolute error in $|S_{ji}|$ and phase error (degrees) for each output port, broken down by device type. The
+input port is excluded from evaluation since the total-field projection at the excited port conflates incident and
+scattered waves.
+
+\paragraph{Computational cost.}
+Wall-clock inference time per sample (single and batched) on a single GPU, compared to FDTD simulation time. We also
+report model parameter count and total training GPU-hours.
+
+\subsection{Baselines and ablations}
+
+We evaluate the following configurations to isolate the contribution of each design choice:
+
+\begin{enumerate}
+    \item \textbf{Complex U-Net + full curriculum} (ours): The complete model as described in Sec.~\ref{sec:method}.
+    \item \textbf{Real-valued U-Net}: Same architecture and training procedure, but with standard real convolutions
+          applied independently to $E_r$ and $E_i$, standard ReLU, and real group normalization. Tests whether
+          complex-valued inductive bias improves phase accuracy.
+    \item \textbf{FM only}: Flow matching loss without Helmholtz residual, phase, or S-parameter losses. Tests
+          whether physics-constrained training improves field quality beyond what pure data-driven learning achieves.
+    \item \textbf{No curriculum}: All losses active from epoch 0 with their full target weights (no phased
+          introduction, no warmup ramps). Tests whether the multi-loss curriculum is necessary for stable training.
+    \item \textbf{No interface masking}: Helmholtz residual computed at all interior pixels including dielectric
+          boundaries. Tests whether interface masking improves training dynamics and the usefulness of the residual
+          as a compliance metric.
+\end{enumerate}
+
+\subsection{Results}
+
+% -----------------------------------------------------------------------
+% PLACEHOLDER: Fill in after training runs complete.
+% -----------------------------------------------------------------------
+
+\subsubsection{Field prediction quality}
+
+% Table: PSNR, amplitude error, phase error per device type
+% Compare complex vs real UNet, FM-only vs full curriculum
+
+\begin{table*}[t]
+\centering
+\caption{Field prediction quality on the held-out test set (EMA model, 30-step Heun integration). PSNR is computed on
+$|E_z|$; phase error is amplitude-weighted RMS in degrees. Best result per column in bold.}
+\label{tab:field_quality}
+\begin{tabular}{lccccc}
+\hline\hline
+ & \multicolumn{5}{c}{PSNR (dB) $\uparrow$} \\
+\cline{2-6}
+Method & S-bend & Y-branch & MMI & Dir.\ coupler & Mean \\
+\hline
+FM only           & -- & -- & -- & -- & -- \\
+Real U-Net + curriculum & -- & -- & -- & -- & -- \\
+Complex U-Net + curriculum (ours) & -- & -- & -- & -- & -- \\
+\hline\hline
+\end{tabular}
+\end{table*}
+
+\subsubsection{Physics compliance}
+
+% Table or figure: Helmholtz residual ratio (with and without interface masking)
+% Show that interface masking drops GT floor from ~0.17 to ~0.01-0.03
+% Show model's residual ratio relative to GT floor
+
+\subsubsection{S-parameter accuracy}
+
+% Table: |S| magnitude error and phase error per device type and port
+% Compare project vs modal extraction
+% Show that S-param loss improves accuracy vs FM-only
+
+\begin{table}[t]
+\centering
+\caption{S-parameter accuracy on the test set. Magnitude error is mean $||S^\text{pred}| - |S^\text{true}||$; phase
+error is RMS angular difference in degrees, evaluated on output ports with $|S^\text{true}| > 0.01$.}
+\label{tab:sparam}
+\begin{tabular}{lcc}
+\hline\hline
+Device & $\Delta|S|$ $\downarrow$ & $\Delta\angle S$ (deg) $\downarrow$ \\
+\hline
+S-bend          & -- & -- \\
+Y-branch        & -- & -- \\
+MMI             & -- & -- \\
+Dir.\ coupler   & -- & -- \\
+\hline
+Mean            & -- & -- \\
+\hline\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Ablation study}
+
+% Table: All ablation variants with PSNR, residual ratio, S-param error
+% Key findings:
+% - Complex vs real: complex improves phase accuracy by X
+% - FM-only vs full: physics losses improve residual ratio by Y
+% - No curriculum vs curriculum: curriculum stabilizes training, improves final metrics
+% - No interface masking: residual floor is artificially high, noisy gradients
+
+\begin{table}[t]
+\centering
+\caption{Ablation study (test-set averages across all device types).}
+\label{tab:ablation}
+\begin{tabular}{lccc}
+\hline\hline
+Variant & PSNR $\uparrow$ & Res.\ ratio $\downarrow$ & $\Delta|S|$ $\downarrow$ \\
+\hline
+Ours (full)           & -- & -- & -- \\
+Real-valued U-Net     & -- & -- & -- \\
+FM only               & -- & -- & -- \\
+No curriculum         & -- & -- & -- \\
+No interface mask     & -- & -- & -- \\
+\hline\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Computational cost}
+
+% Table: inference time vs FDTD
+% Single sample, batched (e.g. batch=32), vs FDTD per sim
+% Parameter count
+% Training GPU-hours
+
+\begin{table}[t]
+\centering
+\caption{Computational cost comparison.}
+\label{tab:cost}
+\begin{tabular}{lc}
+\hline\hline
+ & Time \\
+\hline
+FDTD (Meep, single sim)           & $\sim$\,2--5\,min \\
+Ours (single sample, 1 GPU)       & -- \\
+Ours (batch of 32, 1 GPU)         & -- \\
+\hline
+Model parameters                   & -- \\
+Training (2$\times$ H200, 400 ep) & --\,GPU-hours \\
+\hline\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Qualitative examples}
+
+% Figure: Side-by-side GT vs predicted for representative devices
+% Rows: amplitude |Ez|, phase angle(Ez), pointwise error
+% Columns: one device per column (S-bend, Y-branch, MMI, dir coupler)
+% Caption: note that phase is accurately captured in high-amplitude regions
+
+% Figure: Helmholtz residual maps with and without interface masking
+% Show that interface pixels dominate residual without masking
+
+% Figure: Training loss curves showing Phase A/B/C transitions
+% Show FM loss, residual loss, phase loss, sparam loss vs epoch

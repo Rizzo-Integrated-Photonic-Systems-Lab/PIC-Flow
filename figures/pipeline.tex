@@ -1,0 +1,115 @@
+% Figure 1: High-level training and inference pipeline
+% Compile standalone or \input{} into main document
+% Requires: \usepackage{tikz}
+%           \usetikzlibrary{arrows.meta, positioning, calc, fit, backgrounds, decorations.pathreplacing}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    >=Stealth,
+    node distance=1.2cm and 1.6cm,
+    % Styles
+    block/.style={draw, rounded corners=3pt, minimum height=0.9cm, minimum width=2.0cm,
+                  align=center, font=\small},
+    model/.style={block, fill=blue!15, minimum width=2.4cm},
+    loss/.style={block, fill=red!12, minimum width=1.8cm, minimum height=0.7cm, font=\footnotesize},
+    data/.style={block, fill=green!12},
+    field/.style={block, fill=orange!12},
+    arrow/.style={->, thick},
+    darrow/.style={->, thick, dashed},
+    brace/.style={decorate, decoration={brace, amplitude=6pt, raise=2pt}},
+    phase/.style={font=\footnotesize\bfseries, text=gray!70!black},
+]
+
+% ===== TRAINING (top) =====
+\node[phase] (train_label) at (-6.5, 0.3) {TRAINING};
+
+% Inputs
+\node[data] (x1) at (-5.5, -0.8) {$x_1$ (GT field)};
+\node[data] (x0) at (-5.5, -2.3) {$x_0 \sim \mathcal{N}(0,I)$};
+
+% Interpolation
+\node[block, fill=gray!10] (interp) at (-2.5, -1.55) {$x_t = (1{-}t)\,x_0 + t\,x_1$};
+\draw[arrow] (x1) -| (interp);
+\draw[arrow] (x0) -| (interp);
+
+% Conditioning
+\node[data] (cond) at (-2.5, -3.2) {$\varepsilon,\; m_\text{src},\; \lambda$};
+
+% Model
+\node[model] (unet) at (1.2, -1.55) {Complex\\U-Net $u_\theta$};
+\draw[arrow] (interp) -- node[above, font=\footnotesize] {$x_t$} (unet);
+\draw[arrow] (cond) -| node[near start, above, font=\footnotesize] {} (unet);
+
+% Velocity + x1 reconstruction
+\node[field] (vpred) at (4.5, -1.55) {$\hat{u}_t$};
+\draw[arrow] (unet) -- (vpred);
+
+\node[field] (x1pred) at (4.5, -3.2) {$\hat{x}_1 = x_t + (1{-}t)\hat{u}_t$};
+\draw[arrow] (vpred) -- (x1pred);
+
+% Losses
+\node[loss] (lfm) at (7.5, -0.5) {$\mathcal{L}_\text{FM}$};
+\node[loss] (lres) at (7.5, -1.5) {$\mathcal{L}_\text{res}$};
+\node[loss] (lphase) at (7.5, -2.5) {$\mathcal{L}_\text{phase}$};
+\node[loss] (lsparam) at (7.5, -3.5) {$\mathcal{L}_\text{S-param}$};
+
+\draw[arrow] (vpred) -- (lfm);
+\draw[arrow] (x1pred) -- (lres);
+\draw[arrow] (x1pred) -- (lphase);
+\draw[arrow] (x1pred) -- (lsparam);
+
+% Target velocity
+\node[block, fill=gray!10, minimum width=1.4cm, font=\footnotesize] (vtgt) at (7.5, 0.4)
+    {$u_t = x_1 - x_0$};
+\draw[darrow] (vtgt) -- (lfm);
+
+% Curriculum phases (brace on right)
+\draw[brace] (9.2, -0.2) -- node[right=6pt, align=left, font=\footnotesize]
+    {Phase A\\(ep 0--30)} (9.2, -0.8);
+\draw[brace] (9.2, -1.1) -- node[right=6pt, align=left, font=\footnotesize]
+    {Phase B\\(ep 30--100)} (9.2, -1.9);
+\draw[brace] (9.2, -2.1) -- node[right=6pt, align=left, font=\footnotesize]
+    {Phase C\\(ep 100+)} (9.2, -3.9);
+
+% Helmholtz annotation
+\node[font=\tiny, text=gray, anchor=west] at (5.8, -1.5) {$\nabla^2\hat{E}_z + k_0^2\varepsilon\hat{E}_z$};
+
+% S-param annotation
+\node[font=\tiny, text=gray, anchor=west] at (5.8, -3.5) {modal overlap $\to S_{ji}$};
+
+% ===== INFERENCE (bottom) =====
+\node[phase] (inf_label) at (-6.5, -5.0) {INFERENCE};
+
+\node[data] (z) at (-5.5, -5.8) {$x_0 \sim \mathcal{N}(0,I)$};
+\node[data] (cond2) at (-5.5, -7.0) {$\varepsilon,\; m_\text{src},\; \lambda$};
+
+\node[model] (unet2) at (-1.5, -5.8) {Complex\\U-Net $u_\theta$};
+\draw[arrow] (z) -- (unet2);
+\draw[arrow] (cond2) -| (unet2);
+
+% ODE integration
+\node[block, fill=violet!10, minimum width=3.2cm] (ode) at (2.5, -5.8)
+    {Heun ODE\\$t: 0 \to 1$, $N$ steps};
+\draw[arrow] (unet2) -- (ode);
+\draw[darrow, bend left=30] (ode.north) to node[above, font=\tiny] {iterate} (unet2.north);
+
+% Output
+\node[field] (epred) at (6.0, -5.8) {$\hat{E}_z(x,y)$};
+\draw[arrow] (ode) -- (epred);
+
+\node[field, minimum width=1.4cm] (spred) at (6.0, -7.0) {$\hat{S}_{ji}$};
+\draw[arrow] (epred) -- node[right, font=\tiny] {modal} (spred);
+
+% Divider line
+\draw[gray, dashed, thick] (-7.0, -4.3) -- (10.0, -4.3);
+
+\end{tikzpicture}
+\caption{Training and inference pipeline. \textbf{Top}: During training, a noisy interpolated field $x_t$ and
+conditioning inputs ($\varepsilon$, source mask, $\lambda$) are fed to the complex-valued U-Net, which predicts a
+velocity $\hat{u}_t$. Four losses are applied in a phased curriculum: flow matching loss on the velocity (Phase~A),
+Helmholtz residual on the reconstructed field (Phase~B), and phase and S-parameter losses (Phase~C). \textbf{Bottom}:
+At inference, the learned velocity field is integrated from Gaussian noise to a field prediction using a Heun ODE
+solver; S-parameters are extracted from the output field via modal overlap integrals.}
+\label{fig:pipeline}
+\end{figure*}

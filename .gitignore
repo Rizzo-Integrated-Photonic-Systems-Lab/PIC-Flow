@@ -31,6 +31,7 @@ wandb/
 # Model checkpoints
 *.pt
 logs_physics_unet_pbfm/
+logs_physics_unet_pbfm
 
 # Large generated data
 Data/*

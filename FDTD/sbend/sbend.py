@@ -193,8 +193,9 @@ class EulerSBend2D(Device2DBase):
         """Build Euler S-bend with straight leads."""
         xb, yb = euler_sbend_points(self.lateral_offset_um, self.R_min_um, n_pts=256)
 
-        # Center in x
+        # Center in x and y
         xb -= 0.5 * (xb.min() + xb.max())
+        yb -= 0.5 * (yb.min() + yb.max())
         sbend_pts = np.column_stack([xb, yb])
         self._sbend_pts = sbend_pts.copy()
 
@@ -487,8 +488,9 @@ class CosineSBend2D(Device2DBase):
         """Build Cosine S-bend with straight leads."""
         xb, yb = cosine_sbend_points(self.lateral_offset_um, self.length_um, n_pts=256)
 
-        # Center in x
+        # Center in x and y
         xb -= 0.5 * (xb.min() + xb.max())
+        yb -= 0.5 * (yb.min() + yb.max())
         sbend_pts = np.column_stack([xb, yb])
         self._sbend_pts = sbend_pts.copy()
 

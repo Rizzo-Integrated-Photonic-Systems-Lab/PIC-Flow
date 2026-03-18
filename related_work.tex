@@ -1,0 +1,61 @@
+\section{\label{sec:related}Related Work}
+
+Recent progress in photonics is driven by advances in computational electromagnetics and machine learning. Our work
+connects three lines of research: learning-based surrogates for electromagnetic simulation, physics-informed or
+physics-constrained training for PDE-governed systems, and generative models for scientific computing.
+
+\paragraph{Neural surrogates for photonic simulation.}
+Deep learning has been used to approximate forward electromagnetic responses and accelerate design-space exploration
+across many photonic structures. Jiang \emph{et al.}\ survey deep neural networks for evaluation and design, covering
+supervised surrogates, inverse models, and hybrid
+workflows~\cite{Jiang2021DeepNNPhotonicDevices}; Ma \emph{et al.}\ provide a broader review of deep learning for
+photonic structure design~\cite{Ma2021DLPhotonicsReview}. In integrated photonics, Tahersima \emph{et al.}\ demonstrate
+data-driven inverse design of compact power splitters~\cite{Tahersima2019DNNSplitters}, and Tang \emph{et al.}\
+introduce a generative model for inverse design of nanophotonic
+components~\cite{Tang2020GenerativeLPR}. Chen \emph{et al.}\ train a physics-augmented U-Net~\cite{Ronneberger2015UNet}
+(WaveY-Net) to predict near-fields of freeform nanophotonic devices, using Maxwell's equations as part of the training
+loss~\cite{Chen2022WaveYNet}, and Lim and Psaltis use Maxwell's equations directly as the sole training objective for a
+physics-driven DNN~\cite{Lim2022MaxwellNet}. These works show the value of learned surrogates, but they also highlight
+the need for models that predict \emph{full-field} complex solutions (not only scalar figures of merit) and that
+generalize across device families and wavelengths.
+
+\paragraph{Physics-informed and physics-constrained training.}
+Physics-informed neural networks (PINNs) offer a general way to enforce PDE residuals in the loss for forward and
+inverse problems~\cite{Raissi2019PINNs}; in photonics this often means wave-equation residuals (e.g., Helmholtz) or
+boundary/energy constraints. However, PINNs typically optimize per-instance and do not amortize across a family of
+geometries. Neural operators such as the Fourier Neural Operator~\cite{Li2021FNO} and DeepONet~\cite{Lu2021DeepONet}
+learn mappings between function spaces and have been applied to PDE problems at scale, but are predominantly
+real-valued, discarding the phase information that is critical for coherent photonic devices where interference effects
+determine functionality. Our approach uses a Helmholtz residual penalty on predicted complex fields as a lightweight,
+architecture-agnostic physics constraint that amortizes across thousands of geometries.
+
+\paragraph{Generative models for PDE-governed systems.}
+Generative models can represent distributions over fields and enable conditional sampling for design. Score-based
+diffusion models~\cite{Song2021ScoreSDE} have been applied to PDE-governed problems: Huang \emph{et al.}\ use
+diffusion-based generation to solve Helmholtz and other equations under partial
+observation~\cite{Huang2024DiffusionPDE}. Flow matching~\cite{Lipman2022FlowMatching} provides a simulation-free
+alternative by learning a time-dependent velocity field along a probability path, offering straighter transport paths
+and simpler training than diffusion. Baldan \emph{et al.}\ extend this idea to physics-constrained generation with
+physics-based flow matching (PBFM), integrating PDE residuals during
+training~\cite{Baldan2025PBFM}. Our work is closest to PBFM, but targets complex electromagnetic fields and silicon
+photonic device families, combining a complex-valued architecture with a Helmholtz residual constraint and
+S-parameter supervision.
+
+\paragraph{Complex-valued neural networks.}
+Complex-valued networks~\cite{Trabelsi2018DeepComplex} with magnitude-gated activations such as
+ModReLU~\cite{Arjovsky2016UnitaryRNN} provide an inductive bias that preserves the algebraic structure of complex
+multiplication---phase rotations, interference sums, and mode coupling---that real-valued alternatives must learn
+entirely from data. While complex-valued architectures have been explored for signal processing and MRI
+reconstruction, their application to full-field electromagnetic prediction in photonics remains largely unexplored. Our
+work combines complex convolutions, complex normalization, and complex-domain attention within a U-Net backbone
+specifically designed for wave-physics problems.
+
+\paragraph{Inverse design.}
+Inverse design in photonics is often done with gradient-based optimization coupled to full-wave
+solvers~\cite{Molesky2018InverseDesign}. Classical adjoint-based methods have enabled compact devices such as
+broadband wavelength demultiplexers~\cite{Piggott2015DemultiplexerNatPhoton} and have been extended with fabrication
+constraints~\cite{Piggott2017FabricationConstrainedSciRep}; DeepAdjoint integrates data-driven models with
+optimization algorithms~\cite{Yeung2022DeepAdjointArxiv}, and recent reviews summarize how deep learning and adjoint
+methods can be combined~\cite{Pan2023AdjointDeepLearningReview}. In contrast, we focus on the forward prediction
+problem---replacing the repeated field-solve step with a physics-constrained complex-field generator---which is a
+prerequisite for any differentiable surrogate-based inverse design workflow.

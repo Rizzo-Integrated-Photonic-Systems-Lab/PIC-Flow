@@ -233,6 +233,7 @@ class FDTDDataset(Dataset):
         sdf_feature: str = "raw",          # raw|exp|clip|clip_exp
         sdf_sigma_nm: float = 100.0,
         include_sweeps: Optional[Iterable[str]] = None,
+        exclude_devices: Optional[Iterable[str]] = None,
         use_shards: bool = False,
         shard_subdir: str = "shards",
         shard_index_name: str = "index.json",
@@ -256,6 +257,8 @@ class FDTDDataset(Dataset):
         bad_sample_max_retries: int = 10,  # Max retries before failing
         # --- Joint training: S-param conditioning ---
         include_sparams_cond: bool = False, # Append S-params to conditioning vector
+        # --- Mixed-domain center padding ---
+        canvas_hw: Optional[Tuple[int, int]] = None,  # (H, W) target size; center-pad smaller samples
     ):
         super().__init__()
         self.root = Path(root_dir)
@@ -268,6 +271,7 @@ class FDTDDataset(Dataset):
         self.shard_subdir = str(shard_subdir)
         self.shard_index_name = str(shard_index_name)
         self.return_aux = bool(return_aux)
+        self.exclude_devices: Optional[set] = set(exclude_devices) if exclude_devices else None
 
         self.include_sdf = bool(include_sdf)
         self.normalize_sdf = bool(normalize_sdf)
@@ -322,6 +326,12 @@ class FDTDDataset(Dataset):
         self.skip_bad_samples = bool(skip_bad_samples)
         self.bad_sample_max_retries = max(1, int(bad_sample_max_retries))
 
+        # Mixed-domain center padding: pad all samples to a common canvas size.
+        # E.g., canvas_hw=(320, 480) pads 160×480 rect and 320×320 sq to 320×480.
+        self.canvas_hw: Optional[Tuple[int, int]] = (
+            (int(canvas_hw[0]), int(canvas_hw[1])) if canvas_hw is not None else None
+        )
+
         # Conditioning: wavelength + geometric design parameters
         self.cond_param_names: List[str] = ["wg_width_um", "gap_um", "wg_length_um"]
         self.device_type_names: List[str] = []  # not used
@@ -354,9 +364,9 @@ class FDTDDataset(Dataset):
         if self.use_shards:
             if self.use_index_split:
                 # Use pre-computed splits from index.json (unified_sweep format)
-                all_refs: List[SampleRef] = self._collect_shard_refs(sweep_dirs, target_split=split)
+                all_refs: List[SampleRef] = self._collect_shard_refs(sweep_dirs, target_split=split, exclude_devices=self.exclude_devices)
             else:
-                all_refs = self._collect_shard_refs(sweep_dirs)
+                all_refs = self._collect_shard_refs(sweep_dirs, exclude_devices=self.exclude_devices)
         else:
             all_refs = self._collect_folder_refs(sweep_dirs)
 
@@ -451,6 +461,9 @@ class FDTDDataset(Dataset):
         """
         Probe a subset of samples to infer canonical (H, W).
         This makes loading robust when a dataset accidentally mixes transposed samples.
+
+        When canvas_hw is set, returns the canvas size as the target (mixed domains
+        are handled by center-padding, not by transposing).
         """
         hist: Dict[Tuple[int, int], int] = {}
         n_probe = min(int(max_probe), len(self.sample_refs))
@@ -466,6 +479,9 @@ class FDTDDataset(Dataset):
                 continue
         if not hist:
             return None, {}
+        # When canvas_hw is set, use it as the canonical target (padding handles size mismatch)
+        if self.canvas_hw is not None:
+            return self.canvas_hw, hist
         target = sorted(hist.items(), key=lambda kv: (kv[1], kv[0][0] * kv[0][1], kv[0][0], kv[0][1]), reverse=True)[0][0]
         return target, hist
 
@@ -487,7 +503,40 @@ class FDTDDataset(Dataset):
             return ez_r, ez_i, eps, src
         if (h, w) == (tw, th):
             return ez_r.T.copy(), ez_i.T.copy(), eps.T.copy(), src.T.copy()
+        # With canvas_hw, samples may have different native sizes — skip strict check
+        if self.canvas_hw is not None:
+            return ez_r, ez_i, eps, src
         raise ValueError(f"Unexpected sample shape {(h, w)}; expected {(th, tw)} or {(tw, th)}")
+
+    @staticmethod
+    def _center_pad_2d(arr: np.ndarray, target_h: int, target_w: int,
+                       pad_value: float = 0.0) -> np.ndarray:
+        """Center-pad a 2D array [H, W] to (target_h, target_w)."""
+        h, w = arr.shape
+        if h == target_h and w == target_w:
+            return arr
+        if h > target_h or w > target_w:
+            raise ValueError(f"Array {(h, w)} exceeds canvas {(target_h, target_w)}")
+        out = np.full((target_h, target_w), pad_value, dtype=arr.dtype)
+        y0 = (target_h - h) // 2
+        x0 = (target_w - w) // 2
+        out[y0:y0 + h, x0:x0 + w] = arr
+        return out
+
+    @staticmethod
+    def _center_pad_3d(arr: np.ndarray, target_h: int, target_w: int,
+                       pad_value: float = 0.0) -> np.ndarray:
+        """Center-pad a 3D array [N, H, W] to [N, target_h, target_w]."""
+        n, h, w = arr.shape
+        if h == target_h and w == target_w:
+            return arr
+        if h > target_h or w > target_w:
+            raise ValueError(f"Array {(n, h, w)} exceeds canvas {(target_h, target_w)}")
+        out = np.full((n, target_h, target_w), pad_value, dtype=arr.dtype)
+        y0 = (target_h - h) // 2
+        x0 = (target_w - w) // 2
+        out[:, y0:y0 + h, x0:x0 + w] = arr
+        return out
 
     def _subset_refs_by_sweep(
         self,
@@ -593,7 +642,8 @@ class FDTDDataset(Dataset):
             raise RuntimeError(f"No sample subfolders found in sweeps {sweep_dirs}")
         return all_dirs
 
-    def _collect_shard_refs(self, sweep_dirs: List[Path], target_split: Optional[str] = None) -> List[ShardRef]:
+    def _collect_shard_refs(self, sweep_dirs: List[Path], target_split: Optional[str] = None,
+                            exclude_devices: Optional[set] = None) -> List[ShardRef]:
         """
         Collect shard references from all sweep directories.
 
@@ -602,6 +652,7 @@ class FDTDDataset(Dataset):
             target_split: If provided, only include entries where index["split"] matches this value.
                          Supports "train", "val", "test". For "val", also accepts "val" entries.
                          (unified_sweep format uses pre-computed splits)
+            exclude_devices: If provided, skip entries whose "device" field is in this set.
         """
         refs: List[ShardRef] = []
         for sdir in sweep_dirs:
@@ -616,6 +667,12 @@ class FDTDDataset(Dataset):
                 if target_split is not None:
                     entry_split = e.get("split", "")
                     if entry_split != target_split:
+                        continue
+
+                # Filter by device type
+                if exclude_devices is not None:
+                    dev = e.get("device", "")
+                    if dev in exclude_devices:
                         continue
 
                 shard_path = shard_dir / e["shard"]
@@ -1377,6 +1434,18 @@ class FDTDDataset(Dataset):
         ez_r, ez_i, eps, src = self._maybe_crop_pml_arrays(pml_px, ez_r, ez_i, eps, src)
         ez_r, ez_i, eps, src = self._canonicalize_hw(ez_r, ez_i, eps, src)
 
+        # Center-pad to common canvas size (for mixed-domain datasets).
+        # Pad BEFORE normalization: fields with 0, eps with cladding value, src with 0.
+        if self.canvas_hw is not None:
+            th, tw = self.canvas_hw
+            h, w = ez_r.shape
+            if h != th or w != tw:
+                eps_clad = float(eps[0, 0])  # corner pixel is cladding
+                ez_r = self._center_pad_2d(ez_r, th, tw, pad_value=0.0)
+                ez_i = self._center_pad_2d(ez_i, th, tw, pad_value=0.0)
+                eps = self._center_pad_2d(eps, th, tw, pad_value=eps_clad)
+                src = self._center_pad_2d(src, th, tw, pad_value=0.0)
+
         # Phase anchor (mask-first, ROI fallback).
         ez_r2, ez_i2, _ = phase_anchor_mask(ez_r, ez_i, (src > 0.5), eps_r=eps, thr_eps=3.0)
         if (src is None) or (float((src > 0.5).sum()) < 4.0):
@@ -1473,6 +1542,12 @@ class FDTDDataset(Dataset):
         # Crop port masks consistently if crop_pml=True.
         if port_masks_np is not None:
             (port_masks_np,) = self._maybe_crop_pml_arrays(pml_px, port_masks_np)
+
+        # Center-pad port masks to match canvas (same as field arrays).
+        if self.canvas_hw is not None and port_masks_np is not None:
+            th, tw = self.canvas_hw
+            if port_masks_np.ndim == 3 and (port_masks_np.shape[1] != th or port_masks_np.shape[2] != tw):
+                port_masks_np = self._center_pad_3d(port_masks_np, th, tw, pad_value=0.0)
 
         # Infer P (#ports)
         P = None

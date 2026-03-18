@@ -14,20 +14,25 @@
 # Unified Multi-Device Photonic Dataset Generation
 # =============================================================================
 #
-# Generates training data for 8 device types:
-#   - Straight waveguides (500)
-#   - Tapers (750)
-#   - Euler bends (500)
-#   - Circular bends (500)
-#   - S-bends (250)
-#   - Y-branches (750) - supports splitter AND combiner modes
-#   - Directional couplers (1000)
-#   - Crossings (750)
+# Generates training data for 9 device types across two domain shapes:
 #
-# Total: 5,000 unique geometries × 4 wavelengths = 20,000 stored samples
-#        D4 augmentation (8x) applied during training = 160,000 effective samples
+#   Rectangular (480x160 px = 24x8 µm):
+#     - Straight waveguides (200)
+#     - Tapers (800)
+#     - 2x2 MMIs (2500)
+#     - S-bends (800)
+#     - Y-branches (1500)
+#     - Directional couplers (2500)
 #
-# Split: 80/10/10 by geometry_id (4,000 train / 500 val / 500 test geometries)
+#   Square (320x320 px = 16x16 µm):
+#     - Euler bends (1500)
+#     - Circular bends (1500)
+#     - Waveguide crossings (3000)
+#
+# Total: ~14,300 unique geometries x 5 wavelengths = ~71,500 simulations
+#        D2/D4 augmentation applied during training (not at generation time)
+#
+# Split: 80/10/10 by geometry_id
 #
 # Per sample: eps, Ez (complex), src_mask, port_masks, S-parameters
 # =============================================================================
@@ -42,24 +47,21 @@ export MKL_NUM_THREADS=1
 
 # ---- Run parameters (tune these) ----
 
-# Total unique geometries (scaled proportionally across devices)
-N_GEO=5000
+# Total unique geometries (scaled proportionally across 9 device types)
+N_GEO=14300
 
 # Number of parallel workers (leave headroom for OS/IO)
 N_PROCS=26
 
-# Simulation resolution (pixels per µm)
-RESOLUTION=18
+# Simulation resolution (pixels per um) — meets Meep minimum of 18 for Si at 1550nm
+RESOLUTION=20
 
-# PML thickness (µm)
-DPML=1.0
+# Interior crop size in pixels — rectangular domain (propagation x transverse)
+CROP_X_PX=480
+CROP_Y_PX=160
 
-# Simulation cell size (µm) - devices must fit in (cell - 2*dpml)
-CELL_X=26.0
-CELL_Y=26.0
-
-# Non-PML crop size for quantized devices (ybranch, dir_coupler)
-CROP_PX=432
+# Interior crop size in pixels — square domain (for bends/crossings)
+CROP_SQ_PX=320
 
 # DFT decay tolerance
 DECAY_TOL=1e-5
@@ -84,10 +86,9 @@ python -u FDTD/unified_sweep.py \
   --out-dir "${OUT_DIR}" \
   --n-geo ${N_GEO} \
   --resolution ${RESOLUTION} \
-  --dpml ${DPML} \
-  --cell-x ${CELL_X} \
-  --cell-y ${CELL_Y} \
-  --crop-px ${CROP_PX} \
+  --crop-x-px ${CROP_X_PX} \
+  --crop-y-px ${CROP_Y_PX} \
+  --crop-sq-px ${CROP_SQ_PX} \
   --decay-tol ${DECAY_TOL} \
   --n-procs ${N_PROCS} \
   --shard-size ${SHARD_SIZE} \
