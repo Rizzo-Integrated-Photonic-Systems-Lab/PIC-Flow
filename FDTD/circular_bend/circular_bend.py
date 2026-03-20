@@ -173,13 +173,37 @@ class CircularBend2D(Device2DBase):
 
         self.build_geometry()
 
+    def _clamp_point_inside_nonpml(self, point_xy, pad=0.1):
+        """Clamp a point to remain safely inside the non-PML region."""
+        x_min, x_max, y_min, y_max = self._nonpml_bounds
+        px, py = float(point_xy[0]), float(point_xy[1])
+        return np.array([
+            min(max(px, x_min + float(pad)), x_max - float(pad)),
+            min(max(py, y_min + float(pad)), y_max - float(pad)),
+        ], dtype=np.float64)
+
     def build_geometry(self):
         """Build the circular bend geometry with straight input/output leads."""
         core = self.core_medium
 
+        def ray_to_bounds(point, direction, x_min, x_max, y_min, y_max, eps=1e-12):
+            """Return positive distance to the first axis-aligned boundary along direction."""
+            dx, dy = float(direction[0]), float(direction[1])
+            t_candidates = []
+            if dx > eps:
+                t_candidates.append((x_max - point[0]) / dx)
+            elif dx < -eps:
+                t_candidates.append((x_min - point[0]) / dx)
+            if dy > eps:
+                t_candidates.append((y_max - point[1]) / dy)
+            elif dy < -eps:
+                t_candidates.append((y_min - point[1]) / dy)
+            t_candidates = [t for t in t_candidates if t > 0]
+            if not t_candidates:
+                return 0.0
+            return float(min(t_candidates))
+
         # Build circular arc centerline
-        # Arc starts at origin, tangent +x, curves upward (counter-clockwise)
-        # Center of circle is at (0, R)
         arc_center = (0.0, self.bend_radius_um)
         arc_start_angle = -np.pi / 2  # Start at bottom of circle
         arc_end_angle = arc_start_angle + self.bend_angle_rad
@@ -210,70 +234,101 @@ class CircularBend2D(Device2DBase):
         # Cell boundaries
         half_x = 0.5 * self.cell_x
         half_y = 0.5 * self.cell_y
+        nonpml_left = -half_x + self.dpml
+        nonpml_right = +half_x - self.dpml
+        nonpml_bot = -half_y + self.dpml
+        nonpml_top = +half_y - self.dpml
+        self._nonpml_bounds = (nonpml_left, nonpml_right, nonpml_bot, nonpml_top)
+
+        half_w = 0.5 * float(self.wg_width)
+        x_extent = max(abs(float(bend_pts[:, 0].min())), abs(float(bend_pts[:, 0].max()))) + half_w + self.fit_margin_um
+        y_extent = max(abs(float(bend_pts[:, 1].min())), abs(float(bend_pts[:, 1].max()))) + half_w + self.fit_margin_um
+        if x_extent > min(abs(nonpml_left), abs(nonpml_right)):
+            raise ValueError(
+                f"CircularBend2D exceeds non-PML x extent ({x_extent:.2f} um > "
+                f"{min(abs(nonpml_left), abs(nonpml_right)):.2f} um). Reduce bend_radius_um/angle or increase crop."
+            )
+        if y_extent > min(abs(nonpml_bot), abs(nonpml_top)):
+            raise ValueError(
+                f"CircularBend2D exceeds non-PML y extent ({y_extent:.2f} um > "
+                f"{min(abs(nonpml_bot), abs(nonpml_top)):.2f} um). Reduce bend_radius_um/angle or increase crop."
+            )
 
         # Build geometry as polyline blocks for the bend
         bend_blocks = polyline_to_blocks(bend_pts, wg_width_um=self.wg_width, material=core)
 
-        # Add straight input lead: from bend start extending into PML beyond -x boundary
+        # Add straight input/output leads along tangents until beyond PML boundaries.
         bend_start = bend_pts[0]
-        lead_in_length = abs(bend_start[0] - (-half_x - self.dpml)) + 1.0  # Extra 1µm to ensure coverage
-        lead_in_center_x = bend_start[0] - 0.5 * lead_in_length
-        lead_in_block = mp.Block(
-            size=mp.Vector3(lead_in_length, self.wg_width, mp.inf),
-            center=mp.Vector3(lead_in_center_x, bend_start[1], 0),
-            material=core,
-        )
-
-        # Add straight output lead: from bend end extending into PML beyond +y boundary
         bend_end = bend_pts[-1]
-        lead_out_length = abs((half_y + self.dpml) - bend_end[1]) + 1.0  # Extra 1µm to ensure coverage
-        lead_out_center_y = bend_end[1] + 0.5 * lead_out_length
-        lead_out_block = mp.Block(
-            size=mp.Vector3(self.wg_width, lead_out_length, mp.inf),
-            center=mp.Vector3(bend_end[0], lead_out_center_y, 0),
+        dir_in = -_unit(in_tangent)
+        dir_out = _unit(out_tangent)
+
+        x_min = -half_x - self.dpml
+        x_max = +half_x + self.dpml
+        y_min = -half_y - self.dpml
+        y_max = +half_y + self.dpml
+
+        lead_in_length = ray_to_bounds(bend_start, dir_in, x_min, x_max, y_min, y_max) + 1.0
+        lead_out_length = ray_to_bounds(bend_end, dir_out, x_min, x_max, y_min, y_max) + 1.0
+
+        lead_in_end = bend_start + dir_in * lead_in_length
+        lead_out_end = bend_end + dir_out * lead_out_length
+        lead_in_blocks = polyline_to_blocks(
+            np.vstack([lead_in_end, bend_start]),
+            wg_width_um=self.wg_width,
+            material=core,
+        )
+        lead_out_blocks = polyline_to_blocks(
+            np.vstack([bend_end, lead_out_end]),
+            wg_width_um=self.wg_width,
             material=core,
         )
 
-        # Combine: straight leads + bend blocks
-        self.geometry = [lead_in_block] + bend_blocks + [lead_out_block]
+        self._lead_in_end = lead_in_end
+        self._lead_out_end = lead_out_end
+        self.geometry = lead_in_blocks + bend_blocks + lead_out_blocks
 
         # Device window for conditioning: bounding box of bend only
         x0, x1 = float(bend_pts[:, 0].min()), float(bend_pts[:, 0].max())
         y0, y1 = float(bend_pts[:, 1].min()), float(bend_pts[:, 1].max())
-        half_w = 0.5 * float(self.wg_width)
         self.dev_cx = 0.5 * (x0 + x1)
         self.dev_cy = 0.5 * (y0 + y1)
         self.dev_wx = (x1 - x0) + 2.0 * (self.fit_margin_um + half_w)
         self.dev_wy = (y1 - y0) + 2.0 * (self.fit_margin_um + half_w)
 
-        # Ports: placed at non-PML boundary (inside PML by small margin)
+        # Ports: placed at non-PML boundary (inside by small margin)
         port_span = self.wg_width + self.port_y_pad
         port_margin = self.dpml + 0.5  # 0.5 µm inside the non-PML region
 
-        # Input port: on left edge, inside PML
-        port_in_x = -half_x + port_margin
-        port_in_y = bend_start[1]  # y-position where bend starts
+        nx_min = -half_x + port_margin
+        nx_max = +half_x - port_margin
+        ny_min = -half_y + port_margin
+        ny_max = +half_y - port_margin
 
+        def port_size_from_dir(direction):
+            if abs(direction[0]) >= abs(direction[1]):
+                return mp.Vector3(0, port_span, 0)
+            return mp.Vector3(port_span, 0, 0)
+
+        t_in = ray_to_bounds(bend_start, dir_in, nx_min, nx_max, ny_min, ny_max)
+        if t_in <= 0:
+            raise ValueError("CircularBend2D has no room to place the input port inside the non-PML region.")
+        port_in_center = bend_start + dir_in * t_in
         self.port_in = mp.Volume(
-            center=mp.Vector3(port_in_x, port_in_y, 0),
-            size=mp.Vector3(0, port_span, 0),
+            center=mp.Vector3(port_in_center[0], port_in_center[1], 0),
+            size=port_size_from_dir(dir_in),
         )
 
-        # Source: upstream of input port along the straight lead
-        src_x = port_in_x - self.source_shift
-        src_y = port_in_y
-        self.src_vol = mp.Volume(
-            center=mp.Vector3(src_x, src_y, 0),
-            size=self.port_in.size,
-        )
+        src_center = self._clamp_point_inside_nonpml(port_in_center + dir_in * self.source_shift)
+        self.src_vol = mp.Volume(center=mp.Vector3(src_center[0], src_center[1], 0), size=self.port_in.size)
 
-        # Output port: on top edge, inside PML
-        port_out_x = bend_end[0]  # x-position where bend ends
-        port_out_y = half_y - port_margin
-
+        t_out = ray_to_bounds(bend_end, dir_out, nx_min, nx_max, ny_min, ny_max)
+        if t_out <= 0:
+            raise ValueError("CircularBend2D has no room to place the output port inside the non-PML region.")
+        port_out_center = bend_end + dir_out * t_out
         self.port_out = mp.Volume(
-            center=mp.Vector3(port_out_x, port_out_y, 0),
-            size=mp.Vector3(port_span, 0, 0),
+            center=mp.Vector3(port_out_center[0], port_out_center[1], 0),
+            size=port_size_from_dir(dir_out),
         )
 
         # Store tangents for k-vector directions
@@ -294,18 +349,17 @@ class CircularBend2D(Device2DBase):
         mask = np.zeros((ny, nx), dtype=np.uint8)
         half_width = 0.5 * self.wg_width
 
-        # 1. Input lead: straight horizontal waveguide from -cell_x/2 to bend start
-        bend_start = bend_pts[0]
-        half_x = 0.5 * self.cell_x
-        # Mask is 1 where: x <= bend_start[0] AND |y - bend_start[1]| <= half_width
-        in_lead = (xx <= bend_start[0]) & (np.abs(yy - bend_start[1]) <= half_width)
-        mask = np.logical_or(mask, in_lead).astype(np.uint8)
+        # Build a single polyline for lead-in + bend + lead-out.
+        if hasattr(self, "_lead_in_end") and hasattr(self, "_lead_out_end"):
+            pts = np.vstack([self._lead_in_end, bend_pts, self._lead_out_end])
+        else:
+            pts = bend_pts
 
-        # 2. Bend section: rasterize polyline
+        # Rasterize polyline.
         min_dist = np.full((ny, nx), np.inf, dtype=np.float64)
-        for i in range(len(bend_pts) - 1):
-            p0 = bend_pts[i]
-            p1 = bend_pts[i + 1]
+        for i in range(len(pts) - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
 
             dx_seg = p1[0] - p0[0]
             dy_seg = p1[1] - p0[1]
@@ -323,17 +377,7 @@ class CircularBend2D(Device2DBase):
             dist = np.sqrt((xx - closest_x)**2 + (yy - closest_y)**2)
             min_dist = np.minimum(min_dist, dist)
 
-        bend_mask = (min_dist <= half_width).astype(np.uint8)
-        mask = np.logical_or(mask, bend_mask).astype(np.uint8)
-
-        # 3. Output lead: straight vertical waveguide from bend end to +cell_y/2
-        bend_end = bend_pts[-1]
-        half_y = 0.5 * self.cell_y
-        # Mask is 1 where: y >= bend_end[1] AND |x - bend_end[0]| <= half_width
-        out_lead = (yy >= bend_end[1]) & (np.abs(xx - bend_end[0]) <= half_width)
-        mask = np.logical_or(mask, out_lead).astype(np.uint8)
-
-        return mask
+        return np.logical_or(mask, (min_dist <= half_width)).astype(np.uint8)
 
     # -------------------------
     # Build simulations
@@ -349,8 +393,12 @@ class CircularBend2D(Device2DBase):
             k_in = mp.Vector3(float(self._in_tangent[0]), float(self._in_tangent[1]), 0)
         else:
             # Input from output port (reversed)
-            src_x = self.port_out.center.x + self.source_shift * self._out_tangent[0]
-            src_y = self.port_out.center.y + self.source_shift * self._out_tangent[1]
+            src_xy = self._clamp_point_inside_nonpml((
+                self.port_out.center.x + self.source_shift * self._out_tangent[0],
+                self.port_out.center.y + self.source_shift * self._out_tangent[1],
+            ))
+            src_x = src_xy[0]
+            src_y = src_xy[1]
             src_vol = mp.Volume(center=mp.Vector3(src_x, src_y, 0), size=self.port_out.size)
             k_in = mp.Vector3(float(self._out_tangent[0]), float(self._out_tangent[1]), 0)
 
@@ -406,8 +454,12 @@ class CircularBend2D(Device2DBase):
             src_vol = self.src_vol
             k_in = mp.Vector3(float(self._in_tangent[0]), float(self._in_tangent[1]), 0)
         else:
-            src_x = self.port_out.center.x + self.source_shift * self._out_tangent[0]
-            src_y = self.port_out.center.y + self.source_shift * self._out_tangent[1]
+            src_xy = self._clamp_point_inside_nonpml((
+                self.port_out.center.x + self.source_shift * self._out_tangent[0],
+                self.port_out.center.y + self.source_shift * self._out_tangent[1],
+            ))
+            src_x = src_xy[0]
+            src_y = src_xy[1]
             src_vol = mp.Volume(center=mp.Vector3(src_x, src_y, 0), size=self.port_out.size)
             k_in = mp.Vector3(float(self._out_tangent[0]), float(self._out_tangent[1]), 0)
 

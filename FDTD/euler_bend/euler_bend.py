@@ -220,6 +220,15 @@ class EulerBend2D(Device2DBase):
 
         self.build_geometry()
 
+    def _clamp_point_inside_nonpml(self, point_xy, pad=0.1):
+        """Clamp a point to remain safely inside the non-PML region."""
+        x_min, x_max, y_min, y_max = self._nonpml_bounds
+        px, py = float(point_xy[0]), float(point_xy[1])
+        return np.array([
+            min(max(px, x_min + float(pad)), x_max - float(pad)),
+            min(max(py, y_min + float(pad)), y_max - float(pad)),
+        ], dtype=np.float64)
+
     def build_geometry(self):
         """Build the Euler bend geometry with straight input/output leads."""
         core = self.core_medium
@@ -269,6 +278,25 @@ class EulerBend2D(Device2DBase):
         # Cell boundaries
         half_x = 0.5 * self.cell_x
         half_y = 0.5 * self.cell_y
+        nonpml_left = -half_x + self.dpml
+        nonpml_right = +half_x - self.dpml
+        nonpml_bot = -half_y + self.dpml
+        nonpml_top = +half_y - self.dpml
+        self._nonpml_bounds = (nonpml_left, nonpml_right, nonpml_bot, nonpml_top)
+
+        half_w = 0.5 * float(self.wg_width)
+        x_extent = max(abs(float(bend_pts[:, 0].min())), abs(float(bend_pts[:, 0].max()))) + half_w + self.fit_margin_um
+        y_extent = max(abs(float(bend_pts[:, 1].min())), abs(float(bend_pts[:, 1].max()))) + half_w + self.fit_margin_um
+        if x_extent > min(abs(nonpml_left), abs(nonpml_right)):
+            raise ValueError(
+                f"EulerBend2D exceeds non-PML x extent ({x_extent:.2f} um > "
+                f"{min(abs(nonpml_left), abs(nonpml_right)):.2f} um). Reduce R_min_um/angle or increase crop."
+            )
+        if y_extent > min(abs(nonpml_bot), abs(nonpml_top)):
+            raise ValueError(
+                f"EulerBend2D exceeds non-PML y extent ({y_extent:.2f} um > "
+                f"{min(abs(nonpml_bot), abs(nonpml_top)):.2f} um). Reduce R_min_um/angle or increase crop."
+            )
 
         # Build geometry as polyline blocks for the bend
         bend_blocks = polyline_to_blocks(bend_pts, wg_width_um=self.wg_width, material=core)
@@ -310,7 +338,6 @@ class EulerBend2D(Device2DBase):
         # Device window for conditioning: bounding box of bend only
         x0, x1 = float(bend_pts[:, 0].min()), float(bend_pts[:, 0].max())
         y0, y1 = float(bend_pts[:, 1].min()), float(bend_pts[:, 1].max())
-        half_w = 0.5 * float(self.wg_width)
         self.dev_cx = 0.5 * (x0 + x1)
         self.dev_cy = 0.5 * (y0 + y1)
         self.dev_wx = (x1 - x0) + 2.0 * (self.fit_margin_um + half_w)
@@ -331,14 +358,18 @@ class EulerBend2D(Device2DBase):
             return mp.Vector3(port_span, 0, 0)
 
         t_in = ray_to_bounds(bend_start, dir_in, nx_min, nx_max, ny_min, ny_max)
+        if t_in <= 0:
+            raise ValueError("EulerBend2D has no room to place the input port inside the non-PML region.")
         port_in_center = bend_start + dir_in * t_in
         port_in_size = port_size_from_dir(dir_in)
         self.port_in = mp.Volume(center=mp.Vector3(port_in_center[0], port_in_center[1], 0), size=port_in_size)
 
-        src_center = port_in_center + dir_in * self.source_shift
+        src_center = self._clamp_point_inside_nonpml(port_in_center + dir_in * self.source_shift)
         self.src_vol = mp.Volume(center=mp.Vector3(src_center[0], src_center[1], 0), size=self.port_in.size)
 
         t_out = ray_to_bounds(bend_end, dir_out, nx_min, nx_max, ny_min, ny_max)
+        if t_out <= 0:
+            raise ValueError("EulerBend2D has no room to place the output port inside the non-PML region.")
         port_out_center = bend_end + dir_out * t_out
         port_out_size = port_size_from_dir(dir_out)
         self.port_out = mp.Volume(center=mp.Vector3(port_out_center[0], port_out_center[1], 0), size=port_out_size)
@@ -408,8 +439,12 @@ class EulerBend2D(Device2DBase):
             k_in = mp.Vector3(float(self._in_tangent[0]), float(self._in_tangent[1]), 0)
         else:
             # Input from output port (reversed)
-            src_x = self.port_out.center.x + self.source_shift * self._out_tangent[0]
-            src_y = self.port_out.center.y + self.source_shift * self._out_tangent[1]
+            src_xy = self._clamp_point_inside_nonpml((
+                self.port_out.center.x + self.source_shift * self._out_tangent[0],
+                self.port_out.center.y + self.source_shift * self._out_tangent[1],
+            ))
+            src_x = src_xy[0]
+            src_y = src_xy[1]
             src_vol = mp.Volume(center=mp.Vector3(src_x, src_y, 0), size=self.port_out.size)
             k_in = mp.Vector3(float(self._out_tangent[0]), float(self._out_tangent[1]), 0)
 
@@ -465,8 +500,12 @@ class EulerBend2D(Device2DBase):
             src_vol = self.src_vol
             k_in = mp.Vector3(float(self._in_tangent[0]), float(self._in_tangent[1]), 0)
         else:
-            src_x = self.port_out.center.x + self.source_shift * self._out_tangent[0]
-            src_y = self.port_out.center.y + self.source_shift * self._out_tangent[1]
+            src_xy = self._clamp_point_inside_nonpml((
+                self.port_out.center.x + self.source_shift * self._out_tangent[0],
+                self.port_out.center.y + self.source_shift * self._out_tangent[1],
+            ))
+            src_x = src_xy[0]
+            src_y = src_xy[1]
             src_vol = mp.Volume(center=mp.Vector3(src_x, src_y, 0), size=self.port_out.size)
             k_in = mp.Vector3(float(self._out_tangent[0]), float(self._out_tangent[1]), 0)
 

@@ -526,6 +526,24 @@ class TaperedCrossing2D(Device2DBase):
         """Build tapered 90° crossing with expanded intersection."""
         half_x = 0.5 * self.cell_x
         half_y = 0.5 * self.cell_y
+        nonpml_half_x = half_x - self.dpml
+        nonpml_half_y = half_y - self.dpml
+
+        min_crossing_width = max(self.wg_width_h, self.wg_width_v)
+        if self.crossing_width < min_crossing_width:
+            raise ValueError(
+                f"TaperedCrossing2D: crossing_width ({self.crossing_width:.3f}) must be >= "
+                f"max(wg_width_h, wg_width_v) ({min_crossing_width:.3f})."
+            )
+        max_taper_x = nonpml_half_x - self.fit_margin_um
+        max_taper_y = nonpml_half_y - self.fit_margin_um
+        if self.taper_length_um <= 0:
+            raise ValueError("TaperedCrossing2D: taper_length_um must be > 0.")
+        if self.taper_length_um >= max_taper_x or self.taper_length_um >= max_taper_y:
+            raise ValueError(
+                f"TaperedCrossing2D: taper_length_um ({self.taper_length_um:.3f}) leaves no room for straight sections "
+                f"inside the non-PML region ({max_taper_x:.3f} x {max_taper_y:.3f} um available)."
+            )
 
         # Horizontal waveguide with taper at center
         # Left section: uniform
@@ -620,6 +638,10 @@ class TaperedCrossing2D(Device2DBase):
         # Ports: same as uniform crossing
         port_span = max(self.wg_width_h, self.wg_width_v) + self.port_y_pad
         port_margin = self.dpml + 0.5
+        nonpml_left = -half_x + self.dpml
+        nonpml_right = half_x - self.dpml
+        nonpml_bot = -half_y + self.dpml
+        nonpml_top = half_y - self.dpml
 
         port_1_x = -half_x + port_margin
         self.port_1 = mp.Volume(
@@ -627,7 +649,7 @@ class TaperedCrossing2D(Device2DBase):
             size=mp.Vector3(0, port_span, 0),
         )
         self.src_vol_1 = mp.Volume(
-            center=mp.Vector3(port_1_x - self.source_shift, 0, 0),
+            center=mp.Vector3(max(port_1_x - self.source_shift, nonpml_left + 0.1), 0, 0),
             size=self.port_1.size,
         )
 
@@ -637,7 +659,7 @@ class TaperedCrossing2D(Device2DBase):
             size=mp.Vector3(0, port_span, 0),
         )
         self.src_vol_2 = mp.Volume(
-            center=mp.Vector3(port_2_x + self.source_shift, 0, 0),
+            center=mp.Vector3(min(port_2_x + self.source_shift, nonpml_right - 0.1), 0, 0),
             size=self.port_2.size,
         )
 
@@ -647,7 +669,7 @@ class TaperedCrossing2D(Device2DBase):
             size=mp.Vector3(port_span, 0, 0),
         )
         self.src_vol_3 = mp.Volume(
-            center=mp.Vector3(0, port_3_y - self.source_shift, 0),
+            center=mp.Vector3(0, max(port_3_y - self.source_shift, nonpml_bot + 0.1), 0),
             size=self.port_3.size,
         )
 
@@ -657,7 +679,7 @@ class TaperedCrossing2D(Device2DBase):
             size=mp.Vector3(port_span, 0, 0),
         )
         self.src_vol_4 = mp.Volume(
-            center=mp.Vector3(0, port_4_y + self.source_shift, 0),
+            center=mp.Vector3(0, min(port_4_y + self.source_shift, nonpml_top - 0.1), 0),
             size=self.port_4.size,
         )
 

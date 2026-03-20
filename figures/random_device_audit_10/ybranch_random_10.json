@@ -1,0 +1,142 @@
+[
+  {
+    "sample_idx": 0,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.47500000000000003,
+      "l_junction_um": 2.025,
+      "l_bend_um": 5.4,
+      "h_bend_um": 0.925,
+      "l_out_um": 1.375
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_00.png"
+  },
+  {
+    "sample_idx": 1,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.47500000000000003,
+      "l_junction_um": 1.225,
+      "l_bend_um": 4.1000000000000005,
+      "h_bend_um": 1.9000000000000001,
+      "l_out_um": 2.325
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_01.png"
+  },
+  {
+    "sample_idx": 2,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.45,
+      "l_junction_um": 1.9000000000000001,
+      "l_bend_um": 6.925000000000001,
+      "h_bend_um": 1.2750000000000001,
+      "l_out_um": 1.675
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_02.png"
+  },
+  {
+    "sample_idx": 3,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.575,
+      "l_junction_um": 1.5,
+      "l_bend_um": 5.675000000000001,
+      "h_bend_um": 0.9750000000000001,
+      "l_out_um": 3.2750000000000004
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_03.png"
+  },
+  {
+    "sample_idx": 4,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.525,
+      "l_junction_um": 2.9000000000000004,
+      "l_bend_um": 6.425000000000001,
+      "h_bend_um": 2.35,
+      "l_out_um": 2.5
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_04.png"
+  },
+  {
+    "sample_idx": 5,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.55,
+      "l_junction_um": 2.25,
+      "l_bend_um": 6.300000000000001,
+      "h_bend_um": 0.65,
+      "l_out_um": 3.8000000000000003
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_05.png"
+  },
+  {
+    "sample_idx": 6,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 3,
+    "params": {
+      "wg_width_um": 0.4,
+      "l_junction_um": 2.75,
+      "l_bend_um": 4.55,
+      "h_bend_um": 2.2,
+      "l_out_um": 1.975
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_06.png"
+  },
+  {
+    "sample_idx": 7,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 3,
+    "params": {
+      "wg_width_um": 0.5,
+      "l_junction_um": 2.5500000000000003,
+      "l_bend_um": 4.800000000000001,
+      "h_bend_um": 2.0500000000000003,
+      "l_out_um": 1.25
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_07.png"
+  },
+  {
+    "sample_idx": 8,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.42500000000000004,
+      "l_junction_um": 1.7000000000000002,
+      "l_bend_um": 4.95,
+      "h_bend_um": 1.375,
+      "l_out_um": 3.6750000000000003
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_08.png"
+  },
+  {
+    "sample_idx": 9,
+    "device": "ybranch",
+    "display_name": "Y-Branch",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.525,
+      "l_junction_um": 1.175,
+      "l_bend_um": 6.025,
+      "h_bend_um": 1.625,
+      "l_out_um": 3.0500000000000003
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/ybranch/ybranch_sample_09.png"
+  }
+]

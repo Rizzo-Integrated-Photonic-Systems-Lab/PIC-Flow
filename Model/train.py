@@ -888,6 +888,10 @@ def main(args):
     if getattr(args, "exclude_devices", ""):
         exclude_devices = [s.strip() for s in args.exclude_devices.split(",") if s.strip()]
 
+    include_wavelengths = None
+    if getattr(args, "include_wavelengths", ""):
+        include_wavelengths = [float(s.strip()) for s in args.include_wavelengths.split(",") if s.strip()]
+
     # sdf sigma px -> nm
     sdf_sigma_px = float(getattr(args, "sdf_sigma_px", 0.0) or 0.0)
     if sdf_sigma_px and sdf_sigma_px > 0:
@@ -985,6 +989,7 @@ def main(args):
                 shard_index_name=args.shard_index_name,
                 include_sweeps=include_sweeps,
                 exclude_devices=exclude_devices,
+                include_wavelengths=include_wavelengths,
                 subset_train_per_sweep=subset_train if subset_train else None,
                 subset_val_per_sweep=subset_val if subset_train or subset_val else None,
                 subset_seed=subset_seed,
@@ -1016,6 +1021,7 @@ def main(args):
             shard_index_name=args.shard_index_name,
             include_sweeps=include_sweeps,
             exclude_devices=exclude_devices,
+            include_wavelengths=include_wavelengths,
             return_aux=True,
             subset_train_per_sweep=subset_train if subset_train else None,
             subset_val_per_sweep=subset_val if subset_train or subset_val else None,
@@ -1046,6 +1052,7 @@ def main(args):
             shard_index_name=args.shard_index_name,
             include_sweeps=include_sweeps,
             exclude_devices=exclude_devices,
+            include_wavelengths=include_wavelengths,
             return_aux=True,
             subset_train_per_sweep=subset_train if subset_train else None,
             subset_val_per_sweep=subset_val if subset_train or subset_val else None,
@@ -1169,14 +1176,14 @@ def main(args):
         p.requires_grad = False
     ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
-    # torch.compile: disable when unroll_steps>0 (variable-length loop causes recompilation).
-    use_compile = int(getattr(args, "unroll_steps", 0)) == 0
-    if use_compile:
-        import torch._functorch.config as _ftc
-        _ftc.donated_buffer = False
-        base_model = torch.compile(base_model)
-        if is_rank0():
-            logger.info("torch.compile enabled on base_model")
+    # torch.compile: disabled — Inductor does not support complex tensors in backward pass.
+    # use_compile = int(getattr(args, "unroll_steps", 0)) == 0
+    # if use_compile:
+    #     import torch._functorch.config as _ftc
+    #     _ftc.donated_buffer = False
+    #     base_model = torch.compile(base_model)
+    #     if is_rank0():
+    #         logger.info("torch.compile enabled on base_model")
 
     if use_ddp:
         enable_head = bool(getattr(base_model, "enable_sparam_head", False))
@@ -1256,6 +1263,17 @@ def main(args):
     # Resume
     # -----------------------
     start_epoch = 1
+
+    # Auto-resume: find latest checkpoint if --auto-resume and no explicit --resume-from
+    if getattr(args, "auto_resume", False) and not args.resume_from:
+        import glob as _glob
+        ckpt_pattern = os.path.join(ckpt_dir, "*.pt")
+        ckpt_files = sorted(_glob.glob(ckpt_pattern))
+        if ckpt_files:
+            args.resume_from = ckpt_files[-1]
+            if is_rank0():
+                logger.info(f"Auto-resume: found {args.resume_from}")
+
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
 
@@ -1476,7 +1494,7 @@ def main(args):
             # --- Joint training: sample mask mode and handle 3-channel noise ---
             batch_mask_mode = MASK_MODE_FORWARD
             v_t_eps_target = None
-            base_cond_dim = 1 + 3  # wavelength + 3 geom params
+            base_cond_dim = 1  # wavelength only
 
             if joint_training:
                 batch_mask_mode = sample_mask_mode(
@@ -2468,7 +2486,7 @@ def main(args):
                             lambda_um=lambda_um_s,
                             cfg_scale=inv_cfg_scale,
                             sig_min=SIG_MIN,
-                            base_cond_dim=1 + 3,  # wavelength + 3 geom params (NOT cond_dim which includes S-params)
+                            base_cond_dim=1,  # wavelength only (NOT cond_dim which includes S-params)
                         )
 
                         # De-normalize generated output: [B,3,H,W] = [fields(2), eps(1)]
@@ -2843,6 +2861,8 @@ if __name__ == "__main__":
                         help="Comma-separated sweep subdirectory names to include (empty = all)")
     parser.add_argument("--exclude-devices", type=str, default="",
                         help="Comma-separated device types to exclude (e.g. 'straight,mmi')")
+    parser.add_argument("--include-wavelengths", type=str, default="",
+                        help="Comma-separated wavelengths in µm to include (e.g. '1.55'). Empty = all.")
     parser.add_argument("--use-index-split", type=bool, default=False, action=argparse.BooleanOptionalAction,
                         help="Use pre-computed split field from index.json (unified_sweep format)")
     parser.add_argument("--use-fast-dataset", type=bool, default=False, action=argparse.BooleanOptionalAction,
@@ -2985,6 +3005,8 @@ if __name__ == "__main__":
                         help="ODE integration steps for inverse eval")
 
     parser.add_argument("--resume-from", type=str, default="")
+    parser.add_argument("--auto-resume", action="store_true", default=False,
+                        help="Automatically resume from latest checkpoint in ckpt_dir if available")
     parser.add_argument("--reset-lr-on-resume", action="store_true", default=False,
                         help="Reset LR schedule to fresh cosine from --lr on resume")
     parser.add_argument("--t-physics-min", type=float, default=0.0,

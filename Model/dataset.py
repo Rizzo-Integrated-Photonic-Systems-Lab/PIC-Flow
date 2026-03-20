@@ -234,6 +234,7 @@ class FDTDDataset(Dataset):
         sdf_sigma_nm: float = 100.0,
         include_sweeps: Optional[Iterable[str]] = None,
         exclude_devices: Optional[Iterable[str]] = None,
+        include_wavelengths: Optional[Iterable[float]] = None,
         use_shards: bool = False,
         shard_subdir: str = "shards",
         shard_index_name: str = "index.json",
@@ -272,6 +273,7 @@ class FDTDDataset(Dataset):
         self.shard_index_name = str(shard_index_name)
         self.return_aux = bool(return_aux)
         self.exclude_devices: Optional[set] = set(exclude_devices) if exclude_devices else None
+        self.include_wavelengths: Optional[List[float]] = list(include_wavelengths) if include_wavelengths else None
 
         self.include_sdf = bool(include_sdf)
         self.normalize_sdf = bool(normalize_sdf)
@@ -332,17 +334,17 @@ class FDTDDataset(Dataset):
             (int(canvas_hw[0]), int(canvas_hw[1])) if canvas_hw is not None else None
         )
 
-        # Conditioning: wavelength + geometric design parameters
-        self.cond_param_names: List[str] = ["wg_width_um", "gap_um", "wg_length_um"]
+        # Conditioning: wavelength only (geometry is in the spatial eps map)
+        self.cond_param_names: List[str] = []
         self.device_type_names: List[str] = []  # not used
         self.include_sparams_cond = bool(include_sparams_cond)
-        # Base cond_dim: wavelength + geom params
-        base_cond_dim = 1 + len(self.cond_param_names)  # 4
+        # Base cond_dim: wavelength only
+        base_cond_dim = 1  # wavelength
         if self.include_sparams_cond:
             # +8 for Re/Im of 4 S-params, +4 for port_valid flags = 12 extra
-            self.cond_dim: int = base_cond_dim + 12  # 16
+            self.cond_dim: int = base_cond_dim + 12  # 13
         else:
-            self.cond_dim: int = base_cond_dim  # 4
+            self.cond_dim: int = base_cond_dim  # 1
 
         self.max_ports: int = 4
 
@@ -364,9 +366,9 @@ class FDTDDataset(Dataset):
         if self.use_shards:
             if self.use_index_split:
                 # Use pre-computed splits from index.json (unified_sweep format)
-                all_refs: List[SampleRef] = self._collect_shard_refs(sweep_dirs, target_split=split, exclude_devices=self.exclude_devices)
+                all_refs: List[SampleRef] = self._collect_shard_refs(sweep_dirs, target_split=split, exclude_devices=self.exclude_devices, include_wavelengths=self.include_wavelengths)
             else:
-                all_refs = self._collect_shard_refs(sweep_dirs, exclude_devices=self.exclude_devices)
+                all_refs = self._collect_shard_refs(sweep_dirs, exclude_devices=self.exclude_devices, include_wavelengths=self.include_wavelengths)
         else:
             all_refs = self._collect_folder_refs(sweep_dirs)
 
@@ -643,7 +645,8 @@ class FDTDDataset(Dataset):
         return all_dirs
 
     def _collect_shard_refs(self, sweep_dirs: List[Path], target_split: Optional[str] = None,
-                            exclude_devices: Optional[set] = None) -> List[ShardRef]:
+                            exclude_devices: Optional[set] = None,
+                            include_wavelengths: Optional[List[float]] = None) -> List[ShardRef]:
         """
         Collect shard references from all sweep directories.
 
@@ -653,6 +656,8 @@ class FDTDDataset(Dataset):
                          Supports "train", "val", "test". For "val", also accepts "val" entries.
                          (unified_sweep format uses pre-computed splits)
             exclude_devices: If provided, skip entries whose "device" field is in this set.
+            include_wavelengths: If provided, only include entries whose wavelength_um is
+                                within 0.01 µm of one of these values.
         """
         refs: List[ShardRef] = []
         for sdir in sweep_dirs:
@@ -673,6 +678,12 @@ class FDTDDataset(Dataset):
                 if exclude_devices is not None:
                     dev = e.get("device", "")
                     if dev in exclude_devices:
+                        continue
+
+                # Filter by wavelength
+                if include_wavelengths is not None:
+                    wl = e.get("wavelength_um", None)
+                    if wl is None or not any(abs(wl - target) < 0.01 for target in include_wavelengths):
                         continue
 
                 shard_path = shard_dir / e["shard"]
@@ -1047,19 +1058,6 @@ class FDTDDataset(Dataset):
         lam_norm = (float(lam_um) - float(self.stats["lambda_um_mean"])) / lam_std
 
         cond_vals = [lam_norm]
-
-        # geometric design parameters (if missing, default to mean => normalized 0.0)
-        for name in self.cond_param_names:
-            v = self._get_param_value_from_ref(ref, name)
-            mean = float(self.stats.get(f"cond_param_{name}_mean", 0.0))
-            std = float(self.stats.get(f"cond_param_{name}_std", 1.0))
-            if std <= 0:
-                std = 1.0
-
-            if v is None or (not np.isfinite(v)):
-                cond_vals.append(0.0)
-            else:
-                cond_vals.append((float(v) - mean) / std)
 
         # Append S-param conditioning placeholders (filled later in _build_sample)
         if self.include_sparams_cond:

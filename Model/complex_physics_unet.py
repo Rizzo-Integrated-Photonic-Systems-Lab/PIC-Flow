@@ -365,17 +365,20 @@ class ComplexAttentionBlock(nn.Module):
         qr, kr, vr = qkv_r[:, 0], qkv_r[:, 1], qkv_r[:, 2]
         qi, ki, vi = qkv_i[:, 0], qkv_i[:, 1], qkv_i[:, 2]
 
-        # qk = Q K^H = (qr+i qi)(kr - i ki)
-        # real(qk) = qr*kr + qi*ki
-        qk_r = torch.einsum("bhdn,bhdm->bhnm", qr, kr) + torch.einsum("bhdn,bhdm->bhnm", qi, ki)
-        attn = qk_r / math.sqrt(self.head_dim)
-        attn = F.softmax(attn, dim=-1)
+        # Stack real+imag along head_dim so QK^T computes real(QK^H):
+        #   [qr; qi] @ [kr; ki]^T = qr·kr^T + qi·ki^T
+        # Transpose to SDPA layout: [B, heads, tokens, head_dim]
+        q = torch.cat([qr, qi], dim=2).transpose(-1, -2)  # [B, h, N, 2d]
+        k = torch.cat([kr, ki], dim=2).transpose(-1, -2)  # [B, h, N, 2d]
+        v = torch.cat([vr, vi], dim=2).transpose(-1, -2)  # [B, h, N, 2d]
 
-        out_r = torch.einsum("bhnm,bhdm->bhdn", attn, vr)
-        out_i = torch.einsum("bhnm,bhdm->bhdn", attn, vi)
+        # FlashAttention via SDPA — O(N) memory, no materialized N×N attention matrix
+        out = F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(self.head_dim))
 
-        out_r = out_r.reshape(B, C, H, W)
-        out_i = out_i.reshape(B, C, H, W)
+        # Split back to real/imag and restore [B, C, H, W]
+        out_r, out_i = out.split(self.head_dim, dim=-1)   # [B, h, N, d]
+        out_r = out_r.transpose(-1, -2).reshape(B, C, H, W)
+        out_i = out_i.transpose(-1, -2).reshape(B, C, H, W)
 
         out_r, out_i = self.proj(out_r, out_i)
         return xr + out_r, xi + out_i

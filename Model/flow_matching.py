@@ -1107,7 +1107,7 @@ def sample_inverse(
     lambda_um=None,
     cfg_scale: float = 3.0,
     sig_min: float = SIG_MIN,
-    base_cond_dim: int = 4,       # first N entries are wavelength+geom (not S-params)
+    base_cond_dim: int = 1,       # first N entries are wavelength only (not S-params)
 ) -> torch.Tensor:
     """
     Convenience wrapper for inverse design: generate eps (and fields) from target S-params.

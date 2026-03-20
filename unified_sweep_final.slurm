@@ -12,21 +12,19 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 
 # =============================================================================
-# Final Production Dataset: 9 Device Types, ALL RECTANGULAR, res=20, 4 Wavelengths
+# Final Production Dataset: selected device types, ALL RECTANGULAR, res=20, 5 Wavelengths
 # =============================================================================
 #
 # Single domain (480x160 px = 24x8 µm @ res=20):
-#   - Straight waveguides   (200 geom)  [2D params]
-#   - Tapers                (1000 geom) [3D params]
-#   - S-bends               (1000 geom) [3D params]
-#   - Y-branches            (2000 geom) [5D params]
-#   - Directional couplers  (3000 geom) [5D params]
-#   - 2x2 MMIs              (4000 geom) [5D params]
-#   - Euler bends            (750 geom)  [2D params, R=2-3.5 µm]
-#   - Circular bends         (750 geom)  [2D params, R=2-3.5 µm]
-#   - Waveguide crossings    (1500 geom) [2D params]
+#   - Tapers                (800 geom)  [3D params]
+#   - S-bends               (800 geom)  [3D params]
+#   - Y-branches            (1500 geom) [5D params]
+#   - Directional couplers  (2200 geom) [5D params]
+#   - 2x2 MMIs              (3000 geom) [5D params]
+#   - Euler bends            (700 geom) [2D params, R=2-3.4 µm]
+#   - Waveguide crossings    (1000 geom) [2D params]
 #
-# Total: 14,200 geometries x 4 wavelengths = 56,800 simulations
+# Total: 10,000 geometries x 5 wavelengths = 50,000 simulations
 # All tensors: 480x160 px (no padding needed for training)
 # Split: 80/10/10 by geometry_id
 #
@@ -45,16 +43,16 @@ export MKL_NUM_THREADS=1
 
 # ---- Run parameters ----
 
-# Device counts (14,200 total geometries)
-N_STRAIGHT=200
-N_TAPER=1000
-N_MMI=4000
-N_SBEND=1000
-N_YBRANCH=2000
-N_DC=3000
-N_EULER=750
-N_CIRCULAR=750
-N_CROSSING=1500
+# Device counts (10,000 total geometries)
+N_STRAIGHT=0
+N_TAPER=800
+N_MMI=3000
+N_SBEND=800
+N_YBRANCH=1500
+N_DC=2200
+N_EULER=700
+N_CIRCULAR=0
+N_CROSSING=1000
 
 # Number of parallel workers (leave headroom for OS/IO)
 N_PROCS=26

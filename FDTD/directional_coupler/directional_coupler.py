@@ -446,10 +446,23 @@ class DirectionalCoupler2D(Device2DBase):
         x_left_lim = nonpml_left + self.fit_margin_um
         x_right_lim = nonpml_right - self.fit_margin_um
 
-        # Clamp bend length to available space
+        # Bend length must fit while leaving straight lead segments for port modes.
         max_left = x_in - x_left_lim
         max_right = x_right_lim - x_out
-        L_bend = float(min(self.bend_length_um, max_left, max_right))
+        available_bend = float(min(max_left, max_right))
+        if available_bend <= 0.0:
+            raise ValueError(
+                "DirectionalCoupler2D has no room for S-bends inside the non-PML region. "
+                "Reduce wg_length_um/lead_extra_gap_um or increase crop/cell."
+            )
+        if self.bend_length_um > available_bend + 1e-9:
+            raise ValueError(
+                f"DirectionalCoupler2D bend_length_um ({self.bend_length_um:.3f}) exceeds available space "
+                f"({available_bend:.3f}) inside the non-PML region."
+            )
+        L_bend = float(self.bend_length_um)
+        if L_bend <= 0.2:
+            raise ValueError("DirectionalCoupler2D bend_length_um must be > 0.2 um to keep ports on straight leads.")
         self.L_bend_um = float(L_bend)
         self.x_left_beg_um = float(x_in - L_bend)
         self.x_right_end_um = float(x_out + L_bend)
@@ -469,73 +482,50 @@ class DirectionalCoupler2D(Device2DBase):
         port_y_offset = center_offset_y
         src_y_offset = center_offset_y
 
-        if L_bend <= 1e-9:
-            # Extend straight leads through PML
-            x_pml_left = -half_x
-            x_pml_right = +half_x
+        x_left_beg = x_in - L_bend
+        x_left_end = x_in
+        x_right_beg = x_out
+        x_right_end = x_out + L_bend
 
-            if x_in > x_pml_left:
-                lead_len_left = x_in - x_pml_left
-                x_center_left = 0.5 * (x_pml_left + x_in)
-                geometry.append(mp.Block(size=self._orient_size(lead_len_left, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_left, +center_offset_y), material=core))
-                geometry.append(mp.Block(size=self._orient_size(lead_len_left, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_left, -center_offset_y), material=core))
+        # left: wide lead -> close coupling
+        geometry += s_bend_blocks(+lead_center_offset_y, +center_offset_y, x_left_beg, x_left_end, self.bend_n_segments)
+        geometry += s_bend_blocks(-lead_center_offset_y, -center_offset_y, x_left_beg, x_left_end, self.bend_n_segments)
 
-            if x_out < x_pml_right:
-                lead_len_right = x_pml_right - x_out
-                x_center_right = 0.5 * (x_out + x_pml_right)
-                geometry.append(mp.Block(size=self._orient_size(lead_len_right, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_right, +center_offset_y), material=core))
-                geometry.append(mp.Block(size=self._orient_size(lead_len_right, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_right, -center_offset_y), material=core))
+        # right: close coupling -> wide lead
+        geometry += s_bend_blocks(+center_offset_y, +lead_center_offset_y, x_right_beg, x_right_end, self.bend_n_segments)
+        geometry += s_bend_blocks(-center_offset_y, -lead_center_offset_y, x_right_beg, x_right_end, self.bend_n_segments)
 
-            self.geometry = geometry
-        else:
-            x_left_beg = x_in - L_bend
-            x_left_end = x_in
-            x_right_beg = x_out
-            x_right_end = x_out + L_bend
+        # straight leads to PML boundary
+        x_pml_left = -half_x
+        x_pml_right = +half_x
 
-            # left: wide lead -> close coupling
-            geometry += s_bend_blocks(+lead_center_offset_y, +center_offset_y, x_left_beg, x_left_end, self.bend_n_segments)
-            geometry += s_bend_blocks(-lead_center_offset_y, -center_offset_y, x_left_beg, x_left_end, self.bend_n_segments)
+        if x_left_beg > x_pml_left:
+            lead_len_left = x_left_beg - x_pml_left
+            x_center_left = 0.5 * (x_pml_left + x_left_beg)
+            geometry.append(mp.Block(size=self._orient_size(lead_len_left, self.wg_width_um),
+                                     center=self._orient_vec3(x_center_left, +lead_center_offset_y), material=core))
+            geometry.append(mp.Block(size=self._orient_size(lead_len_left, self.wg_width_um),
+                                     center=self._orient_vec3(x_center_left, -lead_center_offset_y), material=core))
 
-            # right: close coupling -> wide lead
-            geometry += s_bend_blocks(+center_offset_y, +lead_center_offset_y, x_right_beg, x_right_end, self.bend_n_segments)
-            geometry += s_bend_blocks(-center_offset_y, -lead_center_offset_y, x_right_beg, x_right_end, self.bend_n_segments)
+        if x_right_end < x_pml_right:
+            lead_len_right = x_pml_right - x_right_end
+            x_center_right = 0.5 * (x_right_end + x_pml_right)
+            geometry.append(mp.Block(size=self._orient_size(lead_len_right, self.wg_width_um),
+                                     center=self._orient_vec3(x_center_right, +lead_center_offset_y), material=core))
+            geometry.append(mp.Block(size=self._orient_size(lead_len_right, self.wg_width_um),
+                                     center=self._orient_vec3(x_center_right, -lead_center_offset_y), material=core))
 
-            # straight leads to PML boundary
-            x_pml_left = -half_x
-            x_pml_right = +half_x
+        self.geometry = geometry
 
-            if x_left_beg > x_pml_left:
-                lead_len_left = x_left_beg - x_pml_left
-                x_center_left = 0.5 * (x_pml_left + x_left_beg)
-                geometry.append(mp.Block(size=self._orient_size(lead_len_left, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_left, +lead_center_offset_y), material=core))
-                geometry.append(mp.Block(size=self._orient_size(lead_len_left, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_left, -lead_center_offset_y), material=core))
+        # With bends, put ports on straight leads near non-PML boundary
+        desired_margin = self.fit_margin_um
+        candidate_left = nonpml_left + desired_margin
+        max_left_before_bend = x_left_beg - 0.2
+        port_x_left = min(candidate_left, max_left_before_bend)
+        port_x_right = -port_x_left
 
-            if x_right_end < x_pml_right:
-                lead_len_right = x_pml_right - x_right_end
-                x_center_right = 0.5 * (x_right_end + x_pml_right)
-                geometry.append(mp.Block(size=self._orient_size(lead_len_right, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_right, +lead_center_offset_y), material=core))
-                geometry.append(mp.Block(size=self._orient_size(lead_len_right, self.wg_width_um),
-                                         center=self._orient_vec3(x_center_right, -lead_center_offset_y), material=core))
-
-            self.geometry = geometry
-
-            # With bends, put ports on straight leads near non-PML boundary
-            desired_margin = self.fit_margin_um
-            candidate_left = nonpml_left + desired_margin
-            max_left_before_bend = x_left_beg - 0.2
-            port_x_left = min(candidate_left, max_left_before_bend)
-            port_x_right = -port_x_left
-
-            port_y_offset = lead_center_offset_y
-            src_y_offset = lead_center_offset_y
+        port_y_offset = lead_center_offset_y
+        src_y_offset = lead_center_offset_y
 
         self.x_port_left_um = float(port_x_left)
         self.x_port_right_um = float(port_x_right)

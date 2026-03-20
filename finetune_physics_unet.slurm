@@ -49,11 +49,11 @@ DATA_ROOT="${LOCAL_DATA}"
 #   - Hidden 40→48 (~90M params, 1.44x capacity for 2.7x more data)
 #   - Epochs reduced to 80 for faster turnaround on the 50k-sample training set
 # -----------------------
-VERSION="complexphys_v7"
+VERSION="PHASE_V1_train1"
 
 # Architecture
 HIDDEN_SIZE=40
-NUM_RES_BLOCKS=3
+NUM_RES_BLOCKS=2
 CHANNEL_MULT="1,2,4,8"
 NUM_HEADS=8
 ATTN_RESOLUTIONS="8"
@@ -64,17 +64,18 @@ USE_SHARDS="--use-shards"
 SHARD_SUBDIR="shards"
 SHARD_INDEX_NAME="index.json"
 INCLUDE_SWEEPS="unified_sweep_final"
-EXCLUDE_DEVICES="straight"
+EXCLUDE_DEVICES=""
+INCLUDE_WAVELENGTHS=""
 
 # Train
-EPOCHS=80
+EPOCHS=150
 LR=1e-4
-BATCH_SIZE=110
+BATCH_SIZE=160
 WEIGHT_DECAY=5e-5
 
 # Curriculum — compressed for 80 epochs on the larger final dataset
-PHASE_A_EPOCHS=5        # FM only
-PHASE_B_EPOCHS=15       # FM+Residual (epochs 5-15), Phase C starts at epoch 15
+PHASE_A_EPOCHS=15     # FM only
+PHASE_B_EPOCHS=40    # FM+Residual (epochs 5-15), Phase C starts at epoch 15
 
 # Time-gating: physics losses only when t >= 0.5
 T_PHYSICS_MIN=0.5
@@ -166,6 +167,7 @@ srun torchrun \
   --shard-index-name "${SHARD_INDEX_NAME}" \
   --include-sweeps "${INCLUDE_SWEEPS}" \
   --exclude-devices "${EXCLUDE_DEVICES}" \
+  --include-wavelengths "${INCLUDE_WAVELENGTHS}" \
   --version "${VERSION}" \
   --hidden-size "${HIDDEN_SIZE}" \
   --num-res-blocks "${NUM_RES_BLOCKS}" \
@@ -228,9 +230,10 @@ srun torchrun \
   --pml-cells 0 \
   --physics-features \
   --complex-unet \
+  --use-checkpoint \
   --dx 0.05 \
   --unroll-steps 0 \
-  --fm_steps 30 \
+  --fm_steps 50 \
   \
   --warmup-epochs 5 \
   --min-lr 5e-6 \
@@ -251,6 +254,6 @@ srun torchrun \
   --normalize-eps \
   \
   --eps-core 5.8 \
-  --eps-clad 2.09
+  --eps-clad 2.09 \
 
 echo "Training job completed."

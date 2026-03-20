@@ -201,6 +201,11 @@ class EulerSBend2D(Device2DBase):
 
         # Build geometry
         half_x = 0.5 * self.cell_x
+        half_y = 0.5 * self.cell_y
+        nonpml_left = -half_x + self.dpml
+        nonpml_right = +half_x - self.dpml
+        nonpml_bot = -half_y + self.dpml
+        nonpml_top = +half_y - self.dpml
         sbend_blocks = polyline_to_blocks(sbend_pts, self.wg_width, self.core_medium)
 
         # Input lead
@@ -227,6 +232,18 @@ class EulerSBend2D(Device2DBase):
         x0, x1 = float(sbend_pts[:, 0].min()), float(sbend_pts[:, 0].max())
         y0, y1 = float(sbend_pts[:, 1].min()), float(sbend_pts[:, 1].max())
         half_w = 0.5 * float(self.wg_width)
+        x_extent = max(abs(x0), abs(x1)) + half_w + self.fit_margin_um
+        y_extent = max(abs(y0), abs(y1)) + half_w + self.fit_margin_um
+        if x_extent > min(abs(nonpml_left), abs(nonpml_right)):
+            raise ValueError(
+                f"EulerSBend2D exceeds non-PML x extent ({x_extent:.2f} um > "
+                f"{min(abs(nonpml_left), abs(nonpml_right)):.2f} um). Reduce lateral_offset_um/R_min_um or increase crop."
+            )
+        if y_extent > min(abs(nonpml_bot), abs(nonpml_top)):
+            raise ValueError(
+                f"EulerSBend2D exceeds non-PML y extent ({y_extent:.2f} um > "
+                f"{min(abs(nonpml_bot), abs(nonpml_top)):.2f} um). Reduce lateral_offset_um/R_min_um or increase crop."
+            )
         self.dev_cx = 0.5 * (x0 + x1)
         self.dev_cy = 0.5 * (y0 + y1)
         self.dev_wx = (x1 - x0) + 2.0 * (self.fit_margin_um + half_w)
@@ -242,10 +259,14 @@ class EulerSBend2D(Device2DBase):
             size=mp.Vector3(0, port_span, 0),
         )
 
+        src_x_left = max(port_in_x - self.source_shift, nonpml_left + 0.1)
         self.src_vol = mp.Volume(
-            center=mp.Vector3(port_in_x - self.source_shift, sbend_start[1], 0),
+            center=mp.Vector3(src_x_left, sbend_start[1], 0),
             size=self.port_in.size,
         )
+
+        self._src_x_left = float(src_x_left)
+        self._src_x_right = float(min((half_x - port_margin) + self.source_shift, nonpml_right - 0.1))
 
         port_out_x = half_x - port_margin
         self.port_out = mp.Volume(
@@ -302,14 +323,24 @@ class EulerSBend2D(Device2DBase):
         fcen = 1.0 / self.wavelength_um
         fwidth = float(df_frac) * fcen
 
+        if int(input_port) == 1:
+            src_vol = self.src_vol
+            k_in = mp.Vector3(+1, 0, 0)
+        else:
+            src_vol = mp.Volume(
+                center=mp.Vector3(self._src_x_right, float(self.port_out.center.y), 0),
+                size=self.port_out.size,
+            )
+            k_in = mp.Vector3(-1, 0, 0)
+
         sources = [
             mp.EigenModeSource(
                 src=mp.GaussianSource(fcen, fwidth=fwidth),
-                volume=self.src_vol,
+                volume=src_vol,
                 eig_band=1,
                 eig_parity=mp.NO_PARITY,
                 eig_match_freq=True,
-                eig_kpoint=mp.Vector3(+1, 0, 0),
+                eig_kpoint=k_in,
             )
         ]
 
@@ -333,7 +364,7 @@ class EulerSBend2D(Device2DBase):
 
         return sim, (m1, m2), dft, fcen
 
-    def _build_sim_broadband(self, lam_min_um=1.40, lam_max_um=1.60, Nf=101):
+    def _build_sim_broadband(self, input_port=1, lam_min_um=1.40, lam_max_um=1.60, Nf=101):
         """Build broadband simulation."""
         fmin = 1.0 / lam_max_um
         fmax = 1.0 / lam_min_um
@@ -343,14 +374,24 @@ class EulerSBend2D(Device2DBase):
         freqs = np.linspace(fcen - 0.5 * df, fcen + 0.5 * df, Nf)
         lams = 1.0 / freqs
 
+        if int(input_port) == 1:
+            src_vol = self.src_vol
+            k_in = mp.Vector3(+1, 0, 0)
+        else:
+            src_vol = mp.Volume(
+                center=mp.Vector3(self._src_x_right, float(self.port_out.center.y), 0),
+                size=self.port_out.size,
+            )
+            k_in = mp.Vector3(-1, 0, 0)
+
         sources = [
             mp.EigenModeSource(
                 src=mp.GaussianSource(fcen, fwidth=df),
-                volume=self.src_vol,
+                volume=src_vol,
                 eig_band=1,
                 eig_parity=mp.NO_PARITY,
                 eig_match_freq=True,
-                eig_kpoint=mp.Vector3(+1, 0, 0),
+                eig_kpoint=k_in,
             )
         ]
 
@@ -496,6 +537,11 @@ class CosineSBend2D(Device2DBase):
 
         # Build geometry
         half_x = 0.5 * self.cell_x
+        half_y = 0.5 * self.cell_y
+        nonpml_left = -half_x + self.dpml
+        nonpml_right = +half_x - self.dpml
+        nonpml_bot = -half_y + self.dpml
+        nonpml_top = +half_y - self.dpml
         sbend_blocks = polyline_to_blocks(sbend_pts, self.wg_width, self.core_medium)
 
         # Input lead
@@ -522,6 +568,18 @@ class CosineSBend2D(Device2DBase):
         x0, x1 = float(sbend_pts[:, 0].min()), float(sbend_pts[:, 0].max())
         y0, y1 = float(sbend_pts[:, 1].min()), float(sbend_pts[:, 1].max())
         half_w = 0.5 * float(self.wg_width)
+        x_extent = max(abs(x0), abs(x1)) + half_w + self.fit_margin_um
+        y_extent = max(abs(y0), abs(y1)) + half_w + self.fit_margin_um
+        if x_extent > min(abs(nonpml_left), abs(nonpml_right)):
+            raise ValueError(
+                f"CosineSBend2D exceeds non-PML x extent ({x_extent:.2f} um > "
+                f"{min(abs(nonpml_left), abs(nonpml_right)):.2f} um). Reduce length_um/offset or increase crop."
+            )
+        if y_extent > min(abs(nonpml_bot), abs(nonpml_top)):
+            raise ValueError(
+                f"CosineSBend2D exceeds non-PML y extent ({y_extent:.2f} um > "
+                f"{min(abs(nonpml_bot), abs(nonpml_top)):.2f} um). Reduce lateral_offset_um or increase crop."
+            )
         self.dev_cx = 0.5 * (x0 + x1)
         self.dev_cy = 0.5 * (y0 + y1)
         self.dev_wx = (x1 - x0) + 2.0 * (self.fit_margin_um + half_w)
@@ -537,10 +595,14 @@ class CosineSBend2D(Device2DBase):
             size=mp.Vector3(0, port_span, 0),
         )
 
+        src_x_left = max(port_in_x - self.source_shift, nonpml_left + 0.1)
         self.src_vol = mp.Volume(
-            center=mp.Vector3(port_in_x - self.source_shift, sbend_start[1], 0),
+            center=mp.Vector3(src_x_left, sbend_start[1], 0),
             size=self.port_in.size,
         )
+
+        self._src_x_left = float(src_x_left)
+        self._src_x_right = float(min((half_x - port_margin) + self.source_shift, nonpml_right - 0.1))
 
         port_out_x = half_x - port_margin
         self.port_out = mp.Volume(
@@ -597,14 +659,24 @@ class CosineSBend2D(Device2DBase):
         fcen = 1.0 / self.wavelength_um
         fwidth = float(df_frac) * fcen
 
+        if int(input_port) == 1:
+            src_vol = self.src_vol
+            k_in = mp.Vector3(+1, 0, 0)
+        else:
+            src_vol = mp.Volume(
+                center=mp.Vector3(self._src_x_right, float(self.port_out.center.y), 0),
+                size=self.port_out.size,
+            )
+            k_in = mp.Vector3(-1, 0, 0)
+
         sources = [
             mp.EigenModeSource(
                 src=mp.GaussianSource(fcen, fwidth=fwidth),
-                volume=self.src_vol,
+                volume=src_vol,
                 eig_band=1,
                 eig_parity=mp.NO_PARITY,
                 eig_match_freq=True,
-                eig_kpoint=mp.Vector3(+1, 0, 0),
+                eig_kpoint=k_in,
             )
         ]
 
@@ -628,7 +700,7 @@ class CosineSBend2D(Device2DBase):
 
         return sim, (m1, m2), dft, fcen
 
-    def _build_sim_broadband(self, lam_min_um=1.40, lam_max_um=1.60, Nf=101):
+    def _build_sim_broadband(self, input_port=1, lam_min_um=1.40, lam_max_um=1.60, Nf=101):
         """Build broadband simulation."""
         fmin = 1.0 / lam_max_um
         fmax = 1.0 / lam_min_um
@@ -638,14 +710,24 @@ class CosineSBend2D(Device2DBase):
         freqs = np.linspace(fcen - 0.5 * df, fcen + 0.5 * df, Nf)
         lams = 1.0 / freqs
 
+        if int(input_port) == 1:
+            src_vol = self.src_vol
+            k_in = mp.Vector3(+1, 0, 0)
+        else:
+            src_vol = mp.Volume(
+                center=mp.Vector3(self._src_x_right, float(self.port_out.center.y), 0),
+                size=self.port_out.size,
+            )
+            k_in = mp.Vector3(-1, 0, 0)
+
         sources = [
             mp.EigenModeSource(
                 src=mp.GaussianSource(fcen, fwidth=df),
-                volume=self.src_vol,
+                volume=src_vol,
                 eig_band=1,
                 eig_parity=mp.NO_PARITY,
                 eig_match_freq=True,
-                eig_kpoint=mp.Vector3(+1, 0, 0),
+                eig_kpoint=k_in,
             )
         ]
 

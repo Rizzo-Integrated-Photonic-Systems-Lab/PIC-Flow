@@ -77,11 +77,9 @@ DEVICES = [
         "wg_width_um": 0.575, "mmi_width_um": 5.5, "mmi_length_um": 15.0,
         "taper_width_um": 1.5, "taper_length_um": 3.0,
     }),
-    # Bends: R reduced to fit 8 µm height
-    # 90° bend vertical extent ≈ R. With 8 µm, R_max ≈ 3.5 µm leaves ~0.5 µm margin
-    # for port placement + waveguide width on each side.
+    # Bends: R reduced to fit 8 µm height with stricter source/port clearance.
     ("euler_bend", "Euler Bend (90°)", {
-        "wg_width": 0.575, "R_min_um": 3.5,
+        "wg_width": 0.575, "R_min_um": 3.4,
     }),
     ("circular_bend", "Circular Bend (90°)", {
         "wg_width": 0.575, "bend_radius_um": 3.5,

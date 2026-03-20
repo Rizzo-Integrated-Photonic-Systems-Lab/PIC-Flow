@@ -1,0 +1,112 @@
+[
+  {
+    "sample_idx": 0,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.4,
+      "bend_radius_um": 2.1750000000000003
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_00.png"
+  },
+  {
+    "sample_idx": 1,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.42500000000000004,
+      "bend_radius_um": 2.45
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_01.png"
+  },
+  {
+    "sample_idx": 2,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.47500000000000003,
+      "bend_radius_um": 3.2750000000000004
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_02.png"
+  },
+  {
+    "sample_idx": 3,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.5,
+      "bend_radius_um": 3.45
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_03.png"
+  },
+  {
+    "sample_idx": 4,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.45,
+      "bend_radius_um": 2.95
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_04.png"
+  },
+  {
+    "sample_idx": 5,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 2,
+    "params": {
+      "wg_width": 0.525,
+      "bend_radius_um": 2.625
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_05.png"
+  },
+  {
+    "sample_idx": 6,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.45,
+      "bend_radius_um": 2.1
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_06.png"
+  },
+  {
+    "sample_idx": 7,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.55,
+      "bend_radius_um": 2.85
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_07.png"
+  },
+  {
+    "sample_idx": 8,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 1,
+    "params": {
+      "wg_width": 0.5,
+      "bend_radius_um": 2.5500000000000003
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_08.png"
+  },
+  {
+    "sample_idx": 9,
+    "device": "circular_bend",
+    "display_name": "Circular Bend (90\u00b0)",
+    "input_port": 2,
+    "params": {
+      "wg_width": 0.55,
+      "bend_radius_um": 3.1
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/circular_bend/circular_bend_sample_09.png"
+  }
+]

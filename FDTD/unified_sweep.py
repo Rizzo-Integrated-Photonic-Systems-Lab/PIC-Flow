@@ -3,10 +3,10 @@
 Unified multi-device sweep for photonic dataset generation.
 
 Generates training data for 9 device types:
-  Rectangular domain (480x160 px): straight, taper, sbend, ybranch, directional_coupler, mmi
-  Square domain (320x320 px): euler_bend, circular_bend, crossing
+  Rectangular domain (480x160 px): straight, taper, sbend, ybranch,
+    directional_coupler, mmi, euler_bend, circular_bend, crossing
 
-Each geometry is run at 5 fixed wavelengths (1.48-1.62 µm, C-band).
+Each geometry is run at 5 fixed wavelengths (1.50-1.60 µm, C-band).
 For multi-input devices, one input port is randomly selected per geometry.
 
 Split: 80/10/10 by geometry_id (no leakage across wavelengths).
@@ -391,7 +391,7 @@ DEVICE_DOMAIN = {
 # =============================================================================
 # Configuration
 # =============================================================================
-WAVELENGTHS = [1.48, 1.53, 1.58, 1.62]
+WAVELENGTHS = [1.50, 1.525, 1.55, 1.575, 1.60]
 
 # Default counts for ~14,300 total geometries (9 device types).
 # Allocation weighted by parameter-space dimensionality and physics complexity.
@@ -402,16 +402,17 @@ DEFAULT_COUNTS = {
     "sbend": 800,                 # 3D param space
     "ybranch": 1500,              # 5D param space
     "directional_coupler": 2500,  # 5D param space
-    "euler_bend": 1500,           # 2D param space (square domain, D4)
-    "circular_bend": 1500,        # 2D param space (square domain, D4)
-    "crossing": 3000,             # 2D param space (4-port, square domain)
+    "euler_bend": 1500,           # 2D param space
+    "circular_bend": 1500,        # 2D param space
+    "crossing": 3000,             # 2D param space (4-port)
 }
 
 # Parameter ranges per device (9 device types).
 # All values should be multiples of 1/(2*resolution) for pixel-grid alignment.
 # At resolution=20: quantum = 1/40 = 0.025 µm.
 # Rectangular domain: 480×160 interior at res=20 (24.0 × 8.0 µm).
-# Square domain: 320×320 interior at res=20 (16.0 × 16.0 µm).
+# Square-domain support remains available for experiments/previews, but the
+# active final dataset currently uses the rectangular domain for all devices.
 PARAM_RANGES = {
     "straight": {
         "wg_width_um": (0.40, 0.575),       # 8/20 – 11.5/20 (≥8 px per wg width)
@@ -424,7 +425,7 @@ PARAM_RANGES = {
     },
     "mmi": {
         "wg_width_um":    (0.40, 0.575),     # 8/20 – 11.5/20
-        "mmi_width_um":   (2.5, 5.5),        # fit in 8 µm Y
+        "mmi_width_um":   (4.5, 5.5),        # keep up to 1.5 µm tapers inside MMI body
         "mmi_length_um":  (8.0, 15.0),       # fit in 24 µm X
         "taper_width_um": (0.575, 1.5),      # 11.5/20 – 1.5
         "taper_length_um":(1.0, 3.0),        # taper length per side
@@ -450,11 +451,11 @@ PARAM_RANGES = {
     },
     "euler_bend": {
         "wg_width": (0.40, 0.575),           # 8/20 – 11.5/20
-        "R_min_um": (2.0, 3.5),              # fit in 8 µm rect height
+        "R_min_um": (2.0, 3.4),              # fit in 8 µm rectangular height with source/port clearance
     },
     "circular_bend": {
         "wg_width": (0.40, 0.575),           # 8/20 – 11.5/20
-        "bend_radius_um": (2.0, 3.5),        # fit in 8 µm rect height
+        "bend_radius_um": (2.0, 3.5),        # fit in 8 µm rectangular height
     },
     "crossing": {
         "wg_width_h": (0.40, 0.575),         # horizontal WG width
@@ -740,8 +741,15 @@ def worker(task: Tuple) -> Tuple[str, Any]:
             interior_y = cell_size[1]
 
         ny, nx = eps.shape
+        expected_shape = (int(crop_y_px), int(crop_x_px))
 
         # Quality checks
+        if eps.shape != expected_shape or Ez.shape != expected_shape:
+            return (
+                "ERR",
+                f"{geom_id}_{wavelength_um:.4f}: cropped field shape mismatch "
+                f"(eps={eps.shape}, Ez={Ez.shape}, expected={expected_shape})",
+            )
         if np.any(np.isnan(Ez)) or np.any(np.isinf(Ez)):
             return ("ERR", f"{geom_id}_{wavelength_um:.4f}: NaN/Inf in Ez field")
         if np.any(np.isnan(eps)) or np.any(np.isinf(eps)):
@@ -759,6 +767,32 @@ def worker(task: Tuple) -> Tuple[str, Any]:
             cell_size[0], cell_size[1], dpml, resolution,
             ny, nx, thickness_px=3
         )
+
+        if src_mask.shape != expected_shape:
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: src_mask shape {src_mask.shape} != {expected_shape}")
+        if port_masks.ndim != 3 or port_masks.shape[1:] != expected_shape:
+            return (
+                "ERR",
+                f"{geom_id}_{wavelength_um:.4f}: port_masks shape {port_masks.shape} incompatible with {expected_shape}",
+            )
+        if len(port_ids) != port_masks.shape[0]:
+            return (
+                "ERR",
+                f"{geom_id}_{wavelength_um:.4f}: port_ids length {len(port_ids)} != port_masks count {port_masks.shape[0]}",
+            )
+        if float(src_mask.sum()) <= 0.0:
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: empty source mask")
+        if port_masks.shape[0] == 0 or np.any(port_masks.reshape(port_masks.shape[0], -1).sum(axis=1) <= 0):
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: one or more port masks are empty")
+
+        eps_thr = 0.5 * (float(np.min(eps)) + float(np.max(eps)))
+        core_mask = eps > eps_thr
+        src_overlap = float(np.logical_and(src_mask > 0.0, core_mask).sum())
+        if src_overlap <= 0.0:
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: source mask does not overlap the device core")
+        port_overlap = np.logical_and(port_masks > 0.0, core_mask[None, :, :]).reshape(port_masks.shape[0], -1).sum(axis=1)
+        if np.any(port_overlap <= 0):
+            return ("ERR", f"{geom_id}_{wavelength_um:.4f}: one or more port masks miss the device core")
 
         # Save to temp file (non-PML interior only)
         np.savez_compressed(

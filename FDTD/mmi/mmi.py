@@ -110,9 +110,11 @@ class MMI2x2(Device2DBase):
         super().__init__(cell_x=float(cx), cell_y=float(cy), dpml=float(dpml_use), resolution=int(resolution))
 
         self.wg_width_um = float(wg_width_um)
-        self.mmi_width_um = float(mmi_width_um)
-        self.mmi_length_um = float(mmi_length_um)
         self.taper_width_um = float(taper_width_um)
+        # Keep the taper fully contained inside the MMI body at the junction.
+        # With access guides centered at +/- Wm/3, containment requires Wm >= 3*Wt.
+        self.mmi_width_um = max(float(mmi_width_um), 3.0 * self.taper_width_um)
+        self.mmi_length_um = float(mmi_length_um)
         self.taper_length_um = float(taper_length_um)
         self.wavelength_um = float(wavelength_um)
 
@@ -315,11 +317,11 @@ class MMI2x2(Device2DBase):
                 f"Reduce mmi_width_um or increase crop/cell."
             )
 
-        # Tapers must not overlap each other (on same side)
-        if Wt > 2.0 * y_acc:
+        # Tapers must stay inside the MMI body at the junction.
+        if y_acc + 0.5 * Wt > 0.5 * Wm:
             raise ValueError(
-                f"MMI2x2: taper_width_um ({Wt:.3f}) exceeds 2*y_access ({2*y_acc:.3f}), "
-                f"tapers would overlap. Reduce taper_width_um or increase mmi_width_um."
+                f"MMI2x2: taper_width_um ({Wt:.3f}) is too large for mmi_width_um ({Wm:.3f}); "
+                f"tapers extend beyond the MMI body. Increase mmi_width_um or reduce taper_width_um."
             )
 
         geometry = []

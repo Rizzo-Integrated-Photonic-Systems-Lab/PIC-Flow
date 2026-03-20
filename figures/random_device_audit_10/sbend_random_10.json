@@ -1,0 +1,122 @@
+[
+  {
+    "sample_idx": 0,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.5,
+      "lateral_offset_um": 2.8000000000000003,
+      "R_min_um": 5.800000000000001
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_00.png"
+  },
+  {
+    "sample_idx": 1,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.55,
+      "lateral_offset_um": 5.1000000000000005,
+      "R_min_um": 4.075
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_01.png"
+  },
+  {
+    "sample_idx": 2,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.525,
+      "lateral_offset_um": 3.125,
+      "R_min_um": 5.300000000000001
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_02.png"
+  },
+  {
+    "sample_idx": 3,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.45,
+      "lateral_offset_um": 2.25,
+      "R_min_um": 4.275
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_03.png"
+  },
+  {
+    "sample_idx": 4,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.42500000000000004,
+      "lateral_offset_um": 3.4250000000000003,
+      "R_min_um": 6.3500000000000005
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_04.png"
+  },
+  {
+    "sample_idx": 5,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.575,
+      "lateral_offset_um": 3.8000000000000003,
+      "R_min_um": 3.2750000000000004
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_05.png"
+  },
+  {
+    "sample_idx": 6,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.525,
+      "lateral_offset_um": 2.575,
+      "R_min_um": 6.7
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_06.png"
+  },
+  {
+    "sample_idx": 7,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.45,
+      "lateral_offset_um": 4.675,
+      "R_min_um": 4.9750000000000005
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_07.png"
+  },
+  {
+    "sample_idx": 8,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 1,
+    "params": {
+      "wg_width_um": 0.4,
+      "lateral_offset_um": 5.2,
+      "R_min_um": 3.75
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_08.png"
+  },
+  {
+    "sample_idx": 9,
+    "device": "sbend",
+    "display_name": "S-Bend (Euler)",
+    "input_port": 2,
+    "params": {
+      "wg_width_um": 0.47500000000000003,
+      "lateral_offset_um": 4.2,
+      "R_min_um": 6.0
+    },
+    "image": "/dartfs-hpc/rc/home/j/f0071mj/rayfield/figures/random_device_audit_10/sbend/sbend_sample_09.png"
+  }
+]
