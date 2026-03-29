@@ -41,4 +41,10 @@ Data/*
 build/
 dist/
 
+# LaTeX (local drafts / compilation)
+*.aux
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
 

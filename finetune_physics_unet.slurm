@@ -2,11 +2,11 @@
 
 #SBATCH --job-name=rayfield-v6
 #SBATCH --partition=h200_preemptable
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
 #SBATCH --nodelist=h200b
 #SBATCH --gres=gpu:h200:2
-#SBATCH --cpus-per-task=24
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
 #SBATCH --time=3-00:00:00
 #SBATCH --output=/dartfs-hpc/rc/home/j/f0071mj/rayfield/logs/rayfield_%j.out
@@ -24,15 +24,9 @@ mkdir -p "${CHECKPOINT_ROOT}"
 export RAYFIELD_CKPT_ROOT="${CHECKPOINT_ROOT}"
 
 # -----------------------
-# Copy data to local scratch for faster I/O
+# Data (NFS, no local scratch)
 # -----------------------
-NFS_DATA="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
-LOCAL_DATA="/scratch/${SLURM_JOB_ID}/rayfield_data"
-echo "Copying data to local scratch: ${LOCAL_DATA}"
-mkdir -p "${LOCAL_DATA}"
-rsync -a "${NFS_DATA}/" "${LOCAL_DATA}/"
-echo "Data copy complete ($(du -sh "${LOCAL_DATA}" | cut -f1))"
-DATA_ROOT="${LOCAL_DATA}"
+DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
 
 # -----------------------
 # Run config: v6 — final dataset (res=20, 9 devices, 5 wavelengths, all rect 480x160)
@@ -49,13 +43,13 @@ DATA_ROOT="${LOCAL_DATA}"
 #   - Hidden 40→48 (~90M params, 1.44x capacity for 2.7x more data)
 #   - Epochs reduced to 80 for faster turnaround on the 50k-sample training set
 # -----------------------
-VERSION="PHASE_V1_train1"
+VERSION="PHASE_V1_train6"
 
 # Architecture
-HIDDEN_SIZE=40
-NUM_RES_BLOCKS=2
+HIDDEN_SIZE=48
+NUM_RES_BLOCKS=3
 CHANNEL_MULT="1,2,4,8"
-NUM_HEADS=8
+NUM_HEADS=4
 ATTN_RESOLUTIONS="8"
 MODEL_DROPOUT=0.0
 
@@ -64,18 +58,18 @@ USE_SHARDS="--use-shards"
 SHARD_SUBDIR="shards"
 SHARD_INDEX_NAME="index.json"
 INCLUDE_SWEEPS="unified_sweep_final"
-EXCLUDE_DEVICES=""
+EXCLUDE_DEVICES="euler_bend,circular_bend,crossing,taper"
 INCLUDE_WAVELENGTHS=""
 
 # Train
-EPOCHS=150
+EPOCHS=200
 LR=1e-4
-BATCH_SIZE=160
+BATCH_SIZE=60
 WEIGHT_DECAY=5e-5
 
 # Curriculum — compressed for 80 epochs on the larger final dataset
-PHASE_A_EPOCHS=15     # FM only
-PHASE_B_EPOCHS=40    # FM+Residual (epochs 5-15), Phase C starts at epoch 15
+PHASE_A_EPOCHS=10     # FM only
+PHASE_B_EPOCHS=60    # FM+Residual, Phase C starts earlier for 200-epoch run
 
 # Time-gating: physics losses only when t >= 0.5
 T_PHYSICS_MIN=0.5
@@ -86,14 +80,14 @@ T_SAMPLE_LOC=0.0
 T_SAMPLE_SCALE=1.0
 
 # Residual t-power weighting
-RESIDUAL_T_POWER=4.0
+RESIDUAL_T_POWER=4
 
 # ODE sampler time grid
 TIME_GRID="linear"
 
-# Losses — FM + Residual + S-param (phase dropped, endpoint disabled)
-LAMBDA_RESIDUAL=1.0
-RESIDUAL_WARMUP=5
+# Losses — FM + Residual only (phase/sparam/endpoint disabled for v1 paper)
+LAMBDA_RESIDUAL=1.5
+RESIDUAL_WARMUP=20
 
 # Endpoint loss DISABLED
 LAMBDA_ENDPOINT=0.0
@@ -106,10 +100,10 @@ LAMBDA_PHASE_GRAD=0.0
 PHASE_WARMUP=0
 PHASE_GRAD_WARMUP=0
 
-# S-param: learned head mode, 5x weight increase vs v5
-LAMBDA_SPARAM=0.4       # v5: 0.1 — S-params were underpowered (30-50% |S| errors)
+# S-param: DISABLED for v1 paper — field prediction only; true eigenmode decomposition deferred to v2
+LAMBDA_SPARAM=0.0
 SPARAM_MODE="head"
-SPARAM_WARMUP=5        # shorter warmup for the faster 80-epoch schedule
+SPARAM_WARMUP=0
 SPARAM_START_PHASE="C"
 
 # Spatial focus knobs (disabled — let model learn full cladding fields)
@@ -121,6 +115,15 @@ W_MIN=0.5
 EPS_THR=2.5
 DILATE=15
 INTERFACE_THR=1.0
+
+# Stable stratified sample eval + physical-ratio acceptance (Model/train.py)
+EVAL_SAMPLE_MODE="fixed"
+EVAL_SAMPLE_INDEX_SEED=0
+EVAL_FLOW_NOISE_SEED=0
+EVAL_SAMPLES_PER_DEVICE=8
+SAMPLE_EVAL_LIMIT=64
+PHYSICAL_RATIO_TARGET=2
+CKPT_BEST_METRIC="worst_ratio_p95"
 
 # System/env
 export OMP_NUM_THREADS=1
@@ -175,13 +178,13 @@ srun torchrun \
   --num-heads "${NUM_HEADS}" \
   --attn-resolutions "${ATTN_RESOLUTIONS}" \
   --model-dropout "${MODEL_DROPOUT}" \
-  --train-fraction 0.90 \
+  --train-fraction 0.95 \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
   --batch-size "${BATCH_SIZE}" \
   --amp \
-  --amp-dtype bfloat16 \
-  --train-num-workers 10 \
+  --amp-dtype float16 \
+  --train-num-workers 2 \
   --val-num-workers 4 \
   --prefetch-factor 4 \
   \
@@ -220,12 +223,18 @@ srun torchrun \
   --dilate "${DILATE}" \
   --interface-thr "${INTERFACE_THR}" \
   \
-  --ckpt-every 20 \
-  --eval-every 5 \
+  --ckpt-every 50 \
+  --eval-every 20 \
   --val-batches 4 \
   --save-eval-samples \
   --save-eval-samples-limit 2 \
-  --sample-eval-limit 2 \
+  --sample-eval-limit "${SAMPLE_EVAL_LIMIT}" \
+  --eval-sample-mode "${EVAL_SAMPLE_MODE}" \
+  --eval-sample-index-seed "${EVAL_SAMPLE_INDEX_SEED}" \
+  --eval-flow-noise-seed "${EVAL_FLOW_NOISE_SEED}" \
+  --eval-samples-per-device "${EVAL_SAMPLES_PER_DEVICE}" \
+  --physical-ratio-target "${PHYSICAL_RATIO_TARGET}" \
+  --ckpt-best-metric "${CKPT_BEST_METRIC}" \
   \
   --pml-cells 0 \
   --physics-features \
@@ -238,6 +247,7 @@ srun torchrun \
   --warmup-epochs 5 \
   --min-lr 5e-6 \
   --weight-decay "${WEIGHT_DECAY}" \
+  --grad-clip 5.0 \
   --log-every 1 \
   \
   --no-include-sdf \
@@ -255,5 +265,7 @@ srun torchrun \
   \
   --eps-core 5.8 \
   --eps-clad 2.09 \
+  \
+ \
 
 echo "Training job completed."

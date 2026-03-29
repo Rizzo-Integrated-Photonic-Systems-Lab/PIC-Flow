@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import logging
 import math
 import os
@@ -10,6 +11,7 @@ from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from time import time
 from types import SimpleNamespace
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -74,6 +76,85 @@ torch.set_float32_matmul_precision("high")
 torch.backends.cuda.preferred_linalg_library("cusolver")
 
 dtype = torch.float32
+
+
+def _ratio_list_stats(ratios: List[float]) -> dict:
+    """Mean, std, p95, max of physical residual ratios (pred/GT)."""
+    if not ratios:
+        return {"mean": 0.0, "std": 0.0, "p95": 0.0, "max": 0.0, "min": 0.0}
+    rs = np.asarray(ratios, dtype=np.float64)
+    return {
+        "mean": float(rs.mean()),
+        "std": float(rs.std(ddof=0)) if rs.size > 1 else 0.0,
+        "p95": float(np.percentile(rs, 95.0)),
+        "max": float(rs.max()),
+        "min": float(rs.min()),
+    }
+
+
+def _eval_field_noise(
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    """Deterministic Gaussian noise for stratified FM sample eval (same every epoch if seed fixed)."""
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed) & 0x7FFFFFFFFFFFFFFF)
+    return torch.randn(shape, device=device, dtype=dtype, generator=gen)
+
+
+def _select_eval_sample_indices(
+    dt_index: dict[str, list],
+    n_per_device: int,
+    args,
+    epoch: int,
+    logger: Optional[logging.Logger],
+) -> list[tuple[int, str]]:
+    """
+    Stratified (global_idx, device_type) pairs for sample eval.
+    Modes: epoch_random (default), fixed (same draw every epoch), or JSON file override.
+    """
+    json_path = (getattr(args, "eval_sample_indices_json", "") or "").strip()
+    if json_path:
+        if not os.path.isfile(json_path):
+            if logger:
+                logger.warning(f"eval_sample_indices_json not found ({json_path}); using eval-sample-mode selection.")
+        else:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            out: list[tuple[int, str]] = []
+            for dt_name in sorted(data.keys()):
+                if dt_name not in dt_index:
+                    if logger:
+                        logger.warning(f"eval JSON: device_type '{dt_name}' not in validation set; skipping.")
+                    continue
+                pool = set(dt_index[dt_name])
+                for idx in data[dt_name]:
+                    gi = int(idx)
+                    if gi in pool:
+                        out.append((gi, dt_name))
+            if out:
+                return out
+            if logger:
+                logger.warning("eval JSON produced no valid indices; falling back to random selection.")
+
+    mode = str(getattr(args, "eval_sample_mode", "epoch_random"))
+    if mode == "fixed":
+        rng = np.random.default_rng(int(getattr(args, "eval_sample_index_seed", 0)))
+    else:
+        rng = np.random.default_rng(int(epoch) * 137 + 7)
+
+    out: list[tuple[int, str]] = []
+    for dt_name in sorted(dt_index.keys()):
+        dt_pool = dt_index[dt_name]
+        n = min(int(n_per_device), len(dt_pool))
+        if n <= 0:
+            continue
+        chosen = rng.choice(len(dt_pool), size=n, replace=False)
+        for c in chosen:
+            out.append((dt_pool[int(c)], dt_name))
+    return out
 
 
 def _unwrap_model(model):
@@ -442,6 +523,50 @@ def _save_device_bar_chart_png(
             pass
 
 
+def _save_device_ratio_p95_chart_png(
+    *,
+    out_path: str,
+    title: str,
+    metrics_per_device: dict,
+    target_ratio: float,
+) -> None:
+    """Bar chart of per-device ratio p95 vs acceptance target (e.g. 1.5×)."""
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        if not metrics_per_device:
+            return
+        devices = sorted(metrics_per_device.keys())
+        fig, ax = plt.subplots(figsize=(max(10, len(devices) * 1.2), 5))
+        fig.suptitle(title, fontsize=12, fontweight="bold")
+        x = np.arange(len(devices))
+        p95_vals = [float(metrics_per_device[d].get("ratio_p95", 0.0)) for d in devices]
+        colors = plt.cm.Spectral(np.linspace(0.15, 0.85, max(len(devices), 1)))
+        bars = ax.bar(x, p95_vals, color=colors[: len(devices)], edgecolor="black", linewidth=0.5)
+        ax.axhline(float(target_ratio), color="red", linestyle="--", linewidth=1.2, label=f"target={target_ratio:g}×")
+        ax.set_ylabel("ratio p95 (pred/GT residual)", fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(devices, rotation=30, ha="right", fontsize=9)
+        for bar, v in zip(bars, p95_vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f"{v:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax.legend(loc="upper right", fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
+
 def _save_gradient_health_png(
     *,
     out_path: str,
@@ -513,7 +638,7 @@ def _save_training_curves_png(
         if epochs is None:
             return
 
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        fig, axes = plt.subplots(3, 2, figsize=(12, 11))
         fig.suptitle(f"Training Curves (epoch {epoch})", fontsize=12, fontweight="bold")
 
         # (0,0) FM loss
@@ -577,8 +702,30 @@ def _save_training_curves_png(
         elif has_amp:
             ax_right.legend(fontsize=7)
 
+        # (2,0) Worst per-device ratio p95 (acceptance metric; lower is better)
+        wr = col("worst_ratio_p95")
+        pt = col("physical_ratio_target")
+        if wr is not None and np.isfinite(wr).any():
+            mask_w = np.isfinite(wr) & (wr > 0)
+            if mask_w.any():
+                axes[2, 0].plot(epochs[mask_w], wr[mask_w], "k-o", markersize=2, label="worst ratio p95")
+            if pt is not None and np.isfinite(pt).any():
+                mask_p = np.isfinite(pt) & (pt > 0)
+                if mask_p.any():
+                    axes[2, 0].axhline(float(np.nanmedian(pt[mask_p])), color="red", linestyle="--", linewidth=1.0, label="target")
+            axes[2, 0].set_title("Worst device ratio p95 (pred/GT)", fontsize=9)
+            axes[2, 0].set_ylabel("ratio")
+            axes[2, 0].set_xlabel("Epoch")
+            axes[2, 0].legend(fontsize=7)
+            axes[2, 0].grid(alpha=0.3)
+        else:
+            axes[2, 0].set_visible(False)
+
+        axes[2, 1].set_visible(False)
+
         for ax in axes.ravel():
-            ax.tick_params(labelsize=8)
+            if ax.get_visible():
+                ax.tick_params(labelsize=8)
 
         fig.tight_layout(rect=[0, 0.02, 1, 0.95])
         fig.savefig(out_path, dpi=200)
@@ -869,6 +1016,11 @@ def main(args):
                     "sample_amp_err_mean",
                     "sample_phase_err_mean",
                     "sample_psnr_mean",
+                    "worst_ratio_p95",
+                    "worst_ratio_max",
+                    "physical_ratio_target",
+                    "all_devices_ratio_p95_le_target",
+                    "all_devices_ratio_max_le_target",
                 ])
 
     wandb_run = None
@@ -1176,14 +1328,14 @@ def main(args):
         p.requires_grad = False
     ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
-    # torch.compile: disabled — Inductor does not support complex tensors in backward pass.
-    # use_compile = int(getattr(args, "unroll_steps", 0)) == 0
-    # if use_compile:
-    #     import torch._functorch.config as _ftc
-    #     _ftc.donated_buffer = False
-    #     base_model = torch.compile(base_model)
-    #     if is_rank0():
-    #         logger.info("torch.compile enabled on base_model")
+    # torch.compile: enabled when S-param head is not in use (Inductor doesn't support complex backward through learned head)
+    use_compile = int(getattr(args, "unroll_steps", 0)) == 0 and not bool(getattr(base_model, "enable_sparam_head", False))
+    if use_compile:
+        import torch._functorch.config as _ftc
+        _ftc.donated_buffer = False
+        base_model = torch.compile(base_model)
+        if is_rank0():
+            logger.info("torch.compile enabled on base_model")
 
     if use_ddp:
         enable_head = bool(getattr(base_model, "enable_sparam_head", False))
@@ -1230,12 +1382,19 @@ def main(args):
     if amp_enabled:
         logger.info(f"AMP enabled with dtype={amp_dtype}, GradScaler={'on' if use_scaler else 'off'}")
 
-    def optimizer_step():
-        if scaler.is_enabled():
+    def optimizer_step(manual_grads: bool = False):
+        # When ConFIG injects gradients manually, we bypass scaler.scale().backward(),
+        # so scaler.step() would fail (_scale is None). Use opt.step() directly.
+        if scaler.is_enabled() and not manual_grads:
             scaler.step(opt)
             scaler.update()
         else:
             opt.step()
+            if scaler.is_enabled() and manual_grads:
+                try:
+                    scaler.update()
+                except Exception:
+                    pass  # update() may fail when _scale was never set
 
     warmup_epochs = int(getattr(args, "warmup_epochs", 0))
     min_lr = max(float(getattr(args, "min_lr", 5e-6)), 0.0)
@@ -1280,7 +1439,11 @@ def main(args):
         _unwrap_model(model).load_state_dict(checkpoint["model"], strict=False)
         _unwrap_model(ema).load_state_dict(checkpoint["ema"], strict=False)
 
-        opt.load_state_dict(checkpoint["opt"])
+        if getattr(args, 'reset_optimizer', False):
+            if is_rank0():
+                logger.info("--reset-optimizer: skipping optimizer state, using fresh optimizer")
+        else:
+            opt.load_state_dict(checkpoint["opt"])
 
         _unwrap_model(model).set_normalization_stats(stats, normalize_eps=args.normalize_eps)
         _unwrap_model(ema).set_normalization_stats(stats, normalize_eps=args.normalize_eps)
@@ -1373,6 +1536,7 @@ def main(args):
             logger.info("Autograd anomaly detection ENABLED (--detect-anomaly).")
 
     _prev_weights = None  # track weight changes for log deduplication
+    best_worst_ratio_p95 = float("inf")  # lower is better; for --ckpt-best-metric worst_ratio_p95
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -1654,6 +1818,11 @@ def main(args):
                 for i, (_name, L, w) in enumerate(loss_items):
                     if float(w) <= 0.0:
                         continue
+                    # Skip losses that are placeholders (e.g. torch.zeros when time-gating
+                    # excludes all samples). These have no grad_fn and would raise:
+                    # "element 0 of tensors does not require grad and does not have a grad_fn"
+                    if not L.requires_grad:
+                        continue
                     retain = (i != len(loss_items) - 1)
                     L_scaled = L * _config_scale if _config_scale != 1.0 else L
 
@@ -1714,7 +1883,7 @@ def main(args):
                     if math.isfinite(gn):
                         running_grad_norm += gn
                         grad_norm_max_epoch = max(grad_norm_max_epoch, gn)
-                    optimizer_step()
+                    optimizer_step(manual_grads=False)  # fallback uses normal backward
                 else:
                     # DDP-sync: average the combined grad vector across ranks once
                     if dist.is_initialized():
@@ -1733,7 +1902,7 @@ def main(args):
                     if math.isfinite(gn):
                         running_grad_norm += gn
                         grad_norm_max_epoch = max(grad_norm_max_epoch, gn)
-                    optimizer_step()
+                    optimizer_step(manual_grads=True)  # ConFIG injects grads, bypass scaler.step
 
             else:
                 # Plain weighted sum (default / when ConFIG disabled)
@@ -1991,6 +2160,10 @@ def main(args):
             sample_phase_err_mean = 0.0
             sample_psnr_mean = 0.0
             sample_metrics_per_device = {}  # {device_type: {metric: value}}
+            worst_ratio_p95 = None
+            worst_ratio_max = None
+            all_devices_p95_le_target = None
+            all_devices_max_le_target = None
             if is_rank0():
                 residuals = []
                 gt_residuals = []
@@ -2017,21 +2190,27 @@ def main(args):
                         logger.info(f"[sample eval] Device-type index: {', '.join(f'{k}({len(v)})' for k, v in sorted(dt_index.items()))}")
 
                 dt_index = val_ds._device_type_index
-                n_per_device = max(1, int(args.sample_eval_limit) // max(len(dt_index), 1))
+                n_auto = max(1, int(args.sample_eval_limit) // max(len(dt_index), 1))
+                n_per_device = int(getattr(args, "eval_samples_per_device", 0) or 0)
+                if n_per_device <= 0:
+                    n_per_device = n_auto
 
-                # Select samples: n_per_device from each device type (epoch-seeded)
-                sample_rng = np.random.default_rng(epoch * 137 + 7)
-                sample_indices = []  # (global_idx, device_type)
-                for dt_name in sorted(dt_index.keys()):
-                    dt_pool = dt_index[dt_name]
-                    n = min(n_per_device, len(dt_pool))
-                    chosen = sample_rng.choice(len(dt_pool), size=n, replace=False)
-                    for c in chosen:
-                        sample_indices.append((dt_pool[c], dt_name))
+                sample_indices = _select_eval_sample_indices(
+                    dt_index, n_per_device, args, epoch, logger,
+                )
+                if not getattr(val_ds, "_eval_protocol_logged", False):
+                    fns = int(getattr(args, "eval_flow_noise_seed", -1))
+                    logger.info(
+                        f"[sample eval] protocol: mode={getattr(args, 'eval_sample_mode', 'epoch_random')}, "
+                        f"n_per_device={n_per_device}, total_samples={len(sample_indices)}, "
+                        f"eval_flow_noise_seed={fns} (>=0: deterministic per index)"
+                    )
+                    val_ds._eval_protocol_logged = True
 
                 # Per-device accumulators
                 dev_residuals = defaultdict(list)
                 dev_gt_residuals = defaultdict(list)
+                dev_ratios = defaultdict(list)  # per-sample pred/GT residual ratio
                 dev_amp_errs = defaultdict(list)
                 dev_phase_errs = defaultdict(list)
                 dev_psnr = defaultdict(list)
@@ -2048,7 +2227,14 @@ def main(args):
                         eps_s = x_full_s[:, 2:3]
                         src_s = x_full_s[:, 3:4]
                         extra_maps_s = x_full_s[:, 4:] if x_full_s.shape[1] > 4 else None
-                        x0_fields_s = torch.randn_like(x_full_s[:, 0:2])
+                        flow_noise_seed = int(getattr(args, "eval_flow_noise_seed", -1))
+                        if flow_noise_seed >= 0:
+                            noise_seed = int(flow_noise_seed) + int(s) * 1_000_003
+                            x0_fields_s = _eval_field_noise(
+                                x_full_s[:, 0:2].shape, device, dtype, noise_seed,
+                            )
+                        else:
+                            x0_fields_s = torch.randn_like(x_full_s[:, 0:2])
                         lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean
 
                         if extra_maps_s is not None:
@@ -2113,6 +2299,8 @@ def main(args):
                         gt_res_val = float(res_gt_masked.sqrt().item())
                         gt_residuals.append(gt_res_val)
                         dev_gt_residuals[dt_name].append(gt_res_val)
+                        ratio_ij = res_val / max(gt_res_val, 1e-12)
+                        dev_ratios[dt_name].append(ratio_ij)
 
                         # ezr_gt_s, ezi_gt_s already computed above for GT residual
                         mag_gt_s = torch.sqrt(ezr_gt_s ** 2 + ezi_gt_s ** 2 + 1e-12)
@@ -2249,7 +2437,8 @@ def main(args):
                 sample_phase_err_mean = float(np.mean(phase_errs)) if phase_errs else 0.0
                 sample_psnr_mean = float(np.mean(psnr_list)) if psnr_list else 0.0
 
-                # Aggregate per-device metrics
+                # Aggregate per-device metrics (per-sample ratio stats for stable acceptance tests)
+                ph_targ = float(getattr(args, "physical_ratio_target", 1.5))
                 for dt_name in sorted(dev_residuals.keys()):
                     dr = dev_residuals[dt_name]
                     dgr = dev_gt_residuals[dt_name]
@@ -2258,12 +2447,20 @@ def main(args):
                     dpsnr = dev_psnr.get(dt_name, [])
                     dt_res = float(np.mean(dr))
                     dt_gt_res = float(np.mean(dgr))
-                    dt_ratio = dt_res / max(dt_gt_res, 1e-12)
-                    dt_gap_dB = 10.0 * math.log10(max(dt_ratio, 1e-12))
+                    ratio_over_mean = dt_res / max(dt_gt_res, 1e-12)
+                    rs_list = dev_ratios.get(dt_name, [])
+                    st = _ratio_list_stats(rs_list)
+                    ratio_primary = st["mean"] if rs_list else ratio_over_mean
+                    dt_gap_dB = 10.0 * math.log10(max(ratio_primary, 1e-12))
                     dt_metrics = {
                         "residual": dt_res,
                         "gt_residual": dt_gt_res,
-                        "ratio": dt_ratio,
+                        "ratio": ratio_primary,
+                        "ratio_mean_over_mean": ratio_over_mean,
+                        "ratio_std": st["std"],
+                        "ratio_p95": st["p95"],
+                        "ratio_max": st["max"],
+                        "ratio_min": st["min"],
                         "gap_dB": dt_gap_dB,
                         "amp_err": float(np.mean(dae)),
                         "phase_err": float(np.mean(dpe)),
@@ -2277,6 +2474,49 @@ def main(args):
                         dt_metrics["sparam_mag_err"] = float(np.mean(dsme))
                         dt_metrics["sparam_phase_err_deg"] = float(np.degrees(np.mean(dspe)))
                     sample_metrics_per_device[dt_name] = dt_metrics
+
+                if sample_metrics_per_device:
+                    p95s = [sample_metrics_per_device[d]["ratio_p95"] for d in sample_metrics_per_device]
+                    maxes = [sample_metrics_per_device[d]["ratio_max"] for d in sample_metrics_per_device]
+                    worst_ratio_p95 = float(max(p95s))
+                    worst_ratio_max = float(max(maxes))
+                    all_devices_p95_le_target = bool(
+                        all(sample_metrics_per_device[d]["ratio_p95"] <= ph_targ for d in sample_metrics_per_device)
+                    )
+                    all_devices_max_le_target = bool(
+                        all(sample_metrics_per_device[d]["ratio_max"] <= ph_targ for d in sample_metrics_per_device)
+                    )
+
+                eval_jsonl_path = os.path.join(experiment_dir, "eval_sample_metrics.jsonl")
+                try:
+                    rec = {
+                        "epoch": int(epoch),
+                        "physical_ratio_target": ph_targ,
+                        "worst_ratio_p95": worst_ratio_p95,
+                        "worst_ratio_max": worst_ratio_max,
+                        "all_devices_ratio_p95_le_target": all_devices_p95_le_target,
+                        "all_devices_ratio_max_le_target": all_devices_max_le_target,
+                        "per_device": {k: dict(v) for k, v in sample_metrics_per_device.items()},
+                        "protocol": {
+                            "eval_sample_mode": getattr(args, "eval_sample_mode", "epoch_random"),
+                            "eval_sample_index_seed": int(getattr(args, "eval_sample_index_seed", 0)),
+                            "eval_flow_noise_seed": int(getattr(args, "eval_flow_noise_seed", -1)),
+                            "eval_sample_indices_json": (getattr(args, "eval_sample_indices_json", "") or "").strip(),
+                            "n_per_device": int(n_per_device),
+                            "n_total_samples": int(len(sample_indices)),
+                        },
+                    }
+                    with open(eval_jsonl_path, "a", encoding="utf-8") as jf:
+                        jf.write(json.dumps(rec, default=str) + "\n")
+                except Exception:
+                    pass
+
+                _save_device_ratio_p95_chart_png(
+                    out_path=os.path.join(samples_dir, f"ratio_p95_epoch_{epoch:04d}.png"),
+                    title=f"Physical residual ratio (per-device) — Epoch {epoch}",
+                    metrics_per_device=sample_metrics_per_device,
+                    target_ratio=ph_targ,
+                )
 
                 # Save per-device bar chart dashboard and training curves
                 _save_device_bar_chart_png(
@@ -2321,12 +2561,19 @@ def main(args):
                     f", phase_err_w={sample_phase_err_mean:.4e}"
                     f", psnr={sample_psnr_mean:.2f}dB"
                 )
+                if worst_ratio_p95 is not None and math.isfinite(float(worst_ratio_p95)):
+                    _pt = float(getattr(args, "physical_ratio_target", 1.5))
+                    msg += (
+                        f"\n             worst_ratio_p95={worst_ratio_p95:.3f}x, worst_ratio_max={worst_ratio_max:.3f}x "
+                        f"(target≤{_pt:.2f}×) | all_p95_ok={all_devices_p95_le_target}, all_max_ok={all_devices_max_le_target}"
+                    )
                 # Per-device breakdown
                 if sample_metrics_per_device:
                     msg += "\n             --- per-device ---"
                     for dt_name, dt_m in sorted(sample_metrics_per_device.items()):
                         line = (
                             f"\n             {dt_name:>20s} (n={dt_m['n_samples']:d}): "
+                            f"r_p95={dt_m['ratio_p95']:.3f}, r_max={dt_m['ratio_max']:.3f}, "
                             f"res={dt_m['residual']:.4e}, gap={dt_m['gap_dB']:+.1f}dB, "
                             f"amp_err={dt_m['amp_err']:.4e}, phase_err={dt_m['phase_err']:.4e}, "
                             f"psnr={dt_m['psnr']:.2f}dB"
@@ -2365,6 +2612,11 @@ def main(args):
                         sample_amp_err_mean,
                         sample_phase_err_mean,
                         sample_psnr_mean,
+                        worst_ratio_p95 if worst_ratio_p95 is not None else "",
+                        worst_ratio_max if worst_ratio_max is not None else "",
+                        float(getattr(args, "physical_ratio_target", 1.5)),
+                        int(bool(all_devices_p95_le_target)) if all_devices_p95_le_target is not None else "",
+                        int(bool(all_devices_max_le_target)) if all_devices_max_le_target is not None else "",
                     ])
 
                 if wandb_run is not None:
@@ -2380,6 +2632,12 @@ def main(args):
                         "val/sample_phase_err_w": sample_phase_err_mean,
                         "val/sample_psnr_mean": sample_psnr_mean,
                     }
+                    if worst_ratio_p95 is not None and math.isfinite(float(worst_ratio_p95)):
+                        log_dict["val/worst_ratio_p95"] = float(worst_ratio_p95)
+                        log_dict["val/worst_ratio_max"] = float(worst_ratio_max) if worst_ratio_max is not None else float("nan")
+                        log_dict["val/physical_ratio_target"] = float(getattr(args, "physical_ratio_target", 1.5))
+                        log_dict["val/all_devices_ratio_p95_le_target"] = int(bool(all_devices_p95_le_target))
+                        log_dict["val/all_devices_ratio_max_le_target"] = int(bool(all_devices_max_le_target))
                     if phase_weight > 0.0:
                         log_dict["val/phase_loss"] = val_phase_loss
                         try:
@@ -2396,6 +2654,9 @@ def main(args):
                     for dt_name, dt_m in sample_metrics_per_device.items():
                         log_dict[f"val_device/{dt_name}/residual"] = dt_m["residual"]
                         log_dict[f"val_device/{dt_name}/residual_gap_dB"] = dt_m["gap_dB"]
+                        log_dict[f"val_device/{dt_name}/ratio_p95"] = dt_m["ratio_p95"]
+                        log_dict[f"val_device/{dt_name}/ratio_max"] = dt_m["ratio_max"]
+                        log_dict[f"val_device/{dt_name}/ratio_std"] = dt_m["ratio_std"]
                         log_dict[f"val_device/{dt_name}/amp_err"] = dt_m["amp_err"]
                         log_dict[f"val_device/{dt_name}/phase_err"] = dt_m["phase_err"]
                         log_dict[f"val_device/{dt_name}/psnr"] = dt_m["psnr"]
@@ -2412,14 +2673,44 @@ def main(args):
                         except Exception:
                             pass
                     # Upload dashboard and training curves plots
-                    for plot_name in ["dashboard", "training_curves"]:
-                        plot_path = os.path.join(samples_dir, f"{plot_name}_epoch_{epoch:04d}.png")
+                    for plot_name in ["dashboard", "training_curves", "ratio_p95"]:
+                        if plot_name == "ratio_p95":
+                            plot_path = os.path.join(samples_dir, f"ratio_p95_epoch_{epoch:04d}.png")
+                        else:
+                            plot_path = os.path.join(samples_dir, f"{plot_name}_epoch_{epoch:04d}.png")
                         if os.path.isfile(plot_path):
                             try:
                                 log_dict[f"val/{plot_name}"] = wandb.Image(plot_path)
                             except Exception:
                                 pass
                     wandb_run.log(log_dict, step=epoch)
+
+                # Optional: save checkpoint when worst per-device ratio p95 improves (lower is better)
+                if (
+                    (epoch % int(args.eval_every) == 0)
+                    and str(getattr(args, "ckpt_best_metric", "") or "") == "worst_ratio_p95"
+                    and worst_ratio_p95 is not None
+                    and math.isfinite(float(worst_ratio_p95))
+                    and float(worst_ratio_p95) < best_worst_ratio_p95
+                ):
+                    best_worst_ratio_p95 = float(worst_ratio_p95)
+                    ckpt_best_path = os.path.join(ckpt_dir, "best_worst_ratio_p95.pt")
+                    torch.save(
+                        {
+                            "model": _unwrap_model(model).state_dict(),
+                            "ema": _unwrap_model(ema).state_dict(),
+                            "opt": opt.state_dict(),
+                            "args": args,
+                            "stats": stats,
+                            "epoch": epoch,
+                            "worst_ratio_p95": float(worst_ratio_p95),
+                        },
+                        ckpt_best_path,
+                    )
+                    logger.info(
+                        f"[epoch {epoch:04d}] New best worst_ratio_p95={float(worst_ratio_p95):.4f} "
+                        f"-> saved {ckpt_best_path}"
+                    )
 
         # -----------------------
         # Inverse design evaluation (rank0 only, separate frequency)
@@ -2990,7 +3281,52 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--ckpt-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=25)
-    parser.add_argument("--sample-eval-limit", type=int, default=16)
+    parser.add_argument("--sample-eval-limit", type=int, default=16,
+                        help="Total sample-eval budget; split across device types unless --eval-samples-per-device is set")
+    parser.add_argument(
+        "--eval-sample-mode",
+        type=str,
+        default="fixed",
+        choices=["epoch_random", "fixed"],
+        help="Sample selection: epoch_random (legacy, changes each eval) or fixed (same stratified draw every epoch)",
+    )
+    parser.add_argument(
+        "--eval-sample-index-seed",
+        type=int,
+        default=0,
+        help="RNG seed for stratified val indices when --eval-sample-mode=fixed (ignored if --eval-sample-indices-json is set)",
+    )
+    parser.add_argument(
+        "--eval-sample-indices-json",
+        type=str,
+        default="",
+        help="Optional JSON map {device_type: [global_val_idx, ...]}; overrides random stratified selection",
+    )
+    parser.add_argument(
+        "--eval-samples-per-device",
+        type=int,
+        default=0,
+        help="If >0, draw this many validation samples per device type; else derive from sample-eval-limit",
+    )
+    parser.add_argument(
+        "--eval-flow-noise-seed",
+        type=int,
+        default=0,
+        help="If >=0, deterministic FM noise x0 per val index (reproducible ODE); if -1, fresh randn each eval (legacy)",
+    )
+    parser.add_argument(
+        "--physical-ratio-target",
+        type=float,
+        default=1.5,
+        help="Target max pred/GT residual ratio for acceptance flags (logged vs per-device p95/max)",
+    )
+    parser.add_argument(
+        "--ckpt-best-metric",
+        type=str,
+        default="",
+        choices=["", "worst_ratio_p95"],
+        help="If worst_ratio_p95, save checkpoints/best_worst_ratio_p95.pt when val worst per-device ratio p95 improves",
+    )
     parser.add_argument("--save-eval-samples", dest="save_eval_samples", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--save-eval-samples-limit", dest="save_eval_samples_limit", type=int, default=1)
 
@@ -3009,6 +3345,8 @@ if __name__ == "__main__":
                         help="Automatically resume from latest checkpoint in ckpt_dir if available")
     parser.add_argument("--reset-lr-on-resume", action="store_true", default=False,
                         help="Reset LR schedule to fresh cosine from --lr on resume")
+    parser.add_argument("--reset-optimizer", action="store_true", default=False,
+                        help="Skip loading optimizer state on resume (fresh optimizer, keeps model weights)")
     parser.add_argument("--t-physics-min", type=float, default=0.0,
                         help="Min t for physics losses (residual/phase/sparam). FM always at all t.")
 

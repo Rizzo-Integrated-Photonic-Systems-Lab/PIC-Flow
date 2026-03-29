@@ -392,7 +392,7 @@ class CircularBend2D(Device2DBase):
             src_vol = self.src_vol
             k_in = mp.Vector3(float(self._in_tangent[0]), float(self._in_tangent[1]), 0)
         else:
-            # Input from output port (reversed)
+            # Input from output port: source is outward, wave must propagate INTO device (-out_tangent)
             src_xy = self._clamp_point_inside_nonpml((
                 self.port_out.center.x + self.source_shift * self._out_tangent[0],
                 self.port_out.center.y + self.source_shift * self._out_tangent[1],
@@ -400,7 +400,7 @@ class CircularBend2D(Device2DBase):
             src_x = src_xy[0]
             src_y = src_xy[1]
             src_vol = mp.Volume(center=mp.Vector3(src_x, src_y, 0), size=self.port_out.size)
-            k_in = mp.Vector3(float(self._out_tangent[0]), float(self._out_tangent[1]), 0)
+            k_in = mp.Vector3(-float(self._out_tangent[0]), -float(self._out_tangent[1]), 0)
 
         sources = [
             mp.EigenModeSource(
@@ -461,7 +461,7 @@ class CircularBend2D(Device2DBase):
             src_x = src_xy[0]
             src_y = src_xy[1]
             src_vol = mp.Volume(center=mp.Vector3(src_x, src_y, 0), size=self.port_out.size)
-            k_in = mp.Vector3(float(self._out_tangent[0]), float(self._out_tangent[1]), 0)
+            k_in = mp.Vector3(-float(self._out_tangent[0]), -float(self._out_tangent[1]), 0)
 
         sources = [
             mp.EigenModeSource(
