@@ -1,22 +1,22 @@
-# Rayfield — PHASE: Physics-Aware Surrogate for Electromagnetics
+# PHASE: Physics-Aware Surrogate for Electromagnetics
 
 A neural surrogate that replaces FDTD simulation for 2D photonic device field prediction.
 PHASE pairs a real-valued U-Net with **conditional flow matching** and a **Helmholtz residual
 loss** to generate complex electromagnetic fields ($E_z$) for parameterized silicon-photonic
-devices given their permittivity map, source-port mask, and wavelength. See [`paper.tex`](paper.tex)
-for the full method and benchmarks.
+devices given their permittivity map, source-port mask, and wavelength.
 
 <p align="center">
   <img src="assets/denoising_trajectory.gif"
-       alt="PHASE denoising trajectory: 400-step Euler integration from Gaussian noise to the predicted E_z field, with the FDTD ground truth shown alongside for reference."
+       alt="PHASE denoising trajectory: 100-step Euler integration from Gaussian noise to the predicted E_z field, with the FDTD ground truth shown alongside for reference."
        width="760">
 </p>
 
 The animation shows what the model actually does: starting from Gaussian noise (left, $t=0$),
 PHASE integrates a learned velocity field along $t \in [0, 1]$ until the field converges to a
-prediction (left, $t=1$) that matches the FDTD reference (right). The whole 400-step integration
-runs in under a second on a single A100; with 20 steps it takes ≈ 444 ms and still hits 3 %
-Helmholtz compliance, ~10× faster than 16-thread CPU FDTD on the same node.
+prediction (left, $t=1$) that matches the FDTD reference (right). On a single A100 the
+integration finishes in well under a second; the wall-clock benchmark with as few as 20 Euler
+steps takes ≈ 444 ms and still hits 3 % Helmholtz compliance, ~10× faster than 16-thread
+CPU FDTD on the same node.
 
 > Regenerate the GIF: `python tools/denoising_trajectory.py` then copy
 > `outputs/denoising/trajectory.gif` to `assets/denoising_trajectory.gif`.
@@ -33,8 +33,8 @@ and directional couplers — 22 500 FDTD simulations total).
 ## Install
 
 ```bash
-git clone <repo-url> rayfield
-cd rayfield
+git clone https://github.com/Rizzo-Integrated-Photonic-Systems-Lab/PHASE.git
+cd PHASE
 
 # Core deps. PyTorch must match your CUDA — install separately if pip's default doesn't fit:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
@@ -116,14 +116,12 @@ See [`Data/README.md`](Data/README.md) for the dataset layout.
 ## Repo layout
 
 ```
-rayfield/
+PHASE/
 ├── Model/         neural network + training loop + flow matching
 ├── FDTD/          dataset generation (Meep-based) + per-device geometries
 ├── tools/         inference, inverse design, benchmarks, evaluation
 ├── notebooks/     hands-on walkthroughs (start here)
 ├── examples/      sample evaluation indices
-├── paper.tex      manuscript
-├── references.bib
 ├── Data/          (gitignored) FDTD ground-truth shards
 └── internal/      research-side material: SLURM configs, run logs, archived experiments
 ```

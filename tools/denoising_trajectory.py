@@ -56,11 +56,11 @@ from euler_convergence_panel import (  # noqa: E402
 )
 
 
-# t-values to render in the static panel. At K=400 these become step indices
-# (0, 4, 20, 80, 200, 300, 400). Labeling by t rather than k keeps the panel
+# t-values to render in the static panel. At K=100 these become step indices
+# (0, 1, 5, 20, 50, 75, 100). Labeling by t rather than k keeps the panel
 # meaningful regardless of integrator step count.
 PANEL_T_VALUES = (0.00, 0.01, 0.05, 0.20, 0.50, 0.75, 1.00)
-TOTAL_STEPS = 400
+TOTAL_STEPS = 100
 
 
 # ---------------------------------------------------------------------------
