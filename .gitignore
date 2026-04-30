@@ -20,6 +20,7 @@ pip-wheel-metadata/
 .DS_Store
 *.swp
 *.swo
+.claude/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -41,11 +42,6 @@ logs_physics_unet_pbfm/
 
 # Internal run artifacts (preserved layout, untracked contents)
 internal/runs/
-
-# Inverse-design code: kept locally, not part of the public repo.
-tools/inverse_design_*.py
-notebooks/04_inverse_design.ipynb
-internal/archived/inverse_design.py
 
 # Large generated data
 Data/*

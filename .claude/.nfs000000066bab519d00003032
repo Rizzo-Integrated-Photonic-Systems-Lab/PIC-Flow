@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(awk -F',' 'NR==1 || $1==100 || $1==200' /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_v100x12/validation.csv)",
-      "Bash(awk -F',' 'NR==1 || $1==100 || $1==200' /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_residual_v100x12/validation.csv)",
-      "Bash(awk -F',' 'NR==1 || $1==50' /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_v100x12/validation.csv /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_residual_v100x12/validation.csv)"
-    ]
-  }
-}
