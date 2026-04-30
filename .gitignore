@@ -40,8 +40,8 @@ checkpoints/
 checkpoints_resume/
 logs_physics_unet_pbfm/
 
-# Internal run artifacts (preserved layout, untracked contents)
-internal/runs/
+# Internal: research-side material kept local, not part of the public repo.
+internal/
 
 # Large generated data
 Data/*

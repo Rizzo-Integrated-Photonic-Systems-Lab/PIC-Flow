@@ -121,12 +121,8 @@ PIC-Flow/
 ├── tools/         inference, benchmarks, evaluation
 ├── notebooks/     hands-on walkthroughs (start here)
 ├── examples/      sample evaluation indices
-├── Data/          (gitignored) FDTD ground-truth shards
-└── internal/      research-side material: SLURM configs, run logs, archived experiments
+└── Data/          (gitignored) FDTD ground-truth shards
 ```
-
-Public users don't need anything in `internal/`; it's preserved for reproducibility of the
-paper's specific runs.
 
 ---
 
