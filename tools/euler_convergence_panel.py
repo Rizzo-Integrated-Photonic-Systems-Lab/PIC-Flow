@@ -114,22 +114,29 @@ def _load_shard_sample(data_root: Path, entry: dict[str, Any]) -> dict[str, Any]
     return out
 
 
-def _pick_dc_sample(data_root: Path) -> dict[str, Any]:
-    """First directional-coupler test sample with input_port=1 (matches
-    benchmark_dc_inference_methods.py's selection rule)."""
+def _pick_test_sample(data_root: Path, device_type: str) -> dict[str, Any]:
+    """First test sample for `device_type` with input_port=1.
+
+    Falls back to the first candidate if none have input_port=1.
+    """
     candidates = [
         e for e in _load_index(data_root)
-        if e.get("device") == "directional_coupler"
+        if e.get("device") == device_type
         and e.get("split") == "test"
         and e.get("augment", "orig") == "orig"
     ]
+    if not candidates:
+        raise RuntimeError(f"No {device_type} test samples in shard index.")
     for e in candidates:
         s = _load_shard_sample(data_root, e)
         if int(s["input_port"]) == 1:
             return s
-    if not candidates:
-        raise RuntimeError("No directional_coupler test samples in shard index.")
     return _load_shard_sample(data_root, candidates[0])
+
+
+def _pick_dc_sample(data_root: Path) -> dict[str, Any]:
+    """Backwards-compatible alias for `directional_coupler`."""
+    return _pick_test_sample(data_root, "directional_coupler")
 
 
 def _anchor_reference(sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:

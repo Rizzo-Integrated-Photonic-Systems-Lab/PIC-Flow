@@ -50,10 +50,17 @@ from predict_parametric_device import (  # noqa: E402
 from euler_convergence_panel import (  # noqa: E402
     DEFAULT_CKPT,
     DEFAULT_DATA_ROOT,
-    _pick_dc_sample,
+    _pick_test_sample,
     _anchor_reference,
     _select_device,
 )
+
+
+DEVICE_LABELS = {
+    "mmi": "MMI",
+    "ybranch": "Y-branch",
+    "directional_coupler": "directional coupler",
+}
 
 
 # t-values to render in the static panel. At K=100 these become step indices
@@ -191,7 +198,7 @@ def _save_gif(
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
 
-    fig, axes = plt.subplots(1, 2, figsize=(7.6, 1.8), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(5.8, 1.4), constrained_layout=True)
     fig.patch.set_facecolor("white")
 
     # Per-frame normalization on the trajectory panel so structure is visible.
@@ -241,7 +248,7 @@ def _save_gif(
                                     interval=int(1000 / max(fps, 1)), blit=False)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = animation.PillowWriter(fps=int(fps))
-    anim.save(out_path, writer=writer, dpi=120)
+    anim.save(out_path, writer=writer, dpi=85)
     plt.close(fig)
     print(f"[denoise] saved: {out_path}")
 
@@ -250,39 +257,21 @@ def _save_gif(
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Capture and render the FM denoising trajectory.")
-    parser.add_argument("--ckpt", default=str(DEFAULT_CKPT))
-    parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
-    parser.add_argument("--out-dir", default=str(REPO_ROOT / "outputs" / "denoising"))
-    parser.add_argument("--num-steps", type=int, default=TOTAL_STEPS)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device-runtime", default="auto")
-    parser.add_argument("--no-ema", action="store_true")
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--gif-fps", type=int, default=12)
-    parser.add_argument("--usetex", action="store_true")
-    args = parser.parse_args()
-
-    runtime_device = _select_device(args.device_runtime)
-    data_root = Path(args.data_root).expanduser().resolve()
-    out_dir = Path(args.out_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[denoise] checkpoint: {args.ckpt}")
-    print(f"[denoise] data_root: {data_root}")
-    print(f"[denoise] runtime_device: {runtime_device}")
-    print(f"[denoise] num_steps: {args.num_steps}  seed: {args.seed}")
-
-    sample = _pick_dc_sample(data_root)
+def _run_for_device(
+    device_type: str,
+    *,
+    args: argparse.Namespace,
+    runtime_device: torch.device,
+    data_root: Path,
+    out_dir: Path,
+    ckpt: dict[str, Any],
+    model: torch.nn.Module,
+) -> None:
+    label = DEVICE_LABELS.get(device_type, device_type)
+    print(f"\n[denoise] === {label} ({device_type}) ===")
+    sample = _pick_test_sample(data_root, device_type)
     fdtd_r, fdtd_i = _anchor_reference(sample)
     print(f"[denoise] geometry_id={sample['geometry_id']}  input_port={sample['input_port']}")
-
-    ckpt = torch.load(args.ckpt, map_location=runtime_device, weights_only=False)
-    model = _build_model_from_checkpoint(ckpt, device=runtime_device)
-    state_key, state = _checkpoint_state_dict(ckpt, use_ema=not bool(args.no_ema))
-    model.load_state_dict(state, strict=True); model.eval()
-    print(f"[denoise] loaded weights: {state_key}")
 
     stats = ckpt["stats"]
     ckpt_args = ckpt.get("args")
@@ -307,18 +296,17 @@ def main() -> None:
     fdtd_mag  = np.abs(fdtd_r + 1j * fdtd_i)
     vmax_global = float(np.percentile(np.concatenate([traj_mags[-1].ravel(), fdtd_mag.ravel()]), 99.5))
 
-    _setup_matplotlib(usetex=bool(args.usetex))
     _save_static_panel(sample["eps"], sample["src_mask"], fdtd_mag, traj_mags,
                        t_values=PANEL_T_VALUES,
                        num_steps=int(args.num_steps),
-                       out_path=out_dir / "trajectory_panel.png",
+                       out_path=out_dir / f"trajectory_panel_{device_type}.png",
                        vmax_global=vmax_global)
     _save_gif(sample["eps"], sample["src_mask"], traj_mags, fdtd_mag,
-              out_path=out_dir / "trajectory.gif",
+              out_path=out_dir / f"trajectory_{device_type}.gif",
               fps=int(args.gif_fps))
 
     np.savez_compressed(
-        out_dir / "fields.npz",
+        out_dir / f"fields_{device_type}.npz",
         eps=sample["eps"].astype(np.float32),
         src_mask=sample["src_mask"].astype(np.float32),
         fdtd_Ez_real=fdtd_r.astype(np.float32),
@@ -327,10 +315,66 @@ def main() -> None:
         traj_Ez_imag=ezi_traj.astype(np.float32),
         num_steps=np.int32(args.num_steps),
         panel_t_values=np.asarray(PANEL_T_VALUES, dtype=np.float32),
+        device=np.array(device_type),
         geometry_id=np.array(sample["geometry_id"]),
         params_json=np.array(json.dumps(sample["params"], sort_keys=True)),
     )
-    print(f"[denoise] cache: {out_dir / 'fields.npz'}")
+    print(f"[denoise] cache: {out_dir / f'fields_{device_type}.npz'}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Capture and render the FM denoising trajectory.")
+    parser.add_argument("--ckpt", default=str(DEFAULT_CKPT))
+    parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--out-dir", default=str(REPO_ROOT / "outputs" / "denoising"))
+    parser.add_argument(
+        "--device", default="directional_coupler",
+        help="Comma-separated list of device families to render. "
+             "Choices: mmi, ybranch, directional_coupler. Default: directional_coupler.",
+    )
+    parser.add_argument("--num-steps", type=int, default=TOTAL_STEPS)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device-runtime", default="auto")
+    parser.add_argument("--no-ema", action="store_true")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gif-fps", type=int, default=12)
+    parser.add_argument("--usetex", action="store_true")
+    args = parser.parse_args()
+
+    runtime_device = _select_device(args.device_runtime)
+    data_root = Path(args.data_root).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    devices = [d.strip() for d in str(args.device).split(",") if d.strip()]
+    for d in devices:
+        if d not in DEVICE_LABELS:
+            raise SystemExit(f"unsupported --device '{d}'; choices: {list(DEVICE_LABELS.keys())}")
+
+    print(f"[denoise] checkpoint: {args.ckpt}")
+    print(f"[denoise] data_root: {data_root}")
+    print(f"[denoise] runtime_device: {runtime_device}")
+    print(f"[denoise] num_steps: {args.num_steps}  seed: {args.seed}")
+    print(f"[denoise] devices: {devices}")
+
+    ckpt = torch.load(args.ckpt, map_location=runtime_device, weights_only=False)
+    model = _build_model_from_checkpoint(ckpt, device=runtime_device)
+    state_key, state = _checkpoint_state_dict(ckpt, use_ema=not bool(args.no_ema))
+    model.load_state_dict(state, strict=True); model.eval()
+    print(f"[denoise] loaded weights: {state_key}")
+
+    _setup_matplotlib(usetex=bool(args.usetex))
+
+    for device_type in devices:
+        _run_for_device(
+            device_type,
+            args=args,
+            runtime_device=runtime_device,
+            data_root=data_root,
+            out_dir=out_dir,
+            ckpt=ckpt,
+            model=model,
+        )
 
 
 if __name__ == "__main__":
