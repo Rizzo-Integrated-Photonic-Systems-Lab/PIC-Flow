@@ -9,6 +9,7 @@ import math
 import os
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
+from datetime import timedelta
 from time import time
 from types import SimpleNamespace
 from typing import List, Optional
@@ -925,7 +926,15 @@ def main(args):
     # Try DDP init; fall back to single-GPU if env vars aren't set (plain python).
     use_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if use_ddp:
-        dist.init_process_group(backend="nccl")
+        # Raise NCCL watchdog timeout well above the default 10 min so rank-0-only
+        # sample/inverse eval work (fm_sample ODE integration, PNG rendering, etc.)
+        # cannot trip the collective-timeout deadlock when other ranks are parked
+        # at a barrier. Override via env NCCL_PG_TIMEOUT_MIN if needed.
+        _pg_timeout_min = int(os.environ.get("NCCL_PG_TIMEOUT_MIN", "120"))
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=_pg_timeout_min),
+        )
 
     # Optional: force all enabled losses to start from epoch 1 (disable phased curriculum).
     # Note: a loss only participates if its corresponding lambda > 0.
@@ -937,16 +946,13 @@ def main(args):
         # Start phases at A (epoch 0 => active on epoch 1 loop)
         args.residual_start_phase = "A"
         args.phase_start_phase = "A"
-        args.phase_grad_start_phase = "A"
         args.sparam_start_phase = "A"
         args.sparam_from_start = True
 
         # Remove warmups so weights are nonzero immediately (if lambdas are nonzero)
         args.residual_warmup_epochs = 0
         args.phase_warmup_epochs = 0
-        args.phase_grad_warmup_epochs = 0
         args.sparam_warmup_epochs = 0
-        args.endpoint_warmup_epochs = 0
 
     rank = dist.get_rank() if use_ddp else 0
     world = dist.get_world_size() if use_ddp else 1
@@ -1484,10 +1490,10 @@ def main(args):
     # -----------------------
     use_config = bool(args.config)
     config_start_epoch = max(1, int(getattr(args, "config_start_epoch", 1)))
-    use_endpoint = args.lambda_endpoint > 0
+    use_endpoint = float(getattr(args, "lambda_endpoint", 0.0)) > 0
     use_residual = args.lambda_residual > 0
     use_phase = args.lambda_phase > 0
-    use_phase_grad = args.lambda_phase_grad > 0
+    use_phase_grad = float(getattr(args, "lambda_phase_grad", 0.0)) > 0
     use_sparam = args.lambda_sparam > 0
 
     if use_config and (not _HAS_CONFLICTFREE) and is_rank0():
@@ -1546,15 +1552,7 @@ def main(args):
         N1 = int(args.phaseA_epochs)
         N2 = int(args.phaseB_epochs)
 
-        if use_endpoint:
-            endpoint_start = _phase_start_epoch(
-                getattr(args, "endpoint_start_phase", "B"), N1=N1, N2=N2
-            )
-            endpoint_weight = float(args.lambda_endpoint) * ramp_linear(
-                epoch, start_epoch=endpoint_start, warmup_epochs=int(args.endpoint_warmup_epochs)
-            )
-        else:
-            endpoint_weight = 0.0
+        endpoint_weight = 0.0  # endpoint loss removed from public CLI; default off
 
         if use_residual:
             residual_start = 0 if getattr(args, "residual_start_phase", "B") == "A" else N1
@@ -1587,13 +1585,7 @@ def main(args):
             phase_gate = max(0.0, min(1.0, phase_gate))
         phase_gate = torch.tensor(phase_gate)
 
-        if use_phase_grad:
-            phase_grad_start = _phase_start_epoch(getattr(args, "phase_grad_start_phase", "C"), N1=N1, N2=N2)
-            phase_grad_weight = float(args.lambda_phase_grad) * ramp_linear(
-                epoch, start_epoch=phase_grad_start, warmup_epochs=int(args.phase_grad_warmup_epochs)
-            )
-        else:
-            phase_grad_weight = 0.0
+        phase_grad_weight = 0.0  # phase-gradient loss removed from public CLI; default off
 
         compute_phase_epoch = (phase_weight > 0.0)
 
@@ -1711,7 +1703,7 @@ def main(args):
                 else:
                     x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
 
-            compute_phase_grad_step = (phase_grad_weight > 0.0) and (global_step % int(args.phase_grad_every) == 0)
+            compute_phase_grad_step = False  # phase-grad loss removed from public CLI
             compute_sparam_step = (sparam_weight > 0.0) and (global_step % int(args.sparam_every) == 0)
             compute_residual_step = (residual_weight > 0.0)
 
@@ -2164,6 +2156,11 @@ def main(args):
             worst_ratio_max = None
             all_devices_p95_le_target = None
             all_devices_max_le_target = None
+            # Non-rank-0 ranks park here while rank 0 runs the (potentially long)
+            # sample-eval block below. Without this barrier, other ranks would
+            # race ahead into the next epoch's training AllReduces and trip the
+            # NCCL watchdog timeout while rank 0 is still in fm_sample / PNG IO.
+            ddp_barrier(device)
             if is_rank0():
                 residuals = []
                 gt_residuals = []
@@ -2246,7 +2243,7 @@ def main(args):
                             ema,
                             x0_fields_s,
                             num_steps=int(args.fm_steps),
-                            use_stoc_samp=bool(args.use_stoc_samp),
+                            use_stoc_samp=False,
                             cond_maps=cond_maps_s,
                             cond=cond_s,
                             lambda_um=lambda_um_s,
@@ -2571,11 +2568,13 @@ def main(args):
                 if sample_metrics_per_device:
                     msg += "\n             --- per-device ---"
                     for dt_name, dt_m in sorted(sample_metrics_per_device.items()):
+                        phase_err_deg = float(dt_m['phase_err']) * 180.0 / math.pi
                         line = (
                             f"\n             {dt_name:>20s} (n={dt_m['n_samples']:d}): "
                             f"r_p95={dt_m['ratio_p95']:.3f}, r_max={dt_m['ratio_max']:.3f}, "
                             f"res={dt_m['residual']:.4e}, gap={dt_m['gap_dB']:+.1f}dB, "
-                            f"amp_err={dt_m['amp_err']:.4e}, phase_err={dt_m['phase_err']:.4e}, "
+                            f"amp_err={dt_m['amp_err']:.4e}, "
+                            f"phase_err={dt_m['phase_err']:.4e} ({phase_err_deg:.1f}°), "
                             f"psnr={dt_m['psnr']:.2f}dB"
                         )
                         if "sparam_mag_err" in dt_m:
@@ -2659,6 +2658,7 @@ def main(args):
                         log_dict[f"val_device/{dt_name}/ratio_std"] = dt_m["ratio_std"]
                         log_dict[f"val_device/{dt_name}/amp_err"] = dt_m["amp_err"]
                         log_dict[f"val_device/{dt_name}/phase_err"] = dt_m["phase_err"]
+                        log_dict[f"val_device/{dt_name}/phase_err_deg"] = float(dt_m["phase_err"]) * 180.0 / math.pi
                         log_dict[f"val_device/{dt_name}/psnr"] = dt_m["psnr"]
                         if "sparam_mag_err" in dt_m:
                             log_dict[f"val_device/{dt_name}/sparam_mag_err"] = dt_m["sparam_mag_err"]
@@ -2712,16 +2712,27 @@ def main(args):
                         f"-> saved {ckpt_best_path}"
                     )
 
+        # Rejoin all ranks after the rank-0-only sample-eval block so nobody
+        # races into the next collective until rank 0 is done.
+        ddp_barrier(device)
+
         # -----------------------
         # Inverse design evaluation (rank0 only, separate frequency)
         # -----------------------
         inv_eval_every = int(getattr(args, "inverse_eval_every", 0))
-        if (
+        # Park non-rank-0 ranks at a barrier while rank 0 (maybe) runs the
+        # inverse-design eval block; same rationale as the sample-eval barrier.
+        _run_inv_eval = (
             joint_training
-            and is_rank0()
             and inv_eval_every > 0
             and epoch % inv_eval_every == 0
             and epoch >= int(args.phaseB_epochs)
+        )
+        if _run_inv_eval:
+            ddp_barrier(device)
+        if (
+            _run_inv_eval
+            and is_rank0()
         ):
             inv_samples = min(int(getattr(args, "inverse_eval_samples", 4)), len(val_ds))
             inv_cfg_scale = float(getattr(args, "inverse_eval_cfg_scale", 3.0))
@@ -2988,6 +2999,10 @@ def main(args):
                         pass
                 wandb_run.log(inv_log, step=epoch)
 
+        # Rejoin all ranks after the rank-0-only inverse-design eval block.
+        if _run_inv_eval:
+            ddp_barrier(device)
+
         # -----------------------
         # Train logging
         # -----------------------
@@ -3212,11 +3227,6 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--config-start-epoch", type=int, default=200)
 
-    parser.add_argument("--unroll-steps", type=int, default=0)
-    parser.add_argument("--unroll-phase", type=bool, default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--phase-amp-tau", type=float, default=0.2)
-
-    parser.add_argument("--use-stoc-samp", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--amp", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"],
                         help="AMP dtype: float16 (needs GradScaler) or bfloat16 (no scaler, more stable)")
@@ -3234,15 +3244,6 @@ if __name__ == "__main__":
     parser.add_argument("--phase-warmup-epochs", type=int, default=50)
     parser.add_argument("--phase-start-phase", type=str, default="C", choices=["A", "B", "C"])
 
-    parser.add_argument("--lambda-endpoint", type=float, default=0.0)
-    parser.add_argument("--endpoint-warmup-epochs", type=int, default=0)
-    parser.add_argument("--endpoint-start-phase", type=str, default="B", choices=["A", "B", "C"])
-
-    parser.add_argument("--lambda-phase-grad", type=float, default=0.0)
-    parser.add_argument("--phase-grad-warmup-epochs", type=int, default=100)
-    parser.add_argument("--phase-grad-every", type=int, default=4)
-    parser.add_argument("--phase-grad-start-phase", type=str, default="C", choices=["A", "B", "C"])
-
     parser.add_argument("--lambda-sparam", type=float, default=0.0)
     parser.add_argument("--sparam-from-start", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--sparam-warmup-epochs", type=int, default=50)
@@ -3254,29 +3255,6 @@ if __name__ == "__main__":
 
     parser.add_argument("--physics-features", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--complex-unet", type=bool, default=False, action=argparse.BooleanOptionalAction)
-
-    # Joint training (forward + inverse design)
-    parser.add_argument("--joint-training", type=bool, default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--forward-ratio", type=float, default=0.5,
-                        help="Probability of forward mask mode per batch")
-    parser.add_argument("--inverse-ratio", type=float, default=0.3,
-                        help="Probability of inverse mask mode per batch")
-    parser.add_argument("--cfg-dropout", type=float, default=0.15,
-                        help="Probability of zeroing S-param conditioning (for CFG)")
-    parser.add_argument("--eps-core", type=float, default=12.25,
-                        help="Core (silicon) permittivity for binarization loss")
-    parser.add_argument("--eps-clad", type=float, default=2.07,
-                        help="Cladding (oxide) permittivity for binarization loss")
-    parser.add_argument("--lambda-binarize", type=float, default=0.01,
-                        help="Weight for binarization loss on generated eps")
-    parser.add_argument("--binarize-warmup-epochs", type=int, default=100,
-                        help="Epochs to linearly ramp binarization loss")
-    parser.add_argument("--lambda-geom", type=float, default=0.0,
-                        help="Weight for pixel-wise geometry MSE loss on generated eps")
-    parser.add_argument("--geom-warmup-epochs", type=int, default=100,
-                        help="Epochs to linearly ramp geometry loss")
-    parser.add_argument("--include-sparams-cond", type=bool, default=False, action=argparse.BooleanOptionalAction,
-                        help="Include S-params in conditioning vector (required for joint/inverse)")
 
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--ckpt-every", type=int, default=50)
@@ -3329,16 +3307,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--save-eval-samples", dest="save_eval_samples", type=bool, default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--save-eval-samples-limit", dest="save_eval_samples_limit", type=int, default=1)
-
-    # Inverse design evaluation
-    parser.add_argument("--inverse-eval-every", type=int, default=50,
-                        help="Run inverse design eval every N epochs (0=disable)")
-    parser.add_argument("--inverse-eval-samples", type=int, default=4,
-                        help="Number of val samples for inverse eval")
-    parser.add_argument("--inverse-eval-cfg-scale", type=float, default=3.0,
-                        help="CFG scale for inverse design sampling")
-    parser.add_argument("--inverse-eval-steps", type=int, default=30,
-                        help="ODE integration steps for inverse eval")
 
     parser.add_argument("--resume-from", type=str, default="")
     parser.add_argument("--auto-resume", action="store_true", default=False,

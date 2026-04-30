@@ -27,24 +27,40 @@ pip-wheel-metadata/
 # Logs / experiment outputs
 logs/
 wandb/
+outputs/
 *.log
+*.out
+*.err
+
 # Model checkpoints
 *.pt
+*.ckpt
+checkpoints/
+checkpoints_resume/
 logs_physics_unet_pbfm/
-logs_physics_unet_pbfm
+
+# Internal run artifacts (preserved layout, untracked contents)
+internal/runs/
 
 # Large generated data
 Data/*
-!Data/test.py
+!Data/README.md
 
 # Build artifacts
 build/
 dist/
 
 # LaTeX (local drafts / compilation)
+paper.tex
+references.bib
 *.aux
 *.toc
 *.synctex.gz
 *.fdb_latexmk
 *.fls
+*.bbl
+*.blg
+*.out
 
+# Test fixtures generated locally
+test_set.png

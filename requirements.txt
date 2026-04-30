@@ -1,24 +1,31 @@
+# Rayfield — public requirements
+# -----------------------------------------------------------------------------
+# Core training, sampling, and evaluation dependencies.
+# PyTorch is intentionally unpinned: install the wheel that matches your CUDA,
+# e.g.  pip install torch --index-url https://download.pytorch.org/whl/cu121
+# -----------------------------------------------------------------------------
+
+numpy>=1.24
+torch>=2.0
+einops>=0.7
+findiff>=0.10
+scipy>=1.11
+matplotlib>=3.7
+tqdm>=4.65
+
+# Optional: experiment tracking. Comment out if you don't use wandb.
+wandb>=0.15
+
+# -----------------------------------------------------------------------------
+# Optional: dataset generation only. Skip these unless you plan to run
+# FDTD/unified_sweep.py to regenerate the training dataset.
 #
-# Rayfield requirements (minimal, import-audited)
-# ------------------------------------------------
-# Notes:
-# - PyTorch is CUDA/version-specific. On HPC it’s usually installed via conda modules.
-#   If you *do* use pip, install torch from the official PyTorch index for your CUDA.
-#
+# Install Meep via conda (recommended):
+#     conda install -c conda-forge pymeep
+# Tidy3D is only used by some of the archived scripts under internal/ and
+# requires a Flexcompute account.
+# -----------------------------------------------------------------------------
 
-# Core training / sampling
-numpy
-torch
-einops
-findiff
-matplotlib
-tqdm
-wandb
-scipy
-
-# Used by FDTD/neff utilities (optional)
-# pandas
-# meep            # typically conda-forge (pip often not ideal)
-# tidy3d          # optional; install per Flexcompute instructions / license
-
-
+# meep
+# tidy3d
+# pandas>=2.0

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F',' 'NR==1 || $1==100 || $1==200' /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_v100x12/validation.csv)",
+      "Bash(awk -F',' 'NR==1 || $1==100 || $1==200' /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_residual_v100x12/validation.csv)",
+      "Bash(awk -F',' 'NR==1 || $1==50' /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_v100x12/validation.csv /dartfs-hpc/rc/home/j/f0071mj/rayfield/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_residual_v100x12/validation.csv)",
+      "Read(//dartfs/rc/lab/R/RizzoA/f0071mj/logs_physics_unet_pbfm/REAL_VS_COMPLEX_real_h56_phase_residual_v100x12/**)",
+      "Read(//dartfs/rc/lab/R/RizzoA/f0071mj/logs_physics_unet_pbfm/**)",
+      "WebFetch(domain:ab-initio.mit.edu)",
+      "Bash(git mv *)",
+      "Bash(awk '/^\\\\\\\\appendix/{exit} {n++} END{print \"main-body lines:\",n}' paper.tex)",
+      "Bash(awk '/^\\\\\\\\appendix/,0' paper.tex)",
+      "Bash(awk '{print \"appendix lines:\",$1}')"
+    ],
+    "additionalDirectories": [
+      "/dartfs-hpc/rc/home/j/f0071mj/rayfield/Model"
+    ]
+  }
+}
