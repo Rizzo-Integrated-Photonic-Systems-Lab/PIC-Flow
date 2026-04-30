@@ -9,33 +9,6 @@ from sparams_loss import sparam_loss, extract_sparams
 from modal_sparams import extract_sparams_modal, sparam_loss_modal
 
 # -----------------------------------------------------------------------------
-# Joint training mask modes
-# -----------------------------------------------------------------------------
-MASK_MODE_FORWARD = "forward"    # eps fixed, fields noised (standard forward sim)
-MASK_MODE_INVERSE = "inverse"    # fields fixed, eps noised (inverse design)
-MASK_MODE_JOINT = "joint"        # both noised (joint generation)
-
-
-def sample_mask_mode(forward_ratio: float = 0.5, inverse_ratio: float = 0.3) -> str:
-    """Sample a mask mode for joint training."""
-    r = torch.rand(1).item()
-    if r < forward_ratio:
-        return MASK_MODE_FORWARD
-    if r < forward_ratio + inverse_ratio:
-        return MASK_MODE_INVERSE
-    return MASK_MODE_JOINT
-
-
-def binarization_loss(eps_phys: torch.Tensor, eps_core: float = 12.25, eps_clad: float = 2.07) -> torch.Tensor:
-    """
-    Penalty that pushes generated eps toward binary (core or cladding).
-    eps_norm in [0,1], penalty = eps_norm * (1 - eps_norm), maximized at 0.5.
-    """
-    eps_norm = ((eps_phys - eps_clad) / (eps_core - eps_clad + 1e-8)).clamp(0, 1)
-    return (eps_norm * (1.0 - eps_norm)).mean()
-
-
-# -----------------------------------------------------------------------------
 # Flow-matching path parameters
 # -----------------------------------------------------------------------------
 SIG_MIN: float = 0.0  # if >0, endpoint at t=1 is x1 + SIG_MIN * x0 (noise floor)
@@ -290,15 +263,6 @@ def cfm_loss_residual(
     unroll_steps: int = 0,
     unroll_phase: bool = False,
     phase_amp_tau: float = 0.2,
-    # Joint training parameters
-    joint_training: bool = False,
-    mask_mode: str = "forward",
-    v_t_eps: torch.Tensor = None,  # [B,1,H,W] target eps velocity
-    eps_core: float = 12.25,
-    eps_clad: float = 2.07,
-    lambda_binarize: float = 0.0,
-    eps_1: torch.Tensor = None,  # [B,1,H,W] GT clean eps (normalized) for geometry loss
-    lambda_geom: float = 0.0,
     t_physics_min: float = 0.0,  # minimum t for physics losses (residual/phase/sparam); FM always at all t
     residual_t_power: float = 0.0,  # if >0, weight per-sample residual by t^p (upweights high-t = cleaner reconstructions)
     interface_thr: float = 0.0,  # if >0, mask out pixels where |∇ε| > thr from residual (removes interface artifacts)
@@ -391,13 +355,7 @@ def cfm_loss_residual(
     v_t_fields_f = v_t_fields.to(dtype=torch.float32)
     fields_1_f = fields_1.to(dtype=torch.float32)
 
-    # Split model output for joint training (model may output 2 or 3 channels)
-    if joint_training and u_t_pred_full.shape[1] == 3:
-        u_t_pred_f = u_t_pred_full[:, :2]       # field velocity [B,2,H,W]
-        u_t_pred_eps_f = u_t_pred_full[:, 2:3]  # eps velocity [B,1,H,W]
-    else:
-        u_t_pred_f = u_t_pred_full[:, :2]
-        u_t_pred_eps_f = None
+    u_t_pred_f = u_t_pred_full[:, :2]   # field velocity [B,2,H,W]
 
     diff_fm = u_t_pred_f - v_t_fields_f  # [B,2,H,W]
 
@@ -572,27 +530,6 @@ def cfm_loss_residual(
     num = (w_fm * (diff_fm ** 2)).sum(dim=(2, 3))  # [B,2]
     den = w_fm.sum(dim=(2, 3)).clamp_min(1.0)      # [B,1]
     fm_loss = (num / den).mean()
-
-    # Joint training: eps FM loss
-    if joint_training and mask_mode != MASK_MODE_FORWARD and v_t_eps is not None and u_t_pred_eps_f is not None:
-        v_t_eps_f = v_t_eps.to(dtype=torch.float32)
-        fm_loss_eps = (u_t_pred_eps_f - v_t_eps_f).pow(2).mean()
-        fm_loss = fm_loss + fm_loss_eps
-
-    # -----------------------
-    # Joint training: skip physics losses when eps is noised (inverse/joint modes)
-    # In INVERSE mode fields are clean (x_t_fields = fields_1), so phase losses
-    # remain valid and provide regularization + shared feature gradients.
-    # Residual/sparam/endpoint depend on eps which IS noised, so skip those.
-    # In JOINT mode both fields and eps are noised, so skip everything.
-    # -----------------------
-    if joint_training and mask_mode in (MASK_MODE_INVERSE, MASK_MODE_JOINT):
-        compute_endpoint = False
-        compute_residual = False
-        compute_sparam = False
-        if mask_mode == MASK_MODE_JOINT:
-            compute_phase = False
-            compute_phase_grad = False
 
     # Time-gating early-out: if no samples have t >= t_physics_min, skip all physics
     if physics_mask is not None and physics_mask.sum() == 0:
@@ -829,35 +766,7 @@ def cfm_loss_residual(
     if physics_frac is not None:
         sparam_loss_val = sparam_loss_val * physics_frac
 
-    # -----------------------
-    # 13) Binarization loss (joint training: push generated eps toward binary)
-    # -----------------------
-    binarize_loss_val = torch.zeros((), device=device, dtype=torch.float32)
-    if joint_training and mask_mode != MASK_MODE_FORWARD and lambda_binarize > 0.0:
-        if u_t_pred_eps_f is not None:
-            # Reconstruct predicted eps: x1_eps = a * x_t_eps + b * v_eps
-            eps_t = x_t_f[:, 2:3]  # noised eps (normalized)
-            x1_eps_pred = a * eps_t + b * u_t_pred_eps_f  # normalized
-            # De-normalize to physical
-            x1_eps_phys = x1_eps_pred * eps_std_t + eps_mean_t if bool(eps_normalized) else x1_eps_pred
-            binarize_loss_val = binarization_loss(x1_eps_phys, eps_core=eps_core, eps_clad=eps_clad)
-
-    # -----------------------
-    # 14) Geometry loss (pixel-wise MSE on reconstructed eps vs GT eps)
-    # -----------------------
-    geom_loss_val = torch.zeros((), device=device, dtype=torch.float32)
-    if joint_training and mask_mode != MASK_MODE_FORWARD and lambda_geom > 0.0 and eps_1 is not None:
-        if u_t_pred_eps_f is not None:
-            # Reconstruct predicted eps (reuse from binarization if already computed)
-            eps_t = x_t_f[:, 2:3]  # noised eps (normalized)
-            x1_eps_pred_g = a * eps_t + b * u_t_pred_eps_f  # normalized
-            # De-normalize both to physical units
-            x1_eps_phys_g = x1_eps_pred_g * eps_std_t + eps_mean_t if bool(eps_normalized) else x1_eps_pred_g
-            eps_1_f = eps_1.to(dtype=torch.float32)
-            eps_1_phys = eps_1_f * eps_std_t + eps_mean_t if bool(eps_normalized) else eps_1_f
-            geom_loss_val = F.mse_loss(x1_eps_phys_g, eps_1_phys)
-
-    return fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad, sparam_loss_val, binarize_loss_val, geom_loss_val
+    return fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad, sparam_loss_val
 
 
 def sample(
@@ -1005,150 +914,3 @@ def _model_call(ema, x_in, t_vec, cond, lambda_um_model, phys_gate, phase_gate, 
     return ema(x_in, t_vec, **kwargs)
 
 
-def sample_joint(
-    ema,
-    x_0: torch.Tensor,           # noise: [B, 3, H, W] = [field_noise(2), eps_noise(1)]
-    num_steps: int,
-    src_mask: torch.Tensor,       # [B, 1, H, W] source mask (fixed conditioning)
-    cond=None,                    # [B, cond_dim] conditioning vector (includes S-params)
-    cond_uncond=None,             # [B, cond_dim] unconditional cond (S-param entries zeroed) for CFG
-    lambda_um=None,
-    phys_gate=1.0,
-    phase_gate=1.0,
-    sig_min: float = SIG_MIN,
-    cfg_scale: float = 1.0,       # CFG scale (1.0 = no guidance)
-    inpaint_fields: torch.Tensor = None,  # [B,2,H,W] clean fields to inpaint (inverse mode)
-    inpaint_eps: torch.Tensor = None,     # [B,1,H,W] clean eps to inpaint (forward mode)
-) -> torch.Tensor:
-    """
-    Joint flow-matching sampler for 3-channel generation (fields + eps).
-
-    Supports:
-    - Full joint generation (both from noise)
-    - Inpainting: fix fields or eps channels at each ODE step
-    - Classifier-free guidance (CFG) on S-param conditioning
-    """
-    device = x_0.device
-    dtype = x_0.dtype
-    B = x_0.shape[0]
-
-    base = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
-    time_steps = base ** 2
-
-    x_new = x_0.clone()  # [B,3,H,W]
-
-    lambda_um_model = None
-    if lambda_um is not None:
-        lambda_um_model = lambda_um.view(B, 1).to(device=device, dtype=dtype)
-
-    use_cfg = (cfg_scale != 1.0) and (cond_uncond is not None)
-
-    for k in range(num_steps):
-        t0 = time_steps[k]
-        t1 = time_steps[k + 1]
-        dt = (t1 - t0)
-
-        t_vec0 = t0.expand(B)
-        t_vec1 = t1.expand(B)
-
-        # Inpainting: replace fixed channels with their deterministic interpolation at time t
-        if inpaint_fields is not None:
-            # x_t_fields = (1 - (1-s)*t) * noise + t * clean
-            noise_fields = x_0[:, :2]
-            x_new[:, :2] = psi_t(noise_fields, inpaint_fields, t0.view(1, 1, 1, 1))
-        if inpaint_eps is not None:
-            noise_eps = x_0[:, 2:3]
-            x_new[:, 2:3] = psi_t(noise_eps, inpaint_eps, t0.view(1, 1, 1, 1))
-
-        # Model input: [x_t_fields(2), x_t_eps(1), src(1)] = 4 channels
-        x_in0 = torch.cat([x_new, src_mask], dim=1)
-
-        if use_cfg:
-            # Two forward passes for CFG
-            v0_cond = _model_call(ema, x_in0, t_vec0, cond, lambda_um_model, phys_gate, phase_gate, sig_min)
-            v0_uncond = _model_call(ema, x_in0, t_vec0, cond_uncond, lambda_um_model, phys_gate, phase_gate, sig_min)
-            v0 = v0_uncond + cfg_scale * (v0_cond - v0_uncond)
-        else:
-            v0 = _model_call(ema, x_in0, t_vec0, cond, lambda_um_model, phys_gate, phase_gate, sig_min)
-
-        x_euler = x_new + dt * v0
-
-        # Inpainting at t1
-        if inpaint_fields is not None:
-            noise_fields = x_0[:, :2]
-            x_euler[:, :2] = psi_t(noise_fields, inpaint_fields, t1.view(1, 1, 1, 1))
-        if inpaint_eps is not None:
-            noise_eps = x_0[:, 2:3]
-            x_euler[:, 2:3] = psi_t(noise_eps, inpaint_eps, t1.view(1, 1, 1, 1))
-
-        x_in1 = torch.cat([x_euler, src_mask], dim=1)
-
-        if use_cfg:
-            v1_cond = _model_call(ema, x_in1, t_vec1, cond, lambda_um_model, phys_gate, phase_gate, sig_min)
-            v1_uncond = _model_call(ema, x_in1, t_vec1, cond_uncond, lambda_um_model, phys_gate, phase_gate, sig_min)
-            v1 = v1_uncond + cfg_scale * (v1_cond - v1_uncond)
-        else:
-            v1 = _model_call(ema, x_in1, t_vec1, cond, lambda_um_model, phys_gate, phase_gate, sig_min)
-
-        x_new = x_new + 0.5 * dt * (v0 + v1)
-
-    # Final inpainting at t=1
-    if inpaint_fields is not None:
-        x_new[:, :2] = inpaint_fields
-    if inpaint_eps is not None:
-        x_new[:, 2:3] = inpaint_eps
-
-    # Debias if sig_min > 0
-    s = float(sig_min)
-    if s != 0.0:
-        t_vec = torch.ones((B,), device=device, dtype=dtype)
-        x_in = torch.cat([x_new, src_mask], dim=1)
-        u1 = _model_call(ema, x_in, t_vec, cond, lambda_um_model, phys_gate, phase_gate, sig_min)
-        x_new = (1.0 - s) * x_new + s * u1
-
-    return x_new  # [B,3,H,W]
-
-
-def sample_inverse(
-    ema,
-    num_steps: int,
-    src_mask: torch.Tensor,       # [B,1,H,W]
-    cond: torch.Tensor,           # [B,cond_dim] with S-params filled
-    lambda_um=None,
-    cfg_scale: float = 3.0,
-    sig_min: float = SIG_MIN,
-    base_cond_dim: int = 1,       # first N entries are wavelength only (not S-params)
-) -> torch.Tensor:
-    """
-    Convenience wrapper for inverse design: generate eps (and fields) from target S-params.
-
-    Returns [B, 3, H, W] = [predicted_fields(2), predicted_eps(1)]
-    """
-    device = src_mask.device
-    dtype = src_mask.dtype
-    B = src_mask.shape[0]
-    H, W = src_mask.shape[-2], src_mask.shape[-1]
-
-    # Start from pure noise for all 3 channels
-    x_0 = torch.randn(B, 3, H, W, device=device, dtype=dtype)
-
-    # Build unconditional cond for CFG (zero only S-param Re/Im, keep port_valid)
-    cond_uncond = cond.clone()
-    n_sparam_reals = 2 * 4  # Re/Im for max 4 ports
-    cond_uncond[:, base_cond_dim:base_cond_dim + n_sparam_reals] = 0.0
-
-    return sample_joint(
-        ema,
-        x_0,
-        num_steps=num_steps,
-        src_mask=src_mask,
-        cond=cond,
-        cond_uncond=cond_uncond,
-        lambda_um=lambda_um,
-        phys_gate=1.0,
-        phase_gate=1.0,
-        sig_min=sig_min,
-        cfg_scale=cfg_scale,
-        inpaint_fields=None,  # generate everything
-        inpaint_eps=None,
-    )

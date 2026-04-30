@@ -12,7 +12,7 @@ authors' own development workflow. **Public users do not need anything in this f
 | `notebooks/` | Older exploration notebooks (e.g. `FDTD_main.ipynb`); not maintained as user-facing material. |
 | `debug/` | One-off debug and probe scripts: residual-floor checks, modal S-param tests, import smoke tests, the `tidy3d` job killer. |
 | `data_tools/` | Dataset-side helpers: preview scripts, geometry validators, single-device synthesis tools, GDS fixtures. |
-| `archived/` | Snapshot-only legacy code: the joint-training inverse-design driver, pre-unified per-device sweepers (`*_old.py`, `mmi_2x2*.py`, `coupler_sweep.py`, etc.). Kept for reference; not imported by any public path. |
+| `archived/` | Snapshot-only legacy code: pre-unified per-device sweepers (`*_old.py`, `mmi_2x2*.py`, `coupler_sweep.py`, etc.). Kept for reference; not imported by any public path. |
 | `train_subset/` | Quick-iteration subset trainer used during development. |
 | `claude/` | `CLAUDE.md` files from the repo root, `Model/`, and `FDTD/` (per-directory development notes). |
 
