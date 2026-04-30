@@ -87,9 +87,7 @@ srun --kill-on-bad-exit=1 torchrun \
   --phaseA-epochs 0 \
   --phaseB-epochs 0 \
   \
-  --lambda-endpoint "${LAMBDA_ENDPOINT}" \
   --lambda-phase "${LAMBDA_PHASE}" \
-  --lambda-phase-grad "${LAMBDA_PHASE_GRAD}" \
   --lambda-sparam "${LAMBDA_SPARAM}" \
   --sparam-mode "${SPARAM_MODE}" \
   \
@@ -122,7 +120,6 @@ srun --kill-on-bad-exit=1 torchrun \
   --no-include-sdf \
   --use-checkpoint \
   \
-  --phase-amp-tau 0.4 \
   \
   --tqdm \
   --tqdm-mininterval 15.0 \

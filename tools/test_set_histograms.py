@@ -18,7 +18,7 @@ Usage
     python tools/test_set_histograms.py \
         --data-root Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um \
         --ckpt /path/to/0000300.pt \
-        --num-steps 100 \
+        --num-steps 20 \
         --usetex
 """
 
@@ -471,12 +471,16 @@ def _plot_histograms(data: dict[str, np.ndarray], *, out_path: Path) -> None:
         log_x=False,
     )
 
-    ph_finite = data["phase_err"][np.isfinite(data["phase_err"])]
+    # Convert intensity-weighted cosine distance L_phi (in [0,2]) to a per-pixel
+    # average phase error in degrees: dphi = arccos(clip(1 - L_phi, -1, 1)).
+    phase_deg = np.degrees(np.arccos(np.clip(1.0 - data["phase_err"], -1.0, 1.0)))
+    data_phase = dict(data); data_phase["phase_deg"] = phase_deg
+    ph_finite = phase_deg[np.isfinite(phase_deg)]
     ph_bins = np.linspace(np.percentile(ph_finite, 1), np.percentile(ph_finite, 99), 36)
     _plot_panel(
-        axes[2], data,
-        metric="phase_err", bins=ph_bins,
-        xlabel=r"phase cosine distance $\mathcal{L}_\phi$",
+        axes[2], data_phase,
+        metric="phase_deg", bins=ph_bins,
+        xlabel=r"mean phase error (deg)",
         title="Phase fidelity",
         log_x=False,
     )
@@ -484,8 +488,8 @@ def _plot_histograms(data: dict[str, np.ndarray], *, out_path: Path) -> None:
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles, labels,
-        loc="upper center", ncol=3,
-        bbox_to_anchor=(0.5, 1.05),
+        loc="lower center", ncol=3,
+        bbox_to_anchor=(0.5, -0.18),
         frameon=False,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,9 +502,10 @@ def _plot_histograms(data: dict[str, np.ndarray], *, out_path: Path) -> None:
 
 def _print_summary(data: dict[str, np.ndarray]) -> None:
     fam = data["family"]
+    phase_deg = np.degrees(np.arccos(np.clip(1.0 - data["phase_err"], -1.0, 1.0)))
     print()
     print(f"  {'family':<22}  {'N':>4}  {'eps_R p50/p95/p99':>22}  "
-          f"{'PSNR p50 (dB)':>14}  {'phase p50':>10}")
+          f"{'PSNR p50 (dB)':>14}  {'phase p50 (deg)':>16}")
     for dev in DEVICE_ORDER:
         sel = fam == dev
         n = int(sel.sum())
@@ -508,14 +513,14 @@ def _print_summary(data: dict[str, np.ndarray]) -> None:
             continue
         e = data["eps_R"][sel]
         p = data["psnr_db"][sel]
-        ph = data["phase_err"][sel]
+        ph = phase_deg[sel]
         e = e[np.isfinite(e)]
         p = p[np.isfinite(p)]
         ph = ph[np.isfinite(ph)]
         e_str = f"{np.median(e):.2f} / {np.percentile(e,95):.2f} / {np.percentile(e,99):.2f}"
         print(
             f"  {DEVICE_LABELS[dev]:<22}  {n:>4}  {e_str:>22}  "
-            f"{np.median(p):>14.2f}  {np.median(ph):>10.4f}"
+            f"{np.median(p):>14.2f}  {np.median(ph):>16.2f}"
         )
     print()
 
@@ -531,7 +536,7 @@ def main() -> None:
     parser.add_argument("--out-dir", default=str(REPO_ROOT / "outputs" / "test_set_histograms"))
     parser.add_argument("--devices", default=",".join(DEVICE_ORDER), help="Comma-separated families to include.")
     parser.add_argument("--split", default="test", choices=("test", "val", "train"))
-    parser.add_argument("--num-steps", type=int, default=100)
+    parser.add_argument("--num-steps", type=int, default=20)
     parser.add_argument("--time-grid", choices=("checkpoint", "linear", "quadratic"), default="checkpoint")
     parser.add_argument("--max-per-device", type=int, default=0, help="Cap samples per family (0 = unlimited).")
     parser.add_argument("--seed", type=int, default=20260429)

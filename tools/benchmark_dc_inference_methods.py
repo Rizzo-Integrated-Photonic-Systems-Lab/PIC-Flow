@@ -116,6 +116,8 @@ CONFIGS = [
     {"name": "Euler 100 (AMP)",    "integrator": "euler", "num_steps": 100, "amp": True },
     {"name": "Euler 50 (AMP)",     "integrator": "euler", "num_steps":  50, "amp": True },
     {"name": "Euler 20 (AMP)",     "integrator": "euler", "num_steps":  20, "amp": True },
+    {"name": "Euler 10 (AMP)",     "integrator": "euler", "num_steps":  10, "amp": True },
+    {"name": "Euler 5 (AMP)",      "integrator": "euler", "num_steps":   5, "amp": True },
 ]
 
 

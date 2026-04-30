@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
-# Finetune from PHASE_V1_train3 with increased residual weight to push residual ratio toward 1x
-
-#SBATCH --job-name=rayfield-resfinetune
-#SBATCH --partition=a5500
-#SBATCH --nodes=4
+#SBATCH --job-name=rayfield-v6
+#SBATCH --partition=h200_preemptable
+#SBATCH --nodelist=h200b
+#SBATCH --gres=gpu:h200:2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --nodelist=centurion[02-05]
-#SBATCH --gres=gpu:nvidia_rtx_a5500:8
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=30
 #SBATCH --mem=256G
-#SBATCH --time=08:00:00
+#SBATCH --time=3-00:00:00
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=/dartfs-hpc/rc/home/j/f0071mj/rayfield/logs/rayfield_%j.out
 #SBATCH --error=/dartfs-hpc/rc/home/j/f0071mj/rayfield/logs/rayfield_%j.err
 #SBATCH --chdir=/dartfs-hpc/rc/home/j/f0071mj/rayfield
@@ -25,97 +25,142 @@ mkdir -p logs
 mkdir -p "${CHECKPOINT_ROOT}"
 export RAYFIELD_CKPT_ROOT="${CHECKPOINT_ROOT}"
 
+# -----------------------
+# Data (NFS, no local scratch)
+# -----------------------
 DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
 
 # -----------------------
-# Finetune: PHASE_V1_train3 (ep500) → higher λ_residual to improve residual ratio
-# - Resume from 0000500.pt
-# - LAMBDA_RESIDUAL 2→4
-# - Lower LR, fewer epochs, fresh optimizer
+# Run config: focused 1.55 um dataset (MMI + Y-branch + directional coupler)
+#
+# Dataset:
+#   - Sweep: unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+#   - Device counts: 7500 each for MMI, Y-branch, and directional coupler
+#   - Excludes: straight, taper, sbend, euler_bend, circular_bend, crossing
+#   - Resolution: res=20 (dx=0.05), tensors 480x160
+#   - Wavelengths: 1.55 um only
+#   - Split: index-based, 90/10 train/val
 # -----------------------
-VERSION="PHASE_V1_train3_residual_finetune"
-RESUME_SRC="${CHECKPOINT_ROOT}/PHASE_V1_train3/checkpoints/0000500.pt"
-RESUME_DIR="${RUN_ROOT}/checkpoints_resume"
-mkdir -p "${RESUME_DIR}"
-RESUME_FROM="${RESUME_DIR}/0000500.pt"
-# Copy to project dir so all compute nodes can read (lab path has permission issues on centurion)
-if [ ! -f "${RESUME_FROM}" ]; then
-  echo "Copying checkpoint to ${RESUME_FROM}..."
-  cp "${RESUME_SRC}" "${RESUME_FROM}" || { echo "Copy failed. Run manually: cp ${RESUME_SRC} ${RESUME_FROM}"; exit 1; }
-fi
+VERSION="PHASE_V4_mmi_ybranch_dc_7500each_1p55_fm_only_h200"
 
-# Architecture (must match base run)
-HIDDEN_SIZE=32
+# Architecture
+HIDDEN_SIZE=40
 NUM_RES_BLOCKS=3
 CHANNEL_MULT="1,2,4,8"
-NUM_HEADS=4
+NUM_HEADS=8
 ATTN_RESOLUTIONS="8"
 MODEL_DROPOUT=0.0
 
-# Data
+# Data — focused dataset (MMI + Y-branch + directional coupler), single-wavelength training
 USE_SHARDS="--use-shards"
+USE_INDEX_SPLIT="--use-index-split"
 SHARD_SUBDIR="shards"
 SHARD_INDEX_NAME="index.json"
-INCLUDE_SWEEPS="unified_sweep_final"
-EXCLUDE_DEVICES="euler_bend,circular_bend,crossing"
-INCLUDE_WAVELENGTHS=""
+INCLUDE_SWEEPS="unified_sweep_mmi_ybranch_dc_7500_each_1p55um"
+EXCLUDE_DEVICES="straight,taper,sbend,euler_bend,circular_bend,crossing"
+INCLUDE_WAVELENGTHS="1.55"
+TRAIN_FRACTION=0.9
 
-# Finetune: 150 ADDITIONAL epochs (resume from 500 → run to 650)
-EPOCHS=400
-LR=2e-5
-BATCH_SIZE=160
-WEIGHT_DECAY=5e-5
+# Train
+EPOCHS=250
+LR=1e-4
+BATCH_SIZE=120
+WEIGHT_DECAY=2e-5
 
-# Curriculum (already past Phase C from base run)
-PHASE_A_EPOCHS=0
-PHASE_B_EPOCHS=0
-T_PHYSICS_MIN=0.5
+# Curriculum — start FM+Residual from epoch 1
+PHASE_A_EPOCHS=20     # No FM-only stage
+PHASE_B_EPOCHS=60    # FM+Residual from start
+
+# Time-gating disabled: apply physics losses for all t
+T_PHYSICS_MIN=0.15
+
+# Logit-normal time sampling
 T_SAMPLE_MODE="mixture"
-T_SAMPLE_LOC=0.0
-T_SAMPLE_SCALE=1.0
+T_SAMPLE_LOC=0.8
+T_SAMPLE_SCALE=0.8
+
+# Residual t-power weighting
 RESIDUAL_T_POWER=3
+
+# ODE sampler time grid
 TIME_GRID="linear"
 
-# Losses — INCREASED residual weight (main change)
-LAMBDA_RESIDUAL=2.5
-RESIDUAL_WARMUP=0
+# Losses — FM + Residual only (phase/sparam/endpoint disabled for v1 paper)
+LAMBDA_RESIDUAL=0.0
+RESIDUAL_WARMUP=15
+
+# Endpoint loss DISABLED
 LAMBDA_ENDPOINT=0.0
 ENDPOINT_START_PHASE="C"
 ENDPOINT_WARMUP=0
+
+# Phase loss DISABLED — complex UNet handles phase natively, saturated at 0.7° in v5
 LAMBDA_PHASE=0.0
 LAMBDA_PHASE_GRAD=0.0
 PHASE_WARMUP=0
 PHASE_GRAD_WARMUP=0
+
+# S-param: DISABLED for v1 paper — field prediction only; true eigenmode decomposition deferred to v2
 LAMBDA_SPARAM=0.0
 SPARAM_MODE="head"
 SPARAM_WARMUP=0
 SPARAM_START_PHASE="C"
 
-# Spatial focus
-DEVICE_FOCUS_MAX=0.0
-DEVICE_FOCUS_WARMUP=25
-DEVICE_FOCUS_HOLD=100
-DEVICE_FOCUS_DECAY=200
-W_MIN=0.5
+# Spatial focus knobs (enabled — moderate core emphasis, then relax)
+DEVICE_FOCUS_MAX=1.2
+DEVICE_FOCUS_WARMUP=20
+DEVICE_FOCUS_HOLD=20
+DEVICE_FOCUS_DECAY=60
+W_MIN=0.8
 EPS_THR=2.5
 DILATE=15
 INTERFACE_THR=1.0
 
-# System
+# Stable stratified sample eval + physical-ratio acceptance (Model/train.py)
+EVAL_SAMPLE_MODE="fixed"
+EVAL_SAMPLE_INDEX_SEED=0
+EVAL_FLOW_NOISE_SEED=0
+EVAL_SAMPLES_PER_DEVICE=8
+SAMPLE_EVAL_LIMIT=24
+PHYSICAL_RATIO_TARGET=2
+CKPT_BEST_METRIC="worst_ratio_p95"
+CKPT_EVERY=10
+
+# System/env
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export MALLOC_ARENA_MAX=2
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-NGPUS=8
 
-echo "Finetuning: resume from ${RESUME_FROM}, λ_residual=${LAMBDA_RESIDUAL}"
-echo "Version: ${VERSION}, Epochs=${EPOCHS}, LR=${LR}"
-echo "Nodes=${SLURM_NNODES} GPUs/node=${NGPUS}"
+NGPUS=2
+CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${VERSION}/checkpoints"
+RESUME_ARGS=()
+mkdir -p "${CHECKPOINT_DIR}"
+echo "Starting fresh (no resume checkpoint)."
 
+echo "Starting training job: ${VERSION}"
+echo "Nodes=${SLURM_NNODES} GPUs/node=${NGPUS} WorldGPU=$((SLURM_NNODES * NGPUS))"
+
+# Multi-node DDP setup
 MASTER_ADDR=$(scontrol show hostname "$SLURM_JOB_NODELIST" | head -n1)
 MASTER_PORT=$((29500 + RANDOM % 500))
 export MASTER_ADDR MASTER_PORT
+echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+
+# Quick GPU sanity check (srun so it runs on an allocated node)
+echo ""
+echo "=== GPU preflight ==="
+srun --ntasks=1 --nodes=1 bash -c 'nvidia-smi -L 2>&1; python -c "
+import os, torch
+print(\"torch\", torch.__version__)
+print(\"CUDA_VISIBLE_DEVICES\", os.environ.get(\"CUDA_VISIBLE_DEVICES\"))
+print(\"cuda.is_available\", torch.cuda.is_available())
+print(\"device_count\", torch.cuda.device_count())
+"'
+echo "=== end GPU preflight ==="
+echo ""
 
 srun torchrun \
   --nnodes=${SLURM_NNODES} \
@@ -131,17 +176,15 @@ srun torchrun \
   --include-sweeps "${INCLUDE_SWEEPS}" \
   --exclude-devices "${EXCLUDE_DEVICES}" \
   --include-wavelengths "${INCLUDE_WAVELENGTHS}" \
+  ${USE_INDEX_SPLIT} \
   --version "${VERSION}" \
-  --resume-from "${RESUME_FROM}" \
-  --reset-optimizer \
-  --reset-lr-on-resume \
   --hidden-size "${HIDDEN_SIZE}" \
   --num-res-blocks "${NUM_RES_BLOCKS}" \
   --channel-mult "${CHANNEL_MULT}" \
   --num-heads "${NUM_HEADS}" \
   --attn-resolutions "${ATTN_RESOLUTIONS}" \
   --model-dropout "${MODEL_DROPOUT}" \
-  --train-fraction 0.90 \
+  --train-fraction "${TRAIN_FRACTION}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
   --batch-size "${BATCH_SIZE}" \
@@ -156,15 +199,10 @@ srun torchrun \
   \
   --lambda-residual "${LAMBDA_RESIDUAL}" \
   --residual-warmup-epochs "${RESIDUAL_WARMUP}" \
-  --residual-start-phase "B" \
-  --lambda-endpoint "${LAMBDA_ENDPOINT}" \
-  --endpoint-start-phase "${ENDPOINT_START_PHASE}" \
-  --endpoint-warmup-epochs "${ENDPOINT_WARMUP}" \
+  --residual-start-phase "A" \
   --lambda-phase "${LAMBDA_PHASE}" \
   --phase-warmup-epochs "${PHASE_WARMUP}" \
   --phase-start-phase "C" \
-  --lambda-phase-grad "${LAMBDA_PHASE_GRAD}" \
-  --phase-grad-warmup-epochs "${PHASE_GRAD_WARMUP}" \
   --lambda-sparam "${LAMBDA_SPARAM}" \
   --sparam-mode "${SPARAM_MODE}" \
   --sparam-warmup-epochs "${SPARAM_WARMUP}" \
@@ -186,29 +224,35 @@ srun torchrun \
   --dilate "${DILATE}" \
   --interface-thr "${INTERFACE_THR}" \
   \
-  --ckpt-every 25 \
+  --ckpt-every "${CKPT_EVERY}" \
   --eval-every 10 \
   --val-batches 4 \
   --save-eval-samples \
   --save-eval-samples-limit 2 \
-  --sample-eval-limit 2 \
+  --sample-eval-limit "${SAMPLE_EVAL_LIMIT}" \
+  --eval-sample-mode "${EVAL_SAMPLE_MODE}" \
+  --eval-sample-index-seed "${EVAL_SAMPLE_INDEX_SEED}" \
+  --eval-flow-noise-seed "${EVAL_FLOW_NOISE_SEED}" \
+  --eval-samples-per-device "${EVAL_SAMPLES_PER_DEVICE}" \
+  --physical-ratio-target "${PHYSICAL_RATIO_TARGET}" \
+  --ckpt-best-metric "${CKPT_BEST_METRIC}" \
   \
   --pml-cells 0 \
-  --physics-features \
+  --no-physics-features \
   --complex-unet \
   --use-checkpoint \
   --dx 0.05 \
-  --unroll-steps 0 \
-  --fm_steps 50 \
+  --fm_steps 150 \
   \
-  --warmup-epochs 3 \
+  --warmup-epochs 5 \
   --min-lr 1e-6 \
   --weight-decay "${WEIGHT_DECAY}" \
   --grad-clip 5.0 \
   --log-every 1 \
   \
   --no-include-sdf \
-  --phase-amp-tau 0.4 \
+  \
+  \
   --tqdm \
   --tqdm-mininterval 15.0 \
   \
@@ -217,7 +261,9 @@ srun torchrun \
   --wandb-project PhotonFlow \
   \
   --normalize-eps \
-  --eps-core 5.8 \
-  --eps-clad 2.09 \
+  \
+  "${RESUME_ARGS[@]}" \
+  \
+ \
 
-echo "Finetuning job completed."
+echo "Training job completed."

@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# REAL-VALUED UNet, FM-only baseline for the residual-loss ablation.
+# REAL-VALUED UNet arm of the real-vs-complex paper comparison.
 #
-# Loss: FM ONLY  (no phase, no residual, no sparam, no endpoint, no physics
-#                 features). This is the genuine "no physics, no auxiliary
-#                 supervision" reference for the FM vs. FM+residual ablation.
-#
-# Pair with: train_real_unet_phase_residual.slurm (FM + phase + residual)
-#            future train_real_unet_residual_lambdaR_*.slurm (FM + residual sweep)
-#
+# Loss: FM + phase  (no residual, no sparam, no endpoint, no physics features)
 # Arch: Real PhysicsUNet, HIDDEN_SIZE=56, channel_mult=1,2,4,8, attn ds=4,8
-#       -> 63.3 M params (identical to the existing phase / phase+residual runs)
+#       -> 63.3 M params  (param-matched against complex arm at h=40 -> 64.6 M)
 #
-# Identical dataset / epochs / eval / seeds / arch / schedule as the existing
-# REAL_VS_COMPLEX runs. Only the phase- and residual-loss weights differ.
+# Pair with: train_complex_unet_phase.slurm  (HIDDEN_SIZE=40, 64.6 M params)
+# Identical dataset / epochs / eval / seeds / loss for a clean A/B.
+#
+# Param-matching rationale:
+#   - ComplexConv2d == 2 real convs internally, so for the same channel count
+#     it has ~2x the params of a real conv.
+#   - Channel-matched comparison favors complex unfairly. Param-matched is the
+#     defensible control: if complex still wins, the win is from architecture
+#     not capacity.
 # =============================================================================
 
-#SBATCH --job-name=rayfield-fmonly
+#SBATCH --job-name=rayfield-real
 #SBATCH --partition=v100_preemptable
 #SBATCH --nodelist=p[02-04]
 #SBATCH --gres=gpu:v100:4
@@ -43,10 +44,10 @@ export RAYFIELD_CKPT_ROOT="${CHECKPOINT_ROOT}"
 
 DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
 
-VERSION="RES_ABLATION_real_h56_fm_only_v100x12"
+VERSION="REAL_VS_COMPLEX_real_h56_phase_v100x12"
 
 # -----------------------
-# Architecture (identical to phase / phase+residual runs for clean ablation)
+# Architecture (REAL arm) — param-matched to complex arm (63.3 M vs 64.6 M)
 # -----------------------
 HIDDEN_SIZE=56
 NUM_RES_BLOCKS=3
@@ -80,8 +81,7 @@ T_SAMPLE_SCALE=0.8
 RESIDUAL_T_POWER=0
 TIME_GRID="linear"
 
-# Losses — FM ONLY. Every auxiliary loss disabled for the cleanest possible
-# baseline against which to measure the effect of the Helmholtz residual loss.
+# Losses — FM + PHASE only (matches complex arm exactly)
 LAMBDA_RESIDUAL=0.0
 RESIDUAL_WARMUP=0
 
@@ -89,9 +89,9 @@ LAMBDA_ENDPOINT=0.0
 ENDPOINT_START_PHASE="C"
 ENDPOINT_WARMUP=0
 
-LAMBDA_PHASE=0.0
+LAMBDA_PHASE=0.1
 LAMBDA_PHASE_GRAD=0.0
-PHASE_WARMUP=0
+PHASE_WARMUP=15
 PHASE_GRAD_WARMUP=0
 
 LAMBDA_SPARAM=0.0
@@ -188,14 +188,9 @@ srun torchrun \
   --lambda-residual "${LAMBDA_RESIDUAL}" \
   --residual-warmup-epochs "${RESIDUAL_WARMUP}" \
   --residual-start-phase "A" \
-  --lambda-endpoint "${LAMBDA_ENDPOINT}" \
-  --endpoint-start-phase "${ENDPOINT_START_PHASE}" \
-  --endpoint-warmup-epochs "${ENDPOINT_WARMUP}" \
   --lambda-phase "${LAMBDA_PHASE}" \
   --phase-warmup-epochs "${PHASE_WARMUP}" \
   --phase-start-phase "A" \
-  --lambda-phase-grad "${LAMBDA_PHASE_GRAD}" \
-  --phase-grad-warmup-epochs "${PHASE_GRAD_WARMUP}" \
   --lambda-sparam "${LAMBDA_SPARAM}" \
   --sparam-mode "${SPARAM_MODE}" \
   --sparam-warmup-epochs "${SPARAM_WARMUP}" \
@@ -235,7 +230,6 @@ srun torchrun \
   --no-complex-unet \
   --use-checkpoint \
   --dx 0.05 \
-  --unroll-steps 0 \
   --fm_steps 100 \
   \
   --warmup-epochs 5 \
@@ -246,7 +240,6 @@ srun torchrun \
   \
   --include-sdf \
   \
-  --phase-amp-tau 0.4 \
   \
   --tqdm \
   --tqdm-mininterval 15.0 \
@@ -257,8 +250,6 @@ srun torchrun \
   \
   --normalize-eps \
   \
-  --eps-core 5.8 \
-  --eps-clad 2.09 \
   "${RESUME_ARGS[@]}" \
   \
  \

@@ -864,8 +864,8 @@ def sample(
     ema,
     x_0: torch.Tensor,           # noise over *fields only*: [B, 2, H, W]
     num_steps: int,
-    use_stoc_samp: bool,         # kept for API compatibility (currently unused)
-    cond_maps: torch.Tensor,     # fixed maps, e.g. [B,1,H,W]=[eps] or [B,2,H,W]=[eps,src]
+    use_stoc_samp: bool = False, # no-op; kept for legacy callers
+    cond_maps: torch.Tensor = None,
     cond=None,
     lambda_um=None,
     phys_gate=1.0,

@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "Rayfield (PHASE): A Physics-Embedded Flow-Matching Model for Electromagnetic Prediction of Silicon Photonic Devices"
+message: "If you use this software, please cite the accompanying paper."
+type: software
+authors:
+  - family-names: Quaratiello
+    given-names: Joseph
+    affiliation: Thayer School of Engineering, Dartmouth College
+  - family-names: Rizzo
+    given-names: Anthony
+    affiliation: Thayer School of Engineering, Dartmouth College
+license: MIT
+preferred-citation:
+  type: article
+  title: "A Physics-Embedded Flow-Matching Model for Electromagnetic Prediction of Silicon Photonic Devices"
+  authors:
+    - family-names: Quaratiello
+      given-names: Joseph
+    - family-names: Rizzo
+      given-names: Anthony
+  year: 2026
+  journal: arXiv
