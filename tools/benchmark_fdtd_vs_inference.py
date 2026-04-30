@@ -46,8 +46,8 @@ def fm_sample_euler(
 ) -> torch.Tensor:
     """First-order Euler integrator equivalent to flow_matching.sample's Heun
     loop but with the corrector pass dropped — exactly half the model calls
-    per step. Quality drops vs Heun (1st-order error per step) but for
-    inverse-design gradients the difference is negligible at >=20 steps.
+    per step. Quality drops vs Heun (1st-order error per step) but the
+    difference is negligible at >=20 steps.
     """
     device = x_0.device
     dtype = x_0.dtype

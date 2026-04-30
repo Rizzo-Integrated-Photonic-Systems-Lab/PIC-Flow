@@ -154,7 +154,7 @@ def _build_model_from_checkpoint(ckpt: dict[str, Any], *, device: torch.device) 
     omega = 2.0 * math.pi / lambda_um
 
     in_channels = int(_ckpt_get(ckpt_args, "in_channels", stats.get("x_channels", 4)) or stats.get("x_channels", 4))
-    out_channels = 3 if bool(_ckpt_get(ckpt_args, "joint_training", False)) else 2
+    out_channels = 2
 
     channel_mult = _parse_csv_ints(_ckpt_get(ckpt_args, "channel_mult", "1,2,4,8"))
     if not channel_mult:

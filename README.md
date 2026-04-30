@@ -66,7 +66,6 @@ The four notebooks cover the full lifecycle:
 | [`notebooks/01_dataset_generation.ipynb`](notebooks/01_dataset_generation.ipynb) | Generate a small FDTD dataset (~10 geometries/family) with `FDTD/unified_sweep.py`. |
 | [`notebooks/02_training.ipynb`](notebooks/02_training.ipynb) | Smoke-train the U-Net on a tiny subset; loss curves. |
 | [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb) | Load the FM+phase+residual checkpoint, predict $E_z$ on a test sample, plot triptych + compliance. |
-| [`notebooks/04_inverse_design.ipynb`](notebooks/04_inverse_design.ipynb) | Gradient-based inverse design: target a 50/50 Y-branch split through the trained surrogate. |
 
 ### Training (full)
 
@@ -119,7 +118,7 @@ See [`Data/README.md`](Data/README.md) for the dataset layout.
 PHASE/
 ├── Model/         neural network + training loop + flow matching
 ├── FDTD/          dataset generation (Meep-based) + per-device geometries
-├── tools/         inference, inverse design, benchmarks, evaluation
+├── tools/         inference, benchmarks, evaluation
 ├── notebooks/     hands-on walkthroughs (start here)
 ├── examples/      sample evaluation indices
 ├── Data/          (gitignored) FDTD ground-truth shards

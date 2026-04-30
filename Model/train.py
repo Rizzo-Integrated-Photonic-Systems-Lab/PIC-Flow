@@ -41,8 +41,6 @@ from physics_unet import PhysicsUNet, HelmholtzResidual2D
 from complex_physics_unet import ComplexPhysicsUNet
 from flow_matching import (
     psi_t, u_t, sample_t, cfm_loss_residual, sample as fm_sample, SIG_MIN,
-    sample_mask_mode, MASK_MODE_FORWARD, MASK_MODE_INVERSE, MASK_MODE_JOINT,
-    binarization_loss, sample_joint, sample_inverse,
 )
 from sparams_loss import extract_sparams, _resolve_in_idx
 from modal_sparams import extract_sparams_modal
@@ -222,128 +220,6 @@ def _save_eval_sample_png(
         plt.close(fig)
     except Exception:
         # plotting must never crash training
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-
-
-def _save_inverse_eval_png(
-    *,
-    out_path: str,
-    title: str,
-    eps_gt: np.ndarray,
-    eps_gen: np.ndarray,
-    eps_gen_binary: np.ndarray,
-    mag_gt: np.ndarray,
-    mag_gen: np.ndarray,
-    port_masks_overlay: np.ndarray | None,
-    sparam_text: str,
-    device_type: str,
-    ezr_gt: np.ndarray | None = None,
-    ezi_gt: np.ndarray | None = None,
-    ezr_gen: np.ndarray | None = None,
-    ezi_gen: np.ndarray | None = None,
-) -> None:
-    """
-    Save a 3×3 inverse design evaluation panel:
-      Row 1: GT eps (+ port masks overlay)  |  Gen eps (continuous)  |  Gen eps (binarized)
-      Row 2: GT |Ez|                        |  Gen |Ez|             |  |eps err| map
-      Row 3: Ez_real GT vs Gen              |  Ez_imag GT vs Gen    |  S-param table (text)
-    Falls back to 2×3 if field components are not provided.
-    """
-    try:
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        has_fields = (ezr_gt is not None and ezi_gt is not None
-                      and ezr_gen is not None and ezi_gen is not None)
-        nrows = 3 if has_fields else 2
-        fig, axes = plt.subplots(nrows, 3, figsize=(14, 4 * nrows))
-        fig.suptitle(f"{title}  [{device_type}]", fontsize=11)
-
-        def im(ax, arr, t, *, cmap="viridis", vmin=None, vmax=None):
-            h = ax.imshow(arr, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax)
-            ax.set_title(t, fontsize=10)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            return h
-
-        colorbar_pairs = []  # (handle, ax) pairs for colorbars
-
-        # Row 1: eps panels
-        h = im(axes[0, 0], eps_gt, "GT eps", cmap="viridis")
-        colorbar_pairs.append((h, axes[0, 0]))
-        if port_masks_overlay is not None:
-            # overlay port masks as semi-transparent colored regions
-            alpha_mask = np.clip(port_masks_overlay, 0, 1) * 0.4
-            overlay = np.zeros((*eps_gt.shape, 4))
-            overlay[..., 0] = 1.0  # red channel
-            overlay[..., 1] = 0.3
-            overlay[..., 3] = alpha_mask
-            axes[0, 0].imshow(overlay, origin="lower")
-        h = im(axes[0, 1], eps_gen, "Gen eps (continuous)", cmap="viridis")
-        colorbar_pairs.append((h, axes[0, 1]))
-        h = im(axes[0, 2], eps_gen_binary, "Gen eps (binary)", cmap="viridis")
-        colorbar_pairs.append((h, axes[0, 2]))
-
-        # Row 2: field magnitude + eps error
-        h = im(axes[1, 0], mag_gt, "GT |Ez|", cmap="magma")
-        colorbar_pairs.append((h, axes[1, 0]))
-        h = im(axes[1, 1], mag_gen, "Gen |Ez|", cmap="magma")
-        colorbar_pairs.append((h, axes[1, 1]))
-
-        eps_err = np.abs(eps_gt - eps_gen)
-        h = im(axes[1, 2], eps_err, "|eps err|", cmap="hot")
-        colorbar_pairs.append((h, axes[1, 2]))
-
-        # Row 3 (if field components available): real/imag fields + S-param text
-        if has_fields:
-            vlim_r = max(np.abs(ezr_gt).max(), np.abs(ezr_gen).max(), 1e-12)
-            vlim_i = max(np.abs(ezi_gt).max(), np.abs(ezi_gen).max(), 1e-12)
-
-            # Real: GT (top half) | Gen (bottom half) side-by-side via vertical concat
-            ezr_compare = np.concatenate([ezr_gt, ezr_gen], axis=0)
-            h = im(axes[2, 0], ezr_compare, "Ez_real  GT(top) | Gen(bot)",
-                   cmap="RdBu", vmin=-vlim_r, vmax=vlim_r)
-            colorbar_pairs.append((h, axes[2, 0]))
-            # Draw separator line at midpoint
-            axes[2, 0].axhline(y=ezr_gt.shape[0] - 0.5, color="k", linewidth=0.8, linestyle="--")
-
-            # Imag: GT (top half) | Gen (bottom half)
-            ezi_compare = np.concatenate([ezi_gt, ezi_gen], axis=0)
-            h = im(axes[2, 1], ezi_compare, "Ez_imag  GT(top) | Gen(bot)",
-                   cmap="RdBu", vmin=-vlim_i, vmax=vlim_i)
-            colorbar_pairs.append((h, axes[2, 1]))
-            axes[2, 1].axhline(y=ezi_gt.shape[0] - 0.5, color="k", linewidth=0.8, linestyle="--")
-
-            # S-param text panel in row 3
-            axes[2, 2].axis("off")
-            axes[2, 2].set_title("S-params", fontsize=10)
-            axes[2, 2].text(
-                0.05, 0.95, sparam_text,
-                transform=axes[2, 2].transAxes,
-                fontsize=8, fontfamily="monospace",
-                verticalalignment="top",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.5),
-            )
-        else:
-            # No field components: S-param text in row 2 slot (original layout)
-            axes[1, 2].axis("off")
-            axes[1, 2].set_title("S-params", fontsize=10)
-            axes[1, 2].text(
-                0.05, 0.95, sparam_text,
-                transform=axes[1, 2].transAxes,
-                fontsize=8, fontfamily="monospace",
-                verticalalignment="top",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.5),
-            )
-
-        for h, ax in colorbar_pairs:
-            fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
-
-        fig.tight_layout(rect=[0, 0.02, 1, 0.93])
-        fig.savefig(out_path, dpi=160)
-        plt.close(fig)
-    except Exception:
         try:
             plt.close("all")
         except Exception:
@@ -1299,8 +1175,7 @@ def main(args):
         except Exception as exc:  # pragma: no cover
             logger.info(f"Data resolution: <unknown> (probe failed: {exc})")
 
-    joint_training = bool(getattr(args, "joint_training", False))
-    out_channels = 3 if joint_training else 2
+    out_channels = 2
 
     model_kwargs = dict(
         in_channels=in_channels,
@@ -1514,8 +1389,6 @@ def main(args):
     running_endpoint_loss = 0.0
     running_phase_grad_loss = 0.0
     running_sparam_loss = 0.0
-    running_binarize_loss = 0.0
-    running_geom_loss = 0.0
     running_grad_norm = 0.0
     grad_norm_max_epoch = 0.0
     layer_grad_norms_accum = defaultdict(list)  # per-block gradient norms (sampled periodically)
@@ -1647,81 +1520,22 @@ def main(args):
 
             lambda_um = cond[:, 0:1] * lam_std + lam_mean  # [B,1] physical
 
-            # --- Joint training: sample mask mode and handle 3-channel noise ---
-            batch_mask_mode = MASK_MODE_FORWARD
-            v_t_eps_target = None
-            base_cond_dim = 1  # wavelength only
-
-            if joint_training:
-                batch_mask_mode = sample_mask_mode(
-                    forward_ratio=float(getattr(args, "forward_ratio", 0.5)),
-                    inverse_ratio=float(getattr(args, "inverse_ratio", 0.3)),
-                )
-
-                # CFG dropout: randomly zero S-param conditioning
-                cfg_dropout = float(getattr(args, "cfg_dropout", 0.15))
-                if torch.rand(1).item() < cfg_dropout:
-                    # Zero only S-param Re/Im entries; preserve port_valid flags
-                    n_sparam_reals = 2 * 4  # Re/Im for max 4 ports
-                    cond[:, base_cond_dim:base_cond_dim + n_sparam_reals] = 0.0
-
             x0_fields = torch.randn_like(fields_1)
             t = sample_t(fields_1, mode=args.t_sample_mode,
                           loc=args.t_sample_loc, scale=args.t_sample_scale)  # [B,1,1,1]
             x_t_fields = psi_t(x0_fields, fields_1, t)
             v_t_fields = u_t(x0_fields, fields_1)
 
-            if joint_training:
-                # Noise eps channel
-                x0_eps = torch.randn_like(eps)
-                x_t_eps = psi_t(x0_eps, eps, t)
-                v_t_eps_raw = u_t(x0_eps, eps)
-
-                if batch_mask_mode == MASK_MODE_FORWARD:
-                    # Forward mode: eps is clean (fixed), fields are noised
-                    x_t_eps_input = eps
-                    v_t_eps_target = None  # no eps loss
-                elif batch_mask_mode == MASK_MODE_INVERSE:
-                    # Inverse mode: fields are clean (fixed), eps is noised
-                    x_t_fields = fields_1  # use clean fields
-                    v_t_fields = torch.zeros_like(v_t_fields)  # zero field velocity target
-                    x_t_eps_input = x_t_eps
-                    v_t_eps_target = v_t_eps_raw
-                else:  # MASK_MODE_JOINT
-                    # Both noised
-                    x_t_eps_input = x_t_eps
-                    v_t_eps_target = v_t_eps_raw
-
-                # Build input: [x_t_fields(2), x_t_eps(1), src(1)] = 4 channels
-                if extra_maps is not None:
-                    x_t_input = torch.cat([x_t_fields, x_t_eps_input, src, extra_maps], dim=1)
-                else:
-                    x_t_input = torch.cat([x_t_fields, x_t_eps_input, src], dim=1)
+            if extra_maps is not None:
+                x_t_input = torch.cat([x_t_fields, eps, src, extra_maps], dim=1)
             else:
-                if extra_maps is not None:
-                    x_t_input = torch.cat([x_t_fields, eps, src, extra_maps], dim=1)
-                else:
-                    x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
+                x_t_input = torch.cat([x_t_fields, eps, src], dim=1)
 
             compute_phase_grad_step = False  # phase-grad loss removed from public CLI
             compute_sparam_step = (sparam_weight > 0.0) and (global_step % int(args.sparam_every) == 0)
             compute_residual_step = (residual_weight > 0.0)
 
-            # Binarization weight with warmup
-            binarize_weight = 0.0
-            if joint_training and float(getattr(args, "lambda_binarize", 0.0)) > 0.0:
-                binarize_weight = float(args.lambda_binarize) * ramp_linear(
-                    epoch, start_epoch=0, warmup_epochs=int(getattr(args, "binarize_warmup_epochs", 100))
-                )
-
-            # Geometry loss weight with warmup
-            geom_weight = 0.0
-            if joint_training and float(getattr(args, "lambda_geom", 0.0)) > 0.0:
-                geom_weight = float(args.lambda_geom) * ramp_linear(
-                    epoch, start_epoch=0, warmup_epochs=int(getattr(args, "geom_warmup_epochs", 100))
-                )
-
-            fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad_loss, sparam_loss, binarize_loss_val, geom_loss_val = cfm_loss_residual(
+            fm_loss, residual_loss, phase_loss, endpoint_loss, phase_grad_loss, sparam_loss = cfm_loss_residual(
                 model,
                 x_t_input,
                 t,
@@ -1753,14 +1567,6 @@ def main(args):
                 amp_device_type=autocast_device_type,
                 amp_dtype=amp_dtype,
                 sparam_mode=str(getattr(args, "sparam_mode", "project")),
-                joint_training=joint_training,
-                mask_mode=batch_mask_mode,
-                v_t_eps=v_t_eps_target,
-                eps_core=float(getattr(args, "eps_core", 12.25)),
-                eps_clad=float(getattr(args, "eps_clad", 2.07)),
-                lambda_binarize=binarize_weight,
-                eps_1=eps,
-                lambda_geom=geom_weight,
                 t_physics_min=float(getattr(args, "t_physics_min", 0.0)),
                 residual_t_power=float(getattr(args, "residual_t_power", 0.0)),
             )
@@ -1796,11 +1602,6 @@ def main(args):
                     loss_items.append(("phg", phase_grad_loss, float(phase_grad_weight)))
                 if compute_sparam_step and sparam_weight > 0.0:
                     loss_items.append(("sp", sparam_loss, float(sparam_weight)))
-                if joint_training and binarize_weight > 0.0:
-                    loss_items.append(("bin", binarize_loss_val, float(binarize_weight)))
-                if joint_training and geom_weight > 0.0:
-                    loss_items.append(("geom", geom_loss_val, float(geom_weight)))
-
                 # Compute a gradient vector per loss term (unweighted, matching your reference implementation).
                 # Note: weights still control participation (which losses are included).
                 params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
@@ -1909,11 +1710,6 @@ def main(args):
                         total_loss = total_loss + phase_grad_weight * phase_grad_loss
                     if compute_sparam_step and sparam_weight > 0.0:
                         total_loss = total_loss + sparam_weight * sparam_loss
-                    if joint_training and binarize_weight > 0.0:
-                        total_loss = total_loss + binarize_weight * binarize_loss_val
-                    if joint_training and geom_weight > 0.0:
-                        total_loss = total_loss + geom_weight * geom_loss_val
-
                     if scaler.is_enabled():
                         scaler.scale(total_loss).backward()
                         scaler.unscale_(opt)
@@ -1962,11 +1758,6 @@ def main(args):
             if compute_sparam_step:
                 running_sparam_loss += float(sparam_loss.item())
                 sparam_steps_epoch += 1
-            if joint_training and binarize_weight > 0.0:
-                running_binarize_loss += float(binarize_loss_val.item())
-            if joint_training and geom_weight > 0.0:
-                running_geom_loss += float(geom_loss_val.item())
-
             train_steps_epoch += 1
             global_step += 1
 
@@ -2717,293 +2508,6 @@ def main(args):
         ddp_barrier(device)
 
         # -----------------------
-        # Inverse design evaluation (rank0 only, separate frequency)
-        # -----------------------
-        inv_eval_every = int(getattr(args, "inverse_eval_every", 0))
-        # Park non-rank-0 ranks at a barrier while rank 0 (maybe) runs the
-        # inverse-design eval block; same rationale as the sample-eval barrier.
-        _run_inv_eval = (
-            joint_training
-            and inv_eval_every > 0
-            and epoch % inv_eval_every == 0
-            and epoch >= int(args.phaseB_epochs)
-        )
-        if _run_inv_eval:
-            ddp_barrier(device)
-        if (
-            _run_inv_eval
-            and is_rank0()
-        ):
-            inv_samples = min(int(getattr(args, "inverse_eval_samples", 4)), len(val_ds))
-            inv_cfg_scale = float(getattr(args, "inverse_eval_cfg_scale", 3.0))
-            inv_steps = int(getattr(args, "inverse_eval_steps", 30))
-            eps_core = float(getattr(args, "eps_core", 12.25))
-            eps_clad = float(getattr(args, "eps_clad", 2.07))
-            eps_binary_thr = (eps_core + eps_clad) / 2.0
-            sparam_mode_inv = str(getattr(args, "sparam_mode", "project"))
-
-            # Per-device-type metric accumulators
-            inv_metrics_global = defaultdict(list)  # key -> list of floats
-            inv_metrics_per_device = defaultdict(lambda: defaultdict(list))
-            inv_saved_paths = []
-
-            ema.eval()
-            # Epoch-seeded random sample indices for more representative evaluation
-            inv_rng = np.random.default_rng(epoch * 137 + 42)
-            inv_indices = inv_rng.choice(len(val_ds), size=inv_samples, replace=False).tolist()
-            logger.info(f"[epoch {epoch:04d}] Running inverse design eval ({inv_samples} samples, {inv_steps} steps, cfg={inv_cfg_scale})...")
-
-            with torch.no_grad():
-                for s_idx, s in enumerate(inv_indices):
-                    try:
-                        x_full_s, cond_s, aux_s = val_ds[s]
-                        x_full_s = x_full_s.unsqueeze(0).to(device, dtype=dtype)
-                        cond_s = cond_s.unsqueeze(0).to(device, dtype=dtype)
-
-                        # Extract GT info
-                        src_s = x_full_s[:, 3:4]
-                        lambda_um_s = cond_s[:, 0:1] * lam_std + lam_mean
-
-                        # Device type
-                        device_type_s = aux_s.get("device_type", "") if isinstance(aux_s, dict) else ""
-                        if not device_type_s:
-                            device_type_s = "unknown"
-
-                        # GT fields (de-normalized)
-                        ezr_gt = x_full_s[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
-                        ezi_gt = x_full_s[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
-                        mag_gt_s = torch.sqrt(ezr_gt ** 2 + ezi_gt ** 2 + 1e-12)
-
-                        # GT eps (de-normalized)
-                        eps_gt_s = x_full_s[:, 2:3]
-                        if args.normalize_eps:
-                            eps_gt_s = eps_gt_s * float(stats["eps_std"]) + float(stats["eps_mean"])
-
-                        # Run inverse sampling
-                        gen_out = sample_inverse(
-                            ema,
-                            num_steps=inv_steps,
-                            src_mask=src_s,
-                            cond=cond_s,
-                            lambda_um=lambda_um_s,
-                            cfg_scale=inv_cfg_scale,
-                            sig_min=SIG_MIN,
-                            base_cond_dim=1,  # wavelength only (NOT cond_dim which includes S-params)
-                        )
-
-                        # De-normalize generated output: [B,3,H,W] = [fields(2), eps(1)]
-                        gen_fields_r = gen_out[:, 0:1] * float(stats["ez_real_std"]) + float(stats["ez_real_mean"])
-                        gen_fields_i = gen_out[:, 1:2] * float(stats["ez_imag_std"]) + float(stats["ez_imag_mean"])
-                        gen_eps = gen_out[:, 2:3]
-                        if args.normalize_eps:
-                            gen_eps = gen_eps * float(stats["eps_std"]) + float(stats["eps_mean"])
-
-                        mag_gen_s = torch.sqrt(gen_fields_r ** 2 + gen_fields_i ** 2 + 1e-12)
-
-                        # Binarize eps
-                        gen_eps_binary = torch.where(gen_eps > eps_binary_thr,
-                                                     torch.tensor(eps_core, device=device, dtype=dtype),
-                                                     torch.tensor(eps_clad, device=device, dtype=dtype))
-
-                        # Binarization quality: fraction of pixels within 10% of binary values
-                        eps_flat = gen_eps.view(-1)
-                        near_core = (torch.abs(eps_flat - eps_core) < 0.1 * eps_core).float()
-                        near_clad = (torch.abs(eps_flat - eps_clad) < 0.1 * eps_clad).float()
-                        binarize_quality = float((near_core + near_clad).clamp(max=1.0).mean().item())
-
-                        # Eps IoU: intersection-over-union between GT and generated binary masks
-                        gt_binary = (eps_gt_s > eps_binary_thr).float()
-                        gen_binary_mask = (gen_eps > eps_binary_thr).float()
-                        intersection = (gt_binary * gen_binary_mask).sum()
-                        union = ((gt_binary + gen_binary_mask) > 0).float().sum()
-                        eps_iou = float((intersection / union.clamp_min(1.0)).item())
-
-                        inv_metrics_global["binarize_quality"].append(binarize_quality)
-                        inv_metrics_global["eps_iou"].append(eps_iou)
-                        inv_metrics_per_device[device_type_s]["binarize_quality"].append(binarize_quality)
-                        inv_metrics_per_device[device_type_s]["eps_iou"].append(eps_iou)
-
-                        # S-param extraction from generated fields
-                        aux_s_dev = _move_aux_to_device(aux_s, device) if isinstance(aux_s, dict) else {}
-                        port_masks_s = aux_s_dev.get("port_masks", None)
-                        in_port_idx_s = aux_s_dev.get("in_port_idx", None)
-                        port_ids_s = aux_s_dev.get("port_ids", None)
-                        port_valid_s = aux_s_dev.get("port_valid", None)
-                        sparams_true_s = aux_s_dev.get("sparams_true", None)
-                        n_ports_s = int(aux_s_dev.get("n_ports", torch.tensor(0)).item()) if aux_s_dev.get("n_ports") is not None else 0
-
-                        sparam_text_lines = ["Port   |S| GT  |S| Gen  Err    Phase GT  Phase Gen  Err"]
-                        sparam_text_lines.append("-" * 60)
-
-                        if port_masks_s is not None and n_ports_s > 0 and sparams_true_s is not None:
-                            # Build complex E field from generated output
-                            E_gen = torch.complex(gen_fields_r[:, 0], gen_fields_i[:, 0])  # [B, H, W]
-
-                            # Unsqueeze aux tensors for single-sample batch
-                            pm = port_masks_s.unsqueeze(0) if port_masks_s.dim() == 3 else port_masks_s
-                            pid = port_ids_s.unsqueeze(0) if port_ids_s is not None and port_ids_s.dim() == 1 else port_ids_s
-                            ipi = in_port_idx_s
-
-                            # Use binarized eps for modal extraction
-                            eps_for_modal = gen_eps_binary[:, 0]  # [B, H, W]
-
-                            try:
-                                if sparam_mode_inv == "modal":
-                                    S_gen = extract_sparams_modal(
-                                        E_gen, pm, eps_for_modal,
-                                        wavelength_um=lambda_um_s,
-                                        dx_um=dx,
-                                        in_port_idx=ipi,
-                                        port_ids=pid,
-                                    )
-                                else:
-                                    S_gen = extract_sparams(
-                                        E_gen, pm,
-                                        in_port_idx=ipi,
-                                        port_ids=pid,
-                                    )
-                            except Exception:
-                                # Fallback to project method
-                                S_gen = extract_sparams(
-                                    E_gen, pm,
-                                    in_port_idx=ipi,
-                                    port_ids=pid,
-                                )
-
-                            S_true_1 = sparams_true_s.unsqueeze(0) if sparams_true_s.dim() == 1 else sparams_true_s
-                            S_gen_0 = S_gen[0].detach().cpu()
-                            S_true_0 = S_true_1[0].detach().cpu()
-                            pv = port_valid_s.detach().cpu() if port_valid_s is not None else None
-
-                            # Resolve input port index
-                            in_idx_val = 0
-                            if ipi is not None:
-                                if torch.is_tensor(ipi):
-                                    in_idx_val = int(ipi.item()) if ipi.numel() == 1 else int(ipi[0].item())
-                                else:
-                                    in_idx_val = int(ipi)
-                            if in_idx_val < 0:
-                                in_idx_val = 0
-
-                            # Resolve port IDs for labeling
-                            pid_np = port_ids_s.detach().cpu().numpy() if port_ids_s is not None else np.arange(1, n_ports_s + 1)
-                            if pid_np.ndim > 1:
-                                pid_np = pid_np[0]
-                            in_pid = int(pid_np[in_idx_val]) if in_idx_val < len(pid_np) else 1
-
-                            for p in range(n_ports_s):
-                                # Skip input port
-                                if p == in_idx_val:
-                                    continue
-                                if pv is not None and float(pv[p].item() if pv.dim() == 1 else pv[0, p].item()) < 0.5:
-                                    continue
-
-                                out_pid = int(pid_np[p]) if p < len(pid_np) else (p + 1)
-                                label = f"S{out_pid}{in_pid}"
-
-                                mag_true = float(torch.abs(S_true_0[p]).item())
-                                mag_gen = float(torch.abs(S_gen_0[p]).item())
-                                mag_err = abs(mag_true - mag_gen)
-
-                                phase_true = float(torch.angle(S_true_0[p]).item())
-                                phase_gen = float(torch.angle(S_gen_0[p]).item())
-                                phase_diff = float(torch.atan2(
-                                    torch.sin(torch.tensor(phase_gen - phase_true)),
-                                    torch.cos(torch.tensor(phase_gen - phase_true)),
-                                ).item())
-
-                                inv_metrics_global["sparam_mag_err"].append(mag_err)
-                                inv_metrics_global["sparam_phase_err"].append(abs(phase_diff))
-                                inv_metrics_per_device[device_type_s]["sparam_mag_err"].append(mag_err)
-                                inv_metrics_per_device[device_type_s]["sparam_phase_err"].append(abs(phase_diff))
-
-                                sparam_text_lines.append(
-                                    f"{label:6s} {mag_true:6.3f}  {mag_gen:6.3f}  {mag_err:5.3f}   "
-                                    f"{phase_true:+6.2f}     {phase_gen:+6.2f}     {abs(phase_diff):5.2f}"
-                                )
-
-                        sparam_text = "\n".join(sparam_text_lines)
-
-                        # Save PNG for this sample
-                        inv_out_path = os.path.join(samples_dir, f"inverse_epoch_{epoch:04d}_idx{s_idx:03d}.png")
-                        pm_overlay = None
-                        if port_masks_s is not None and n_ports_s > 0:
-                            pm_np = port_masks_s.detach().cpu().numpy()
-                            pm_overlay = pm_np[:n_ports_s].sum(axis=0)  # [H, W]
-
-                        _save_inverse_eval_png(
-                            out_path=inv_out_path,
-                            title=f"epoch={epoch:04d} val[{s}]",
-                            eps_gt=eps_gt_s[0, 0].detach().float().cpu().numpy(),
-                            eps_gen=gen_eps[0, 0].detach().float().cpu().numpy(),
-                            eps_gen_binary=gen_eps_binary[0, 0].detach().float().cpu().numpy(),
-                            mag_gt=mag_gt_s[0, 0].detach().float().cpu().numpy(),
-                            mag_gen=mag_gen_s[0, 0].detach().float().cpu().numpy(),
-                            port_masks_overlay=pm_overlay,
-                            sparam_text=sparam_text,
-                            device_type=device_type_s,
-                            ezr_gt=ezr_gt[0, 0].detach().float().cpu().numpy(),
-                            ezi_gt=ezi_gt[0, 0].detach().float().cpu().numpy(),
-                            ezr_gen=gen_fields_r[0, 0].detach().float().cpu().numpy(),
-                            ezi_gen=gen_fields_i[0, 0].detach().float().cpu().numpy(),
-                        )
-                        if os.path.isfile(inv_out_path):
-                            inv_saved_paths.append(inv_out_path)
-
-                    except Exception as exc:
-                        logger.warning(f"[epoch {epoch:04d}] Inverse eval sample {s} failed: {exc}")
-                        continue
-
-            # Aggregate and log inverse eval metrics
-            def _mean_or_zero(lst):
-                return float(np.mean(lst)) if lst else 0.0
-
-            g_mag_err = _mean_or_zero(inv_metrics_global.get("sparam_mag_err", []))
-            g_phase_err = _mean_or_zero(inv_metrics_global.get("sparam_phase_err", []))
-            g_bin_q = _mean_or_zero(inv_metrics_global.get("binarize_quality", []))
-            g_iou = _mean_or_zero(inv_metrics_global.get("eps_iou", []))
-
-            msg = (
-                f"[epoch {epoch:04d}] INVERSE EVAL: |S| err={g_mag_err:.4f}, "
-                f"phase err={g_phase_err:.4f} rad, binarize_q={g_bin_q:.3f}, eps_IoU={g_iou:.3f}"
-            )
-            for dt_name, dt_metrics in sorted(inv_metrics_per_device.items()):
-                dt_mag = _mean_or_zero(dt_metrics.get("sparam_mag_err", []))
-                dt_ph = _mean_or_zero(dt_metrics.get("sparam_phase_err", []))
-                dt_bq = _mean_or_zero(dt_metrics.get("binarize_quality", []))
-                dt_iou = _mean_or_zero(dt_metrics.get("eps_iou", []))
-                msg += f"\n  [{dt_name}] |S| err={dt_mag:.4f}, phase err={dt_ph:.4f}, binarize_q={dt_bq:.3f}, eps_IoU={dt_iou:.3f}"
-            logger.info(msg)
-
-            if wandb_run is not None:
-                inv_log = {
-                    "epoch": epoch,
-                    "val_inverse/sparam_mag_err": g_mag_err,
-                    "val_inverse/sparam_phase_err": g_phase_err,
-                    "val_inverse/binarize_quality": g_bin_q,
-                    "val_inverse/eps_iou": g_iou,
-                }
-                for dt_name, dt_metrics in inv_metrics_per_device.items():
-                    prefix = f"val_inverse/{dt_name}"
-                    inv_log[f"{prefix}/sparam_mag_err"] = _mean_or_zero(dt_metrics.get("sparam_mag_err", []))
-                    inv_log[f"{prefix}/sparam_phase_err"] = _mean_or_zero(dt_metrics.get("sparam_phase_err", []))
-                    inv_log[f"{prefix}/binarize_quality"] = _mean_or_zero(dt_metrics.get("binarize_quality", []))
-                    inv_log[f"{prefix}/eps_iou"] = _mean_or_zero(dt_metrics.get("eps_iou", []))
-                if inv_saved_paths:
-                    try:
-                        inv_log["val_inverse/sample_images"] = [
-                            wandb.Image(p, caption=os.path.basename(p))
-                            for p in inv_saved_paths
-                        ]
-                    except Exception:
-                        pass
-                wandb_run.log(inv_log, step=epoch)
-
-        # Rejoin all ranks after the rank-0-only inverse-design eval block.
-        if _run_inv_eval:
-            ddp_barrier(device)
-
-        # -----------------------
         # Train logging
         # -----------------------
         if epoch % int(args.log_every) == 0:
@@ -3043,12 +2547,6 @@ def main(args):
                     msg += f" phg={phg_mean.item():.4e}"
                 if sparam_weight > 0.0:
                     msg += f" sp={sp_mean.item():.4e}"
-                if joint_training and binarize_weight > 0.0:
-                    bin_mean_val = running_binarize_loss / max(train_steps_epoch, 1)
-                    msg += f" bin={bin_mean_val:.4e}"
-                if joint_training and geom_weight > 0.0:
-                    geom_mean_val = running_geom_loss / max(train_steps_epoch, 1)
-                    msg += f" geom={geom_mean_val:.4e}"
                 msg += f" gnorm={running_grad_norm / max(train_steps_epoch, 1):.2f}/{grad_norm_max_epoch:.2f}"
                 msg += f" [{sec_per_epoch:.0f}s]"
                 # Only print weights when they change from previous epoch
@@ -3087,11 +2585,6 @@ def main(args):
                     wandb_log_dict["train/phase_grad_steps_epoch"] = int(phase_grad_steps_epoch)
                 if sparam_weight > 0.0:
                     wandb_log_dict["train/sparam_loss"] = sp_mean.item()
-                if joint_training and binarize_weight > 0.0:
-                    wandb_log_dict["train/binarize_loss"] = running_binarize_loss / max(train_steps_epoch, 1)
-                if joint_training and geom_weight > 0.0:
-                    wandb_log_dict["train/geom_loss"] = running_geom_loss / max(train_steps_epoch, 1)
-
                 wandb_run.log(wandb_log_dict, step=epoch)
 
             # Gradient health plot (rank0 only, during eval epochs)
@@ -3118,8 +2611,6 @@ def main(args):
             running_endpoint_loss = 0.0
             running_phase_grad_loss = 0.0
             running_sparam_loss = 0.0
-            running_binarize_loss = 0.0
-            running_geom_loss = 0.0
             running_grad_norm = 0.0
             grad_norm_max_epoch = 0.0
             layer_grad_norms_accum = defaultdict(list)

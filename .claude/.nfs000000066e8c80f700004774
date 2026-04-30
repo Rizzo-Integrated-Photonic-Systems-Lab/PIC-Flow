@@ -10,10 +10,7 @@
       "Bash(git mv *)",
       "Bash(awk '/^\\\\\\\\appendix/{exit} {n++} END{print \"main-body lines:\",n}' paper.tex)",
       "Bash(awk '/^\\\\\\\\appendix/,0' paper.tex)",
-      "Bash(awk '{print \"appendix lines:\",$1}')",
-      "Bash(git stash *)",
-      "Bash(git rm *)",
-      "Bash(git checkout *)"
+      "Bash(awk '{print \"appendix lines:\",$1}')"
     ],
     "additionalDirectories": [
       "/dartfs-hpc/rc/home/j/f0071mj/rayfield/Model"
