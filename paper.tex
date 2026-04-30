@@ -1,0 +1,499 @@
+\UseRawInputEncoding
+% ****** Start of file apssamp.tex ******
+%
+%   This file is part of the APS files in the REVTeX 4.2 distribution.
+%   Version 4.2a of REVTeX, December 2014
+%
+%   Copyright (c) 2014 The American Physical Society.
+%
+%   See the REVTeX 4 README file for restrictions and more information.
+%
+% TeX'ing this file requires that you have AMS-LaTeX 2.0 installed
+% as well as the rest of the prerequisites for REVTeX 4.2
+%
+% See the REVTeX 4 README file
+% It also requires running BibTeX. The commands are as follows:
+%
+%  1)  latex apssamp.tex
+%  2)  bibtex apssamp
+%  3)  latex apssamp.tex
+%  4)  latex apssamp.tex
+%
+\documentclass[%
+ reprint,
+%superscriptaddress,
+%groupedaddress,
+%unsortedaddress,
+%runinaddress,
+%frontmatterverbose, 
+%preprint,
+%preprintnumbers,
+%nofootinbib,
+%nobibnotes,
+%bibnotes,
+ amsmath,amssymb,
+ aps,
+%pra,
+%prb,
+%rmp,
+%prstab,
+%prstper,
+floatfix,
+]{revtex4-2}
+
+\usepackage{graphicx}% Include figure files
+\usepackage{dcolumn}% Align table columns on decimal point
+\usepackage{bm}% bold math
+\usepackage{braket}
+\usepackage{placeins}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc, fit, backgrounds, decorations.pathreplacing}
+
+% ---------------------------------------------------------------
+% Float-placement controls (formatting only).
+% Goal: keep wide table* floats inline on the page they belong to,
+% rather than letting LaTeX defer them onto a sparse float-only page
+% where infinite stretch glue produces huge vertical gaps.
+% ---------------------------------------------------------------
+\renewcommand{\topfraction}{0.95}
+\renewcommand{\bottomfraction}{0.85}
+\renewcommand{\textfraction}{0.05}
+\renewcommand{\floatpagefraction}{0.85}
+\renewcommand{\dbltopfraction}{0.95}
+\renewcommand{\dblfloatpagefraction}{0.85}
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{5}
+\setcounter{dbltopnumber}{3}
+
+% Rigid float spacing (no stretch) so floats grouped together do not
+% inflate to fill a column or page.
+\setlength{\textfloatsep}{10pt}
+\setlength{\floatsep}{10pt}
+\setlength{\intextsep}{10pt}
+\setlength{\dbltextfloatsep}{10pt}
+\setlength{\dblfloatsep}{10pt}
+
+% Kill the infinite stretch on float pages. This is the main culprit
+% for "tables span an entire page with huge gaps between them": by
+% default \@fpsep contains a 2fil stretch component that pushes floats
+% apart to fill the page when they end up on a float-only page.
+\makeatletter
+\setlength{\@fptop}{0pt}
+\setlength{\@fpsep}{12pt plus 0pt}
+\setlength{\@fpbot}{0pt plus 1fil}
+\setlength{\@dblfptop}{0pt}
+\setlength{\@dblfpsep}{12pt plus 0pt}
+\setlength{\@dblfpbot}{0pt plus 1fil}
+\makeatother
+
+% Slightly more breathing room inside tables.
+\renewcommand{\arraystretch}{1.15}
+
+\lstdefinestyle{pythonstyle}{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{gray},
+    stringstyle=\color{red},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    tabsize=4,
+    captionpos=b
+}
+%\usepackage{hyperref}% add hypertext capabilities
+%\usepackage[mathlines]{lineno}% Enable numbering of text and display math
+%\linenumbers\relax % Commence numbering lines
+
+%\usepackage[showframe,%Uncomment any one of the following lines to test 
+%%scale=0.7, marginratio={1:1, 2:3}, ignoreall,% default settings
+%%text={7in,10in},centering,
+%%margin=1.5in,
+%%total={6.5in,8.75in}, top=1.2in, left=0.9in, includefoot,
+%%height=10in,a5paper,hmargin={3cm,0.8in},
+%]{geometry}
+
+\begin{document}
+
+\preprint{APS/123-QED}
+
+\title{A Physics-Embedded Flow-Matching Model for \\Electromagnetic Prediction of Silicon Photonic Devices}
+
+\author{Joseph Quaratiello\textsuperscript{1}, Anthony Rizzo\textsuperscript{1}}
+
+\address{\textsuperscript{1}Thayer School of Engineering, Dartmouth College, Hanover, NH 03755}
+
+\date{\today}% It is always \today, today,
+             %  but any date may be explicitly specified
+
+\begin{abstract}
+  Designing photonic integrated circuits requires accurate electromagnetic field simulations, which remain computationally expensive even for simple geometries. We present PHASE (Physics-Aware Surrogate for Electromagnetics), a generative neural surrogate that predicts electromagnetic field distributions for photonic devices given their geometry and operating wavelength, replacing costly finite-difference time-domain (FDTD) simulations. Our approach combines three key ideas: (i) conditional flow matching as the generative framework, learning a velocity field that transports Gaussian noise to physically valid field solutions; (ii) a real-valued U-Net operating on split real and imaginary field channels; and (iii) physics-constrained training through a Helmholtz residual loss enforcing $\nabla^2 E_z + k_0^2 \varepsilon E_z = 0$. We introduce an interface-aware masking scheme for the Helmholtz residual that excludes dielectric boundary pixels where finite-difference stencil errors dominate, yielding a physically meaningful compliance metric. We evaluate ablations on 22,500 FDTD simulations spanning multimode interferometers, Y-branches, and directional couplers at $\lambda=1.55\,\mu$m. Rather than a drop-in replacement for FDTD, this work establishes a foundation that, with broader data coverage, more compute, and further training optimization, could scale toward broadband, device-agnostic field prediction with dramatically improved runtime for rapid design-space exploration of complex photonic devices and circuits.
+\end{abstract}
+
+%\keywords{Suggested keywords}%Use showkeys class option if keyword
+                              %display desired
+\maketitle
+
+%\tableofcontents
+
+\section{\label{sec:level1}Introduction}
+
+Silicon photonic devices used in photonic integrated circuits (PICs) enable compact optical systems for communications, sensing, and computing, but practical design still depends on full-wave electromagnetic simulation and iterative optimization. Finite-difference time-domain (FDTD) solvers remain the main tool for accurate prediction across device geometries and wavelengths~\cite{TafloveHagness2005FDTD, Teixeira2023FDTDMethods}, yet repeated FDTD solves become a bottleneck for parameter sweeps and gradient-based inverse-design loops. This has motivated machine-learning surrogates for forward prediction and learning-assisted inverse design. A key remaining challenge is accurate full-field prediction of complex electromagnetic responses: phase must be handled consistently, solutions should satisfy the wave equation, and models must generalize across device families rather than overfitting to one geometry class. Predicted fields should also preserve device-level behavior such as port-to-port transmission, reflection, and splitting ratios, the quantities ultimately used in photonic design.
+
+We address this gap with a physics-based conditional flow-matching model for fast full-field prediction of silicon photonic devices. Building on flow matching for generative modeling~\citep{Lipman2023FlowMatching} and physics-based flow matching for PDE-constrained generation~\citep{Baldan2025PBFM}, we train a real-valued U-Net to generate the real and imaginary components of the electromagnetic field. Physics is enforced through a Helmholtz residual loss with an interface-aware mask that excludes dielectric boundary pixels where finite-difference stencil errors dominate, yielding a meaningful compliance metric. We study three matched training objectives: flow matching only, flow matching plus phase loss, and flow matching plus both phase and Helmholtz residual losses. This isolates how data fidelity, phase alignment, and PDE compliance affect full-field accuracy. We evaluate the approach on multimode interferometers, Y-branches, and directional couplers, producing full-field predictions in a single forward pass that would otherwise require minutes of FDTD simulation.
+
+\section{\label{sec:related}Related Work}
+
+Recent progress in photonics is driven by advances in computational electromagnetics and machine learning. Our work connects three lines of research: learning-based surrogates for electromagnetic simulation, physics-informed or physics-constrained training for PDE-governed systems, and generative models for scientific computing.
+
+\paragraph{Neural surrogates for photonic simulation.}
+Deep learning has been used to approximate forward electromagnetic responses and accelerate design-space exploration across many photonic structures. Jiang \emph{et al.}\ survey deep neural networks for evaluation and design, covering supervised surrogates, inverse models, and hybrid workflows~\cite{Jiang2021DeepNNPhotonicDevices}; Ma \emph{et al.}\ provide a broader review of deep learning for photonic structure design~\cite{Ma2021DLPhotonicsReview}. In integrated photonics, Tahersima \emph{et al.}\ demonstrate data-driven inverse design of compact power splitters~\cite{Tahersima2019DNNSplitters}, and Tang \emph{et al.}\ introduce a generative model for inverse design of nanophotonic components~\cite{Tang2020GenerativeLPR}. Chen \emph{et al.}\ train a physics-augmented U-Net~\cite{Ronneberger2015UNet} (WaveY-Net) to predict near-fields of freeform nanophotonic devices, using Maxwell's equations as part of the training loss~\cite{Chen2022WaveYNet}, and Lim and Psaltis use Maxwell's equations directly as the sole training objective for a physics-driven DNN~\cite{Lim2022MaxwellNet}. These works show the value of learned surrogates, but they also highlight the need for models that predict \emph{full-field} complex solutions, not only scalar figures of merit, and that generalize across device families and wavelengths.
+
+\paragraph{Physics-informed and physics-constrained training.}
+Physics-informed neural networks (PINNs) offer a general way to enforce PDE residuals in the loss for forward and inverse problems~\cite{Raissi2019PINNs}; in photonics this often means wave-equation residuals, such as Helmholtz, or boundary and energy constraints. However, PINNs typically optimize per-instance and do not amortize across a family of geometries. Neural operators such as the Fourier Neural Operator~\cite{Li2021FNO} and DeepONet~\cite{Lu2021DeepONet} learn mappings between function spaces and have been applied to PDE problems at scale, but the photonic setting still requires accurate amplitude and phase prediction because interference effects determine functionality. Our approach uses a Helmholtz residual penalty on predicted complex fields as a lightweight, architecture-agnostic physics constraint that amortizes across thousands of geometries.
+
+\paragraph{Generative models for PDE-governed systems.}
+Generative models can represent distributions over fields and enable conditional sampling for design. Score-based diffusion models~\cite{Song2021ScoreSDE} have been applied to PDE-governed problems: Huang \emph{et al.}\ use diffusion-based generation to solve Helmholtz and other equations under partial observation~\cite{Huang2024DiffusionPDE}. Flow matching~\cite{Lipman2023FlowMatching} provides a simulation-free alternative by learning a time-dependent velocity field along a probability path, offering straighter transport paths and simpler training than diffusion. Baldan \emph{et al.}\ extend this idea to physics-constrained generation with physics-based flow matching (PBFM), integrating PDE residuals during training~\cite{Baldan2025PBFM}. Our work is closest to PBFM, but targets electromagnetic fields and silicon photonic device families, combining a U-Net field generator with a Helmholtz residual constraint and phase-aware supervision.
+
+\paragraph{Inverse design.}
+Inverse design in photonics is often done with gradient-based optimization coupled to full-wave solvers~\cite{Molesky2018InverseDesign}. Classical adjoint-based methods have enabled compact devices such as broadband wavelength demultiplexers~\cite{Piggott2015DemultiplexerNatPhoton} and have been extended with fabrication constraints~\cite{Piggott2017FabricationConstrainedSciRep}; DeepAdjoint integrates data-driven models with optimization algorithms~\cite{Yeung2023DeepAdjoint}, and recent reviews summarize how deep learning and adjoint methods can be combined~\cite{Pan2023PhotonicsReview}. In contrast, we focus on the forward prediction problem of replacing the repeated field-solve step with a physics-constrained field generator, a prerequisite for any differentiable surrogate-based inverse design workflow.
+
+
+\section{\label{sec:level3}Background}
+\subsection{Electromagnetic simulation of photonic devices}
+We consider two-dimensional TE-polarized electromagnetic fields in silicon-on-insulator (SOI) waveguides. The out-of-plane electric field component $E_z(x,y)$ satisfies the scalar Helmholtz equation in the frequency domain:
+\begin{equation}
+    \nabla^2 E_z(x,y) + k_0^2 \,\varepsilon(x,y)\, E_z(x,y) = 0,
+    \label{eq:helmholtz}
+\end{equation}
+\\
+where $k_0=2\pi/\lambda$ is the free-space wavenumber and $\varepsilon(x,y)$ is the spatially varying relative permittivity. The reduction from three dimensions to two in this paper is valid when the vertical slab mode has been pre-solved: for a 220\,nm SOI slab the fundamental TE mode yields an effective core index $n_\text{eff}\approx 2.4$
+($\varepsilon_\text{core}\approx 5.8$) and the silica cladding has $n_\text{clad}=1.444$ ($\varepsilon_\text{clad}\approx 2.09$)~\cite{ReedKnights2004SiliconPhotonics}. We operate in the telecommunications C-band,
+$\lambda\in[1.50,1.60]\,\mu$m.
+
+Finite-difference time-domain (FDTD) methods solve the time-domain Maxwell's equations on a Yee grid, exciting the structure with an eigenmode source and extracting frequency-domain fields via discrete Fourier transforms~\cite{TafloveHagness2005FDTD}. Each simulation runs until field energy decays below a convergence threshold, typically requiring seconds to minutes for the domain sizes and resolution considered in this paper. The key outputs used here are the complex field $E_z(x,y)$, the permittivity map $\varepsilon(x,y)$, and source/port masks that identify the device excitation and measurement regions.
+
+\subsection{Conditional Flow Matching}
+Flow matching~\cite{Lipman2023FlowMatching, Liu2023RectifiedFlow} is a generative modeling framework that learns a time-dependent velocity field $u_\theta(x_t,t)$ to transport samples from a simple prior $p_0$ (Gaussian noise) to the data distribution $p_1$ along a deterministic path. Given source-target pairs $x_0\sim\mathcal{N}(0,I)$ and $x_1\sim p_\text{data}$, the conditional interpolation path is
+\begin{equation}
+    x_t = (1-t)\,x_0 + t\,x_1, \quad t\in[0,1],
+    \label{eq:interpolation}
+\end{equation}
+with corresponding target velocity $u_t=x_1-x_0$. A neural network $u_{\theta}$ is trained to match this velocity by minimizing the loss function
+\begin{equation}
+    \mathcal{L}_\text{FM} = \mathbb{E}_{t,\,x_0,\,x_1}\!\left[\left\|u_\theta(x_t,t) - u_t\right\|^2\right].
+    \label{eq:fm_loss}
+\end{equation}
+At inference, new samples are generated by integrating the learned velocity field from $t=0$ to $t=1$ using an ODE solver, starting from Gaussian noise. Compared with diffusion models, flow matching yields straighter transport paths that require fewer integration steps and avoids the need to tune a noise schedule~\cite{Lipman2023FlowMatching,Liu2023RectifiedFlow}.
+In our setting, the data distribution $p_1$ consists of physically valid electromagnetic field solutions conditioned on device geometry and wavelength. The model learns to denoise a random field into one that satisfies the Helmholtz equation for a given permittivity map, a task we augment with explicit physics constraints, described in Sec.~\ref{sec:method}.
+\section{\label{sec:method}Method}
+\subsection{Problem formulation}
+Given a device permittivity map $\varepsilon(x,y)$, a source excitation mask $m_\text{src}(x,y)$, and a free space wavelength $\lambda$, we seek the complex electric field $E_z(x,y)\in\mathbb{C}$ that solves the Helmholtz equation [Eq.~\eqref{eq:helmholtz}]. We frame this as a conditional generation problem: learn a model that maps Gaussian noise to the field solution, conditioned on $(\varepsilon, m_\text{src}, \lambda)$.
+The model input is a tensor $\mathbf{x}\in\mathbb{R}^{4\times H\times W}$ whose channels are the real and imaginary parts of $E_z$ (interpolated between noise and target during training), the permittivity map, and the source mask. The wavelength enters as a scalar conditioning variable through the timestep embedding. The model outputs a two-channel velocity field $\hat{u}_\theta\in\mathbb{R}^{2\times H\times W}$ representing the real and imaginary components of the predicted flow-matching velocity.
+
+%\input{pipeline}
+
+\subsection{U-Net architecture}
+
+We use a real-valued U-Net that treats the real and imaginary parts of the optical field as separate channels. The architecture follows the standard encoder-bottleneck-decoder layout with skip connections, residual blocks, and attention at selected spatial resolutions.
+
+\paragraph{Residual convolutional blocks.}
+Each resolution level contains convolutional residual blocks with normalization, nonlinear activation, and dropout. Downsampling in the encoder increases the channel count while reducing spatial resolution; upsampling in the decoder restores the original grid and combines decoder features with encoder skip connections.
+
+\paragraph{Self-attention.}
+At selected resolution levels, we apply multi-head self-attention over spatial tokens. Attention lets features at one location directly reference features at distant locations, complementing the locality of convolutional layers.
+
+\paragraph{Conditioning.}
+The flow-matching timestep $t$ is encoded via sinusoidal positional embeddings and concatenated with the normalized wavelength $\lambda$. This combined embedding passes through a two-layer MLP to produce a conditioning vector that modulates each residual block.
+
+\paragraph{Auxiliary inputs.}
+The permittivity map and source mask are concatenated with the real and imaginary field channels before the U-Net stem. This gives the model direct access to material layout and excitation location throughout the prediction process.
+
+\subsection{Training objective}
+
+The ablation runs in this paper use a weighted subset of three losses:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_\text{FM}
+    + \lambda_R\,\mathcal{L}_\text{res}
+    + \lambda_\phi\,\mathcal{L}_\text{phase},
+    \label{eq:total_loss}
+\end{equation}
+with weights $\lambda_R$ and $\lambda_\phi$ set by the experiment design in Sec.~\ref{sec:level6}. Other auxiliary losses are disabled for these four tests.
+
+\paragraph{Flow matching loss.}
+Given source--target pairs $(x_0, x_1)$ where $x_0 \sim \mathcal{N}(0,I)$ and $x_1$ is the ground-truth field, we sample time $t$ from a 50/50 mixture of $\mathcal{U}[0,1]$ and a logit-normal distribution $t = \sigma(\mu + s\cdot z)$, $z \sim \mathcal{N}(0,1)$. In these experiments $\mu=0.8$ and $s=0.8$, so the nonuniform half of the sampler emphasizes intermediate-to-late denoising states while the uniform half preserves endpoint coverage. The interpolated state is $x_t = (1-t)x_0 + t\,x_1$ and the target velocity is $u_t = x_1 - x_0$. The loss is the spatially weighted MSE between the predicted and target velocities:
+\begin{equation}
+    \mathcal{L}_\text{FM} = \frac{\sum_{p} w(p)\,\|\hat{u}_\theta(x_t,t)(p) - u_t(p)\|^2}{\sum_{p} w(p)},
+    \label{eq:fm_loss_weighted}
+\end{equation}
+where the spatial weight $w(p)$ combines a PML-exclusion mask with an optional device-region upweight.
+
+\paragraph{Helmholtz residual loss.}
+From the predicted velocity we reconstruct the clean field estimate
+$\hat{x}_1 = x_t + (1-t)\hat{u}_\theta$ and de-normalize to physical units. The Helmholtz residual is
+\begin{equation}
+    R(p) = \nabla^2 \hat{E}_z(p) + k_0^2\,\varepsilon(p)\,\hat{E}_z(p),
+    \label{eq:residual}
+\end{equation}
+computed with a five-point finite-difference Laplacian. The loss is the masked, normalized mean-squared residual:
+\begin{equation}
+    \mathcal{L}_\text{res} = \frac{\sum_p\, w_R(p)\,|R(p)|^2}{\sum_p\, w_R(p)\,|k_0^2\varepsilon(p) E_z^\text{true}(p)|^2},
+    \label{eq:residual_loss}
+\end{equation}
+where the weight mask $w_R$ is the product of three binary masks: (i) a PML-exclusion mask that zeros out absorbing boundary cells, (ii) a source-exclusion mask (the Helmholtz equation is only valid in source-free regions), and (iii) an interface mask that excludes pixels where $|\nabla\varepsilon|$ exceeds a threshold, since the five-point Laplacian stencil produces spurious residuals at sharp dielectric boundaries (Si/SiO$_2$). The denominator normalizes by the driving-term scale $|k_0^2\varepsilon E_z|^2$, making the loss approximately 0 when physics is satisfied and 1 when the residual equals the driving term, independent of grid spacing and field amplitude.
+
+For per-sample physics-fidelity reporting we further define the dimensionless compliance percentage
+\begin{equation}
+    \varepsilon_R \;=\; \sqrt{\mathcal{L}_\text{res}}\,\times\,100\%,
+    \label{eq:compliance}
+\end{equation}
+which has a direct physical interpretation as the RMS Helmholtz residual relative to the local driving-term magnitude $|k_0^2\,\varepsilon\,E_z|$. A field that exactly satisfies the wave equation gives $\varepsilon_R = 0$; FDTD's own discretization residual on this dataset sits below $0.1\%$. We use $\varepsilon_R$ to annotate the qualitative comparisons in Figs.~\ref{fig:inference_examples} and~\ref{fig:ood_inference_examples} and report numerical compliance in Table~\ref{tab:compliance}.
+
+When time-gating is enabled, samples with $t$ below a threshold are excluded from the residual computation, since the reconstructed field at low $t$ is too noisy to yield informative physics gradients.
+
+\paragraph{Phase loss.}
+We penalize phase disagreement between the predicted and ground-truth fields using a wrap-safe cosine distance:
+\begin{equation}
+    \mathcal{L}_\text{phase} = 1 - \mathrm{Re}\!\left(\frac{\hat{E}_z}{|\hat{E}_z|} \cdot
+    \frac{\bar{E}_z^\text{true}}{|E_z^\text{true}|}\right),
+    \label{eq:phase_loss}
+\end{equation}
+weighted by $|E_z^\text{true}|^2$ and gated by an amplitude threshold so that phase is only supervised in regions with non-negligible field strength. Before computing the phase loss, predicted and true fields are globally phase-aligned via a weighted inner product to remove the gauge freedom inherent in complex field solutions.
+
+\subsection{\label{sec:curriculum}Loss schedules}
+
+The runs share the same architecture, optimizer, data split, evaluation protocol, and nominal phase milestones, but differ in which losses are active:
+\begin{itemize}
+    \item \textbf{Flow matching}: active for every run and every epoch.
+    \item \textbf{Phase loss}: when enabled, ramps from epoch 1 to $\lambda_\phi=0.1$ over 15 epochs.
+    \item \textbf{Residual loss}: when enabled, starts at epoch 11 and ramps to $\lambda_R=1.0$ over 20 epochs.
+\end{itemize}
+
+Within each schedule, the loss weights ramp linearly from 0 to their target values over the specified warmup period.
+
+\subsection{Inference}
+
+At inference time, we generate field predictions by integrating the learned velocity field from $t = 0$ (Gaussian noise) to $t = 1$ along a linear time grid. We use two integrators in this paper. The first is the explicit (first-order) Euler step
+\begin{equation}
+    x_{k+1} = x_k + \Delta t_k\, \hat{u}_\theta(x_k, t_k),
+    \label{eq:euler}
+\end{equation}
+which requires a single network evaluation per step and is what the wall-clock benchmark in Sec.~\ref{sec:walltime} uses. The second is the second-order Heun (improved Euler) integrator,
+\begin{align}
+    \tilde{x}_{k+1} &= x_k + \Delta t_k\, \hat{u}_\theta(x_k, t_k), \nonumber\\
+    x_{k+1} &= x_k + \tfrac{1}{2}\Delta t_k\!\left[\hat{u}_\theta(x_k, t_k)
+               + \hat{u}_\theta(\tilde{x}_{k+1}, t_{k+1})\right],
+    \label{eq:heun}
+\end{align}
+which doubles the cost per step but reduces local truncation error. The ablation runs use a linear time grid with 100 flow-matching steps.
+
+
+\section{\label{sec:level5}Dataset}
+
+\subsection{Device Types}
+The ablation study in Sec.~\ref{sec:level6} uses a three-family silicon photonics dataset at a single C-band wavelength, $\lambda=1.55\,\mu$m. The device families span interference, splitting, and evanescent coupling, and all runs use the same train/validation split and sample-evaluation protocol.
+
+\begin{table}[!htbp]
+\centering
+\caption{Device families and their geometry sweep ranges. Each family is sampled in a 5-dimensional parameter space using Latin hypercube sampling, with values quantized to a half-pixel grid (0.025\,$\mu$m at 20 pixels/$\mu$m) so that each parameter change produces a measurable change in the permittivity map. \emph{Count} is the number of simulated geometries at $\lambda=1.55\,\mu$m.}
+\label{tab:devices}
+\begin{ruledtabular}
+\begin{tabular}{llc}
+Family / Parameter & Range ($\mu$m) & Count \\
+\hline
+\textbf{2$\times$2 MMI} (4 ports)        &              & 7,500 \\
+\quad waveguide width                    & 0.40--0.575  &       \\
+\quad MMI width                          & 4.5--5.5     &       \\
+\quad MMI length                         & 8.0--15.0    &       \\
+\quad taper width                        & 0.575--1.5   &       \\
+\quad taper length                       & 1.0--3.0     &       \\[2pt]
+\textbf{Y-branch} (3 ports)              &              & 7,500 \\
+\quad waveguide width                    & 0.40--0.575  &       \\
+\quad junction length                    & 1.0--3.0     &       \\
+\quad bend length                        & 4.0--7.0     &       \\
+\quad arm offset                         & 0.575--2.5   &       \\
+\quad output length                      & 1.0--4.0     &       \\[2pt]
+\textbf{Directional coupler} (4 ports)   &              & 7,500 \\
+\quad waveguide width                    & 0.40--0.575  &       \\
+\quad gap $g$                            & 0.10--0.35   &       \\
+\quad coupling length $L_c$              & 5.0--8.0     &       \\
+\quad bend length                        & 4.0--6.0     &       \\
+\quad port separation                    & 0.825--2.0   &       \\[2pt]
+\hline
+Total                                    &              & 22,500 \\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+All devices use silicon-on-insulator waveguides with an effective core index $n_\text{eff}\approx2.4$ (from pre-computed eigenmode tables for a 220\,nm slab) and SiO$_2$ cladding with $n_\text{clad}=1.444$. In the normalized simulation tensors, these correspond to $\varepsilon_\text{core}=5.8$ and $\varepsilon_\text{clad}=2.09$. The ablation runs exclude straight waveguides, tapers, bends, S-bends, and crossings so that the comparison focuses on the three high-dimensional device families in Table~\ref{tab:devices}.
+
+\subsection{FDTD simulation}
+Each geometry is simulated using the Meep FDTD solver~\cite{Oskooi2010Meep}. The ablation data used here are restricted to $\lambda=1.55\,\mu$m, producing 22,500 total simulations. The training tensors are cropped/resampled to a $160\times480$ grid, and the U-Net applies attention at downsampling factors 4 and 8, corresponding to $40\times120$ and $20\times60$ token grids.
+\begin{itemize}
+    \item Wavelength: $\lambda=1.55\,\mu$m.
+    \item Field grid: $160\times480$ pixels after preprocessing.
+    \item Source: eigenmode source exciting the fundamental TE mode at the selected input port.
+    \item Stored channels: $\mathrm{Re}(E_z)$, $\mathrm{Im}(E_z)$, normalized permittivity, and source mask.
+    \item Training split: 18,000 training samples, 2,250 validation samples, and a held-out test partition from the same index split.
+\end{itemize}
+
+Per simulation we store the complex field $E_z$, the permittivity map $\varepsilon$, a source mask identifying the excitation port, and per-port binary masks at each port location.
+
+\subsection{Sampling and splitting}
+Device parameters are sampled to cover each family-specific design space, with geometry indices stored in a shared shard index. All three ablation runs use the same index split, so differences in validation metrics reflect the loss configuration rather than different data partitions. The realized split visible in the training logs is 18,000 training samples and 2,250 validation samples; the remaining 2,250 samples form the held-out partition.
+
+\subsection{Phase anchoring}
+Frequency domain fields have an arbitrary global phase: if $E_z$ is a solution to the Helmholtz equation, so is $E_ze^{i\phi}$. Without phase anchoring, the same device at the same wavelength could produce training targets with different global phases, preventing the model from learning a consistent mapping.
+
+We anchor the global phase using the field within the source region. A weighted average of unit phasors is computed in the source mask, weighted by local field intensity:
+\begin{equation}
+    \phi_\text{ref} = \arg\!\left(\sum_{p \in \mathcal{M}_\text{src}} |E_z(p)|^2 \cdot
+    \frac{E_z(p)}{|E_z(p)|}\right),
+    \label{eq:phase_anchor}
+\end{equation}
+and the entire field is rotated by $e^{-i\phi_\text{ref}}$, setting the intensity-weighted phase in the source region to approximately zero. When restricted to high-permittivity pixels ($\varepsilon > 3.0$, i.e.\ within the waveguide core), this anchoring is robust to the source mask geometry. If the source mask is unavailable or too small, we fall back to a fixed region-of-interest near the input waveguide. This two-stage strategy (mask-first, ROI fallback) ensures consistent targets even after D4 augmentation, which may rotate the source to a different edge of the domain.
+
+
+
+\section{\label{sec:level6}Experiments}
+
+We compare three matched real-valued U-Net runs. All use the same architecture (63.3M parameters), the same $160\times480$ field grid, the same training/validation split, the same $100$-step linear flow sampler for sample evaluation, and the same fixed stratified sample-evaluation set of 24 devices (8 per family). All three runs completed for 300 epochs on 12 V100 GPUs with global batch size 48.
+
+\begin{table*}[!tbp]
+\centering
+\caption{Loss configurations for the ablation study. All runs use the same real-valued U-Net, no physics-feature input channels, no endpoint loss, and no phase-gradient loss. Phase loss, when enabled, ramps from epoch 1 to $\lambda_\phi=0.1$ over 15 epochs. Residual loss, when enabled, starts at epoch 11 and ramps to $\lambda_R=1.0$ over 20 epochs.}
+\label{tab:ablation_design}
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcccccc}
+\hline\hline
+Run & Objective & GPUs & Global batch & $\lambda_R$ & $\lambda_\phi$ & Status \\
+\hline
+FM only & $\mathcal{L}_\mathrm{FM}$ & 12$\times$V100 & 48 & 0 & 0 & complete \\
+FM + phase & $\mathcal{L}_\mathrm{FM}+\lambda_\phi\mathcal{L}_\mathrm{phase}$ & 12$\times$V100 & 48 & 0 & 0.1 & complete \\
+FM + phase + residual & $\mathcal{L}_\mathrm{FM}+\lambda_\phi\mathcal{L}_\mathrm{phase}+\lambda_R\mathcal{L}_\mathrm{res}$ & 12$\times$V100 & 48 & 1.0 & 0.1 & complete \\
+\hline\hline
+\end{tabular}
+\end{table*}
+
+\begin{table*}[!tbp]
+\centering
+\caption{Final validation/sample-evaluation metrics at epoch 300. Residual ratio is the mean sample Helmholtz residual divided by the mean ground-truth residual on the fixed 24-sample evaluation set; lower is better. PSNR is computed from sampled fields; higher is better.}
+\label{tab:ablation_final_metrics}
+\footnotesize
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lccccccc}
+\hline\hline
+Run & Epoch & Val. FM & Val. residual & Val. phase & Residual ratio & Worst p95 ratio & PSNR (dB) \\
+\hline
+FM only & 300 & 0.00668 & 0 & -- & 1.546 & 2.553 & 37.92 \\
+FM + phase & 300 & 0.00664 & 0 & 0.000662 & 1.531 & 2.502 & 37.97 \\
+FM + phase + residual & 300 & 0.00787 & 0.00245 & 0.000801 & 1.336 & 2.222 & 37.41 \\
+\hline\hline
+\end{tabular}
+\end{table*}
+
+The ``Residual ratio'' column in Table~\ref{tab:ablation_final_metrics} reports the per-sample RMS predicted Helmholtz residual divided by the corresponding FDTD residual on the fixed evaluation set. Because the driving-term scale cancels in the ratio, this quantity is mathematically equal to $\varepsilon_R^\mathrm{pred}/\varepsilon_R^\mathrm{FDTD}$ and therefore captures the same physics as the compliance percentage in Eq.~\eqref{eq:compliance}, expressed multiplicatively against the FDTD discretization floor. We retain the multiplicative form here for run-to-run comparison and use $\varepsilon_R$ as the per-sample reporting form (Table~\ref{tab:compliance}); the latter has the advantage of a direct interpretation as residual-relative-to-driving-force and does not depend on the FDTD noise floor.
+
+The completed runs show a consistent tradeoff. Phase supervision alone gives a small improvement in final worst-device residual ratio relative to FM-only (2.50 versus 2.55 at epoch 300), while adding the Helmholtz residual yields the strongest physics-compliance improvement (2.22 final worst p95 ratio and 1.34 mean residual ratio). The residual term slightly reduces final PSNR relative to FM+phase, suggesting that the PDE penalty shifts optimization toward wave-equation compliance rather than purely pixel-level reconstruction.
+
+\subsection{\label{sec:walltime}Wall-clock benchmark}
+
+To quantify the runtime advantage of the surrogate over conventional FDTD, we benchmark inference wall time against Meep~\cite{Oskooi2010Meep} on a single test-set directional coupler ($\mathrm{gap}=0.175\,\mu$m, $L_c=5.97\,\mu$m, $\lambda=1.55\,\mu$m). All measurements are taken on the same compute node: an NVIDIA~A100 GPU paired with dual AMD EPYC~75F3 processors ($2\times32$ physical cores, Zen3 architecture). FDTD is run with Meep on 16 threads, in line with multi-threaded Meep configurations reported in recent photonic ML benchmarks. The surrogate runs PyTorch~2.x on the A100 with fp16 autocast, compiled kernels, and a channels-last memory layout, sampling with a first-order Euler integrator. The checkpoint is the FM+phase+residual run from Table~\ref{tab:ablation_final_metrics}; compliance $\varepsilon_R$ is computed for each sampler configuration against the FDTD reference using Eq.~\eqref{eq:compliance}.
+
+\begin{table}[!htbp]
+\centering
+\caption{Wall-clock inference time and physics compliance ($\varepsilon_R$) for the same held-out test-set directional coupler. FDTD reference uses Meep with 16 threads on dual AMD EPYC~75F3. The surrogate runs on a single NVIDIA~A100 with fp16 autocast, compiled kernels, and a channels-last memory layout. Speedup is over the FDTD reference on the same node.}
+\label{tab:walltime}
+\begin{ruledtabular}
+\begin{tabular}{lccc}
+Method & Wall time & Speedup & $\varepsilon_R$ \\
+\hline
+FDTD (Meep, 16-thr EPYC~75F3)    & $5.48$\,s   & $1.0\times$  & (ref) \\
+PHASE, Euler 100-step (A100)     & $2.22$\,s   & $2.5\times$  & $1.9\%$ \\
+PHASE, Euler 50-step  (A100)     & $1.11$\,s   & $4.9\times$  & $2.1\%$ \\
+PHASE, Euler 20-step  (A100)     & $0.44$\,s   & $12.3\times$ & $3.0\%$ \\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+At 100 sampler steps the surrogate is $2.5\times$ faster than 16-thread CPU FDTD on the same node while reaching $\varepsilon_R=1.9\%$, comparable to the in-distribution compliance levels reported in Table~\ref{tab:compliance}. Reducing the sampler to 20 steps drops the wall time to 444\,ms, a $12.3\times$ speedup, with $\varepsilon_R=3.0\%$, still well below the $\sim\!12\%$ regime observed for heavily out-of-distribution geometries (Sec.~\ref{sec:ood_examples}). The compliance versus speed tradeoff is mild across the trained distribution: a $5\times$ reduction in sampler steps raises $\varepsilon_R$ by roughly a percentage point. Because the hardware is held fixed across both methods, this comparison isolates the surrogate-vs-FDTD speedup from any GPU-vs-CPU asymmetry.
+
+\section{\label{sec:level7}Discussion}
+
+The ablation results support the use of physics-informed supervision as a complement to flow matching rather than a replacement for the generative objective. Flow matching alone learns high-quality field samples, but the Helmholtz residual term directly targets a failure mode that pixel metrics can miss: fields that look plausible while violating the governing wave equation. The completed FM+phase+residual run improves the worst-device residual ratios relative to FM-only and FM+phase baselines, indicating that the residual penalty improves physical consistency on the fixed sample-evaluation set.
+
+At the same time, the results show a tradeoff between reconstruction fidelity and physics compliance. The residual-augmented model has slightly lower final PSNR than the FM+phase model, suggesting that the PDE term changes the optimization target rather than simply improving every metric simultaneously. This is expected for a finite-capacity model trained with multiple losses: a field can be closer in pixelwise mean-square error while still having larger local Helmholtz residuals, especially near interfaces, sources, and low-amplitude regions.
+
+\paragraph{Scaling with domain size, resolution, and dimensionality.}
+A practical implication of these results is that the surrogate's runtime advantage scales favorably with simulation size, grid resolution, and dimensionality. FDTD cost grows quickly along all three axes: each doubling of the grid increases the work per time step in proportion to the number of new cells, and the Courant--Friedrichs--Lewy stability condition forces a matching reduction in the time step, so the total cost grows faster than cell count alone~\cite{TafloveHagness2005FDTD}. This accuracy versus compute tradeoff is what makes 3D FDTD the bottleneck for nanophotonic device optimization, often forcing practitioners to coarsen grids or restrict sweeps to a handful of design points~\cite{BurrFarjadpour2005FDTDAccuracy}. PHASE inference, in contrast, is dominated by a single U-Net forward pass whose cost grows only with the number of pixels at fixed model size, with no time-stepping multiplier on top. Larger domains, finer grids, and the move from 2D scalar to 3D vectorial fields therefore all widen the surrogate's relative advantage rather than erode it. The $12.3\times$ speedup reported in Sec.~\ref{sec:walltime} is best read as a floor: the same comparison on circuit-scale, finer-resolution, or 3D vectorial domains where FDTD currently bottlenecks photonic design is expected to widen substantially. Scaling the surrogate to those regimes is primarily a question of training-data generation and architecture choice rather than per-inference compute.
+
+The current study has several limitations. First, the ablation dataset is restricted to three device families at a single wavelength, so generalization to broader wavelength bands and unseen topologies remains qualitative. Second, the model predicts only the complex $E_z$ field, so additional electromagnetic quantities are not directly available from the surrogate. Third, the U-Net architecture is not exactly equivariant under device symmetries, so symmetric devices may still show asymmetric sampled responses unless symmetry is enforced through architecture, paired conditioning, or sampling constraints.
+
+\paragraph{Future work.}
+Future work will extend the dataset to more device classes and wavelengths, add quantitative tests for out-of-distribution generalization, and investigate more direct integration of port-level quantities. A natural extension is S-parameter prediction or extraction from inferred fields, but rigorous modal decomposition may require additional field components or a dedicated surrogate trained directly for scattering amplitudes.
+
+\section{\label{sec:level8}Conclusion}
+
+We presented a real-valued U-Net flow-matching model for generating frequency-domain electromagnetic fields in parameterized silicon photonic devices. The model conditions on device geometry, source-port masks, and wavelength, and learns to transform Gaussian field noise into complex-valued $E_z$ solutions on a fixed spatial grid. Across matched ablations, adding Helmholtz residual supervision improves physics-compliance metrics relative to FM-only and FM+phase baselines, while preserving high sample fidelity.
+
+These results suggest that flow matching provides a practical generative framework for fast photonic field prediction, and that explicit wave-equation penalties can improve the physical reliability of sampled fields.
+
+\appendix
+
+\section{\label{sec:inference_examples}Inference examples}
+
+Figure~\ref{fig:inference_examples} shows qualitative agreement between FDTD ground truth and samples from the trained conditional generator on held-out \texttt{test} geometries drawn from the same unified sweep used for training (three families: MMI, Y-branch, and directional coupler). Each row is one random test example. Columns show the relative permittivity $\epsilon_r$ with the active source port indicated by a translucent green overlay, followed by $|E_z|$ from FDTD and $|E_z|$ from the model (arbitrary units; independent color scaling per panel).
+
+\begin{figure*}[!tbp]
+\centering
+\includegraphics[width=\textwidth]{test_inference.png}
+\caption{Held-out qualitative comparison for parameterized devices drawn from the training distribution. Each row is a random \texttt{test}-split sample for an MMI (top), Y-branch (middle), and directional coupler (bottom). Columns show (left) $\epsilon_r$ with the sourced input port highlighted in green, (middle) FDTD $|E_z|$, and (right) model $|E_z|$. Sampling uses the epoch-300 FM+phase+residual checkpoint with $200$ Heun steps and the checkpoint-trained time grid; fields are shown in arbitrary units with per-panel color scaling. Each Model panel is annotated with the per-sample compliance percentage $\varepsilon_R$ defined in Eq.~\eqref{eq:compliance}.}
+\label{fig:inference_examples}
+\end{figure*}
+
+\section{\label{sec:ood_examples}Out-of-distribution generalization}
+
+To probe behavior outside the training distribution we apply the same epoch-300 FM+phase+residual checkpoint to three classes of held-out devices: an aggressive Euler S-bend with bend radius below the trained sweep ($R_\mathrm{min}=2.5\,\mu$m vs.\ trained $[3,7]\,\mu$m) and lateral offset above the trained range ($6\,\mu$m vs.\ $[2,5.5]\,\mu$m); a long wide taper with input--output widths and length all outside the trained taper sweep; and a \emph{cascaded $1\times3$ Y-branch} formed from two stacked Y-junctions, an entirely new device class never seen during training. FDTD reference simulations are produced with the same Meep configuration as the training data. Figure~\ref{fig:ood_inference_examples} shows the FDTD reference and model prediction for these three cases, and Table~\ref{tab:compliance} summarizes $\varepsilon_R$ for both the in- and out-of-distribution showcase samples.
+
+\begin{figure*}[!tbp]
+\centering
+\includegraphics[width=\textwidth]{ood_inference.png}
+\caption{Out-of-distribution qualitative comparison. Top: aggressive Euler S-bend ($R_\mathrm{min}=2.5\,\mu$m, lateral offset $6\,\mu$m). Middle: long wide taper ($w_\mathrm{out}=2.5\,\mu$m, length $18\,\mu$m). Bottom: cascaded $1\times3$ Y-branch built from two stacked Y-junctions, an unseen device class. Columns and sampling protocol match Fig.~\ref{fig:inference_examples}; each Model panel reports the per-sample compliance percentage $\varepsilon_R$.}
+\label{fig:ood_inference_examples}
+\end{figure*}
+
+\begin{table}[!htbp]
+\centering
+\caption{Per-sample compliance percentage $\varepsilon_R$ (Eq.~\eqref{eq:compliance}) for the qualitative samples in Figs.~\ref{fig:inference_examples} and~\ref{fig:ood_inference_examples}. Lower is better; FDTD's own discretization residual on this dataset sits below $0.1\%$.}
+\label{tab:compliance}
+\begin{ruledtabular}
+\begin{tabular}{lc}
+Sample & $\varepsilon_R$ \\
+\hline
+\multicolumn{2}{l}{\textit{In-distribution (Fig.~\ref{fig:inference_examples})}}\\
+$2\times2$ MMI                  & $2.7\%$ \\
+Y-branch                        & $2.5\%$ \\
+Directional coupler             & $2.2\%$ \\[2pt]
+\multicolumn{2}{l}{\textit{Out-of-distribution (Fig.~\ref{fig:ood_inference_examples})}}\\
+S-bend (tight $R$, large offset) & $12\%$ \\
+Long wide taper                  & $3.1\%$ \\
+Cascaded $1\times3$ Y-branch     & $8.3\%$ \\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+The model retains physically meaningful predictions on parameter-OOD devices (the long wide taper at $3.1\%$ compliance is on par with the in-distribution families) and on a structurally new device class (the cascaded $1\times3$ Y-branch at $8.3\%$). The aggressive S-bend reaches $\varepsilon_R \approx 12\%$, indicating a moderate but recognizable physics violation: the field amplitude pattern is qualitatively correct but the wave equation is no longer satisfied at the trained-distribution level.
+
+
+\clearpage
+\bibliographystyle{apsrev4-2}
+\bibliography{references}
+
+\end{document}
+%
+% ****** End of file apssamp.tex ******

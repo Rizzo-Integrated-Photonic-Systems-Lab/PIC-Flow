@@ -9,6 +9,7 @@ import math
 import os
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
+from datetime import timedelta
 from time import time
 from types import SimpleNamespace
 from typing import List, Optional
@@ -925,7 +926,15 @@ def main(args):
     # Try DDP init; fall back to single-GPU if env vars aren't set (plain python).
     use_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if use_ddp:
-        dist.init_process_group(backend="nccl")
+        # Raise NCCL watchdog timeout well above the default 10 min so rank-0-only
+        # sample/inverse eval work (fm_sample ODE integration, PNG rendering, etc.)
+        # cannot trip the collective-timeout deadlock when other ranks are parked
+        # at a barrier. Override via env NCCL_PG_TIMEOUT_MIN if needed.
+        _pg_timeout_min = int(os.environ.get("NCCL_PG_TIMEOUT_MIN", "120"))
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=_pg_timeout_min),
+        )
 
     # Optional: force all enabled losses to start from epoch 1 (disable phased curriculum).
     # Note: a loss only participates if its corresponding lambda > 0.
@@ -2164,6 +2173,11 @@ def main(args):
             worst_ratio_max = None
             all_devices_p95_le_target = None
             all_devices_max_le_target = None
+            # Non-rank-0 ranks park here while rank 0 runs the (potentially long)
+            # sample-eval block below. Without this barrier, other ranks would
+            # race ahead into the next epoch's training AllReduces and trip the
+            # NCCL watchdog timeout while rank 0 is still in fm_sample / PNG IO.
+            ddp_barrier(device)
             if is_rank0():
                 residuals = []
                 gt_residuals = []
@@ -2571,11 +2585,13 @@ def main(args):
                 if sample_metrics_per_device:
                     msg += "\n             --- per-device ---"
                     for dt_name, dt_m in sorted(sample_metrics_per_device.items()):
+                        phase_err_deg = float(dt_m['phase_err']) * 180.0 / math.pi
                         line = (
                             f"\n             {dt_name:>20s} (n={dt_m['n_samples']:d}): "
                             f"r_p95={dt_m['ratio_p95']:.3f}, r_max={dt_m['ratio_max']:.3f}, "
                             f"res={dt_m['residual']:.4e}, gap={dt_m['gap_dB']:+.1f}dB, "
-                            f"amp_err={dt_m['amp_err']:.4e}, phase_err={dt_m['phase_err']:.4e}, "
+                            f"amp_err={dt_m['amp_err']:.4e}, "
+                            f"phase_err={dt_m['phase_err']:.4e} ({phase_err_deg:.1f}°), "
                             f"psnr={dt_m['psnr']:.2f}dB"
                         )
                         if "sparam_mag_err" in dt_m:
@@ -2659,6 +2675,7 @@ def main(args):
                         log_dict[f"val_device/{dt_name}/ratio_std"] = dt_m["ratio_std"]
                         log_dict[f"val_device/{dt_name}/amp_err"] = dt_m["amp_err"]
                         log_dict[f"val_device/{dt_name}/phase_err"] = dt_m["phase_err"]
+                        log_dict[f"val_device/{dt_name}/phase_err_deg"] = float(dt_m["phase_err"]) * 180.0 / math.pi
                         log_dict[f"val_device/{dt_name}/psnr"] = dt_m["psnr"]
                         if "sparam_mag_err" in dt_m:
                             log_dict[f"val_device/{dt_name}/sparam_mag_err"] = dt_m["sparam_mag_err"]
@@ -2712,16 +2729,27 @@ def main(args):
                         f"-> saved {ckpt_best_path}"
                     )
 
+        # Rejoin all ranks after the rank-0-only sample-eval block so nobody
+        # races into the next collective until rank 0 is done.
+        ddp_barrier(device)
+
         # -----------------------
         # Inverse design evaluation (rank0 only, separate frequency)
         # -----------------------
         inv_eval_every = int(getattr(args, "inverse_eval_every", 0))
-        if (
+        # Park non-rank-0 ranks at a barrier while rank 0 (maybe) runs the
+        # inverse-design eval block; same rationale as the sample-eval barrier.
+        _run_inv_eval = (
             joint_training
-            and is_rank0()
             and inv_eval_every > 0
             and epoch % inv_eval_every == 0
             and epoch >= int(args.phaseB_epochs)
+        )
+        if _run_inv_eval:
+            ddp_barrier(device)
+        if (
+            _run_inv_eval
+            and is_rank0()
         ):
             inv_samples = min(int(getattr(args, "inverse_eval_samples", 4)), len(val_ds))
             inv_cfg_scale = float(getattr(args, "inverse_eval_cfg_scale", 3.0))
@@ -2987,6 +3015,10 @@ def main(args):
                     except Exception:
                         pass
                 wandb_run.log(inv_log, step=epoch)
+
+        # Rejoin all ranks after the rank-0-only inverse-design eval block.
+        if _run_inv_eval:
+            ddp_barrier(device)
 
         # -----------------------
         # Train logging

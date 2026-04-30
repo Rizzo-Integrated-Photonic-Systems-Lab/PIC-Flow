@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 
 #SBATCH --job-name=rayfield-v6
-#SBATCH --partition=h200_preemptable
-#SBATCH --nodelist=h200b
-#SBATCH --gres=gpu:h200:2
+#SBATCH --partition=2080ti
+#SBATCH --nodelist=turing[01-02]
+#SBATCH --gres=gpu:nvidia_geforce_rtx_2080_ti:8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=30
 #SBATCH --mem=256G
 #SBATCH --time=3-00:00:00
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=/dartfs-hpc/rc/home/j/f0071mj/rayfield/logs/rayfield_%j.out
 #SBATCH --error=/dartfs-hpc/rc/home/j/f0071mj/rayfield/logs/rayfield_%j.err
 #SBATCH --chdir=/dartfs-hpc/rc/home/j/f0071mj/rayfield
@@ -29,65 +31,63 @@ export RAYFIELD_CKPT_ROOT="${CHECKPOINT_ROOT}"
 DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
 
 # -----------------------
-# Run config: v6 — final dataset (res=20, 9 devices, 5 wavelengths, all rect 480x160)
+# Run config: focused 1.55 um dataset (MMI + Y-branch + directional coupler)
 #
-# Key changes vs v5:
-#   - New dataset: unified_sweep_final (81K samples, 9 device types, 5 wavelengths)
+# Dataset:
+#   - Sweep: unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+#   - Device counts: 7500 each for MMI, Y-branch, and directional coupler
+#   - Excludes: straight, taper, sbend, euler_bend, circular_bend, crossing
 #   - Resolution: res=20 (dx=0.05), tensors 480x160
-#   - λ_phase 0.1→0.0 (saturated at 0.7° in v5, complex UNet handles phase natively)
-#   - λ_sparam 0.1→0.5 (was underpowered — S-params had 30-50% errors at v5 end)
-#   - S-param mode: head (learned, not projection)
-#   - Curriculum compressed for 80 epochs: PhaseA=5, PhaseB=15, PhaseC=15+
-#   - S-param warmup 30→5 to match the shorter training schedule
-#   - No resume — fresh training from scratch on new dataset
-#   - Hidden 40→48 (~90M params, 1.44x capacity for 2.7x more data)
-#   - Epochs reduced to 80 for faster turnaround on the 50k-sample training set
+#   - Wavelengths: 1.55 um only
+#   - Split: index-based, 90/10 train/val
 # -----------------------
-VERSION="PHASE_V1_train6"
+VERSION="PHASE_V4_mmi_ybranch_dc_7500each_1p55_finetune"
 
 # Architecture
-HIDDEN_SIZE=48
+HIDDEN_SIZE=40
 NUM_RES_BLOCKS=3
 CHANNEL_MULT="1,2,4,8"
-NUM_HEADS=4
+NUM_HEADS=8
 ATTN_RESOLUTIONS="8"
 MODEL_DROPOUT=0.0
 
-# Data — final dataset (all rect, res=20)
+# Data — focused dataset (MMI + Y-branch + directional coupler), single-wavelength training
 USE_SHARDS="--use-shards"
+USE_INDEX_SPLIT="--use-index-split"
 SHARD_SUBDIR="shards"
 SHARD_INDEX_NAME="index.json"
-INCLUDE_SWEEPS="unified_sweep_final"
-EXCLUDE_DEVICES="euler_bend,circular_bend,crossing,taper"
-INCLUDE_WAVELENGTHS=""
+INCLUDE_SWEEPS="unified_sweep_mmi_ybranch_dc_7500_each_1p55um"
+EXCLUDE_DEVICES="straight,taper,sbend,euler_bend,circular_bend,crossing"
+INCLUDE_WAVELENGTHS="1.55"
+TRAIN_FRACTION=0.9
 
 # Train
-EPOCHS=200
-LR=1e-4
-BATCH_SIZE=60
-WEIGHT_DECAY=5e-5
+EPOCHS=350
+LR=1e-5
+BATCH_SIZE=40
+WEIGHT_DECAY=2e-5
 
-# Curriculum — compressed for 80 epochs on the larger final dataset
-PHASE_A_EPOCHS=10     # FM only
-PHASE_B_EPOCHS=60    # FM+Residual, Phase C starts earlier for 200-epoch run
+# Curriculum — start FM+Residual from epoch 1
+PHASE_A_EPOCHS=20     # No FM-only stage
+PHASE_B_EPOCHS=60    # FM+Residual from start
 
-# Time-gating: physics losses only when t >= 0.5
-T_PHYSICS_MIN=0.5
+# Time-gating disabled: apply physics losses for all t
+T_PHYSICS_MIN=0.15
 
 # Logit-normal time sampling
 T_SAMPLE_MODE="mixture"
-T_SAMPLE_LOC=0.0
-T_SAMPLE_SCALE=1.0
+T_SAMPLE_LOC=0.8
+T_SAMPLE_SCALE=0.8
 
 # Residual t-power weighting
-RESIDUAL_T_POWER=4
+RESIDUAL_T_POWER=3
 
 # ODE sampler time grid
 TIME_GRID="linear"
 
 # Losses — FM + Residual only (phase/sparam/endpoint disabled for v1 paper)
-LAMBDA_RESIDUAL=1.5
-RESIDUAL_WARMUP=20
+LAMBDA_RESIDUAL=1.25
+RESIDUAL_WARMUP=15
 
 # Endpoint loss DISABLED
 LAMBDA_ENDPOINT=0.0
@@ -106,12 +106,12 @@ SPARAM_MODE="head"
 SPARAM_WARMUP=0
 SPARAM_START_PHASE="C"
 
-# Spatial focus knobs (disabled — let model learn full cladding fields)
-DEVICE_FOCUS_MAX=0.0
-DEVICE_FOCUS_WARMUP=25
-DEVICE_FOCUS_HOLD=100
-DEVICE_FOCUS_DECAY=200
-W_MIN=0.5
+# Spatial focus knobs (enabled — moderate core emphasis, then relax)
+DEVICE_FOCUS_MAX=1.2
+DEVICE_FOCUS_WARMUP=20
+DEVICE_FOCUS_HOLD=20
+DEVICE_FOCUS_DECAY=60
+W_MIN=0.8
 EPS_THR=2.5
 DILATE=15
 INTERFACE_THR=1.0
@@ -120,10 +120,11 @@ INTERFACE_THR=1.0
 EVAL_SAMPLE_MODE="fixed"
 EVAL_SAMPLE_INDEX_SEED=0
 EVAL_FLOW_NOISE_SEED=0
-EVAL_SAMPLES_PER_DEVICE=8
-SAMPLE_EVAL_LIMIT=64
+EVAL_SAMPLES_PER_DEVICE=24
+SAMPLE_EVAL_LIMIT=96
 PHYSICAL_RATIO_TARGET=2
 CKPT_BEST_METRIC="worst_ratio_p95"
+CKPT_EVERY=10
 
 # System/env
 export OMP_NUM_THREADS=1
@@ -132,7 +133,21 @@ export MALLOC_ARENA_MAX=2
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-NGPUS=2
+NGPUS=8
+CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${VERSION}/checkpoints"
+RESUME_ARGS=()
+SOURCE_VERSION="PHASE_V4_mmi_ybranch_dc_7500each_1p55"
+SOURCE_CKPT_ROOT="${CHECKPOINT_ROOT}/${SOURCE_VERSION}/checkpoints"
+SOURCE_CKPT="${SOURCE_CKPT_ROOT}/0000240.pt"
+
+mkdir -p "${CHECKPOINT_DIR}"
+if [ -f "${SOURCE_CKPT}" ]; then
+  RESUME_ARGS=(--resume-from "${SOURCE_CKPT}")
+  echo "Resuming from source checkpoint: ${SOURCE_CKPT}"
+else
+  echo "Source checkpoint not found: ${SOURCE_CKPT}"
+  echo "Starting fresh."
+fi
 
 echo "Starting training job: ${VERSION}"
 echo "Nodes=${SLURM_NNODES} GPUs/node=${NGPUS} WorldGPU=$((SLURM_NNODES * NGPUS))"
@@ -171,6 +186,7 @@ srun torchrun \
   --include-sweeps "${INCLUDE_SWEEPS}" \
   --exclude-devices "${EXCLUDE_DEVICES}" \
   --include-wavelengths "${INCLUDE_WAVELENGTHS}" \
+  ${USE_INDEX_SPLIT} \
   --version "${VERSION}" \
   --hidden-size "${HIDDEN_SIZE}" \
   --num-res-blocks "${NUM_RES_BLOCKS}" \
@@ -178,7 +194,7 @@ srun torchrun \
   --num-heads "${NUM_HEADS}" \
   --attn-resolutions "${ATTN_RESOLUTIONS}" \
   --model-dropout "${MODEL_DROPOUT}" \
-  --train-fraction 0.95 \
+  --train-fraction "${TRAIN_FRACTION}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
   --batch-size "${BATCH_SIZE}" \
@@ -193,7 +209,7 @@ srun torchrun \
   \
   --lambda-residual "${LAMBDA_RESIDUAL}" \
   --residual-warmup-epochs "${RESIDUAL_WARMUP}" \
-  --residual-start-phase "B" \
+  --residual-start-phase "A" \
   --lambda-endpoint "${LAMBDA_ENDPOINT}" \
   --endpoint-start-phase "${ENDPOINT_START_PHASE}" \
   --endpoint-warmup-epochs "${ENDPOINT_WARMUP}" \
@@ -223,8 +239,8 @@ srun torchrun \
   --dilate "${DILATE}" \
   --interface-thr "${INTERFACE_THR}" \
   \
-  --ckpt-every 50 \
-  --eval-every 20 \
+  --ckpt-every "${CKPT_EVERY}" \
+  --eval-every 10 \
   --val-batches 4 \
   --save-eval-samples \
   --save-eval-samples-limit 2 \
@@ -242,10 +258,10 @@ srun torchrun \
   --use-checkpoint \
   --dx 0.05 \
   --unroll-steps 0 \
-  --fm_steps 50 \
+  --fm_steps 150 \
   \
   --warmup-epochs 5 \
-  --min-lr 5e-6 \
+  --min-lr 1e-6 \
   --weight-decay "${WEIGHT_DECAY}" \
   --grad-clip 5.0 \
   --log-every 1 \
@@ -265,6 +281,7 @@ srun torchrun \
   \
   --eps-core 5.8 \
   --eps-clad 2.09 \
+  "${RESUME_ARGS[@]}" \
   \
  \
 

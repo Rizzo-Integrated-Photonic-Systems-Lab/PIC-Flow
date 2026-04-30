@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:h200:2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=30
 #SBATCH --mem=256G
 #SBATCH --time=3-00:00:00
 #SBATCH --requeue
@@ -41,7 +41,7 @@ DATA_ROOT="/dartfs-hpc/rc/home/j/f0071mj/rayfield/Data"
 #   - Wavelengths: 1.55 um only
 #   - Split: index-based, 90/10 train/val
 # -----------------------
-VERSION="PHASE_V4_mmi_ybranch_dc_7500each_1p55"
+VERSION="PHASE_V4_mmi_ybranch_dc_7500each_1p55_fm_only_h200"
 
 # Architecture
 HIDDEN_SIZE=40
@@ -86,7 +86,7 @@ RESIDUAL_T_POWER=3
 TIME_GRID="linear"
 
 # Losses — FM + Residual only (phase/sparam/endpoint disabled for v1 paper)
-LAMBDA_RESIDUAL=1.1
+LAMBDA_RESIDUAL=0.0
 RESIDUAL_WARMUP=15
 
 # Endpoint loss DISABLED
@@ -121,7 +121,7 @@ EVAL_SAMPLE_MODE="fixed"
 EVAL_SAMPLE_INDEX_SEED=0
 EVAL_FLOW_NOISE_SEED=0
 EVAL_SAMPLES_PER_DEVICE=8
-SAMPLE_EVAL_LIMIT=64
+SAMPLE_EVAL_LIMIT=24
 PHYSICAL_RATIO_TARGET=2
 CKPT_BEST_METRIC="worst_ratio_p95"
 CKPT_EVERY=10
@@ -136,21 +136,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NGPUS=2
 CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${VERSION}/checkpoints"
 RESUME_ARGS=()
-
 mkdir -p "${CHECKPOINT_DIR}"
-shopt -s nullglob
-CKPT_FILES=("${CHECKPOINT_DIR}"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9].pt)
-shopt -u nullglob
-if ((${#CKPT_FILES[@]} > 0)); then
-  IFS=$'\n' CKPT_FILES_SORTED=($(printf '%s\n' "${CKPT_FILES[@]}" | sort))
-  unset IFS
-  LAST_CKPT_INDEX=$((${#CKPT_FILES_SORTED[@]} - 1))
-  LATEST_CKPT="${CKPT_FILES_SORTED[$LAST_CKPT_INDEX]}"
-  RESUME_ARGS=(--resume-from "${LATEST_CKPT}")
-  echo "Resuming from checkpoint: ${LATEST_CKPT}"
-else
-  echo "No existing checkpoint found for ${VERSION}; starting fresh."
-fi
+echo "Starting fresh (no resume checkpoint)."
 
 echo "Starting training job: ${VERSION}"
 echo "Nodes=${SLURM_NNODES} GPUs/node=${NGPUS} WorldGPU=$((SLURM_NNODES * NGPUS))"
@@ -243,7 +230,7 @@ srun torchrun \
   --interface-thr "${INTERFACE_THR}" \
   \
   --ckpt-every "${CKPT_EVERY}" \
-  --eval-every 20 \
+  --eval-every 10 \
   --val-batches 4 \
   --save-eval-samples \
   --save-eval-samples-limit 2 \
@@ -256,15 +243,15 @@ srun torchrun \
   --ckpt-best-metric "${CKPT_BEST_METRIC}" \
   \
   --pml-cells 0 \
-  --physics-features \
+  --no-physics-features \
   --complex-unet \
   --use-checkpoint \
   --dx 0.05 \
   --unroll-steps 0 \
-  --fm_steps 100 \
+  --fm_steps 150 \
   \
   --warmup-epochs 5 \
-  --min-lr 5e-6 \
+  --min-lr 1e-6 \
   --weight-decay "${WEIGHT_DECAY}" \
   --grad-clip 5.0 \
   --log-every 1 \

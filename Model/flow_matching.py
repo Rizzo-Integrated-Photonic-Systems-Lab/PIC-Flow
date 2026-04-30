@@ -872,6 +872,7 @@ def sample(
     phase_gate=1.0,
     sig_min: float = SIG_MIN,
     time_grid: str = "quadratic",
+    progress: bool = False,
 ) -> torch.Tensor:
     """
     Flow-matching sampler for fields, conditioned on spatial maps (eps, and optionally src).
@@ -903,7 +904,16 @@ def sample(
     if lambda_um is not None:
         lambda_um_model = lambda_um.view(B, 1).to(device=device, dtype=dtype)
 
-    for k in range(num_steps):
+    step_iter = range(num_steps)
+    if progress:
+        try:
+            from tqdm.auto import trange
+
+            step_iter = trange(num_steps, desc="Flow matching", unit="step", leave=True)
+        except ModuleNotFoundError:
+            step_iter = range(num_steps)
+
+    for k in step_iter:
         t0 = time_steps[k]
         t1 = time_steps[k + 1]
         dt = (t1 - t0)

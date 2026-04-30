@@ -12,19 +12,15 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 
 # =============================================================================
-# Final Production Dataset: selected device types, ALL RECTANGULAR, res=20, 5 Wavelengths
+# Final Production Dataset: selected device types, ALL RECTANGULAR, res=20, 1 Wavelength
 # =============================================================================
 #
 # Single domain (480x160 px = 24x8 µm @ res=20):
-#   - Tapers                (800 geom)  [3D params]
-#   - S-bends               (800 geom)  [3D params]
-#   - Y-branches            (1500 geom) [5D params]
-#   - Directional couplers  (2200 geom) [5D params]
-#   - 2x2 MMIs              (3000 geom) [5D params]
-#   - Euler bends            (700 geom) [2D params, R=2-3.4 µm]
-#   - Waveguide crossings    (1000 geom) [2D params]
+#   - 2x2 MMIs              (7500 geom) [5D params]
+#   - Y-branches            (7500 geom) [5D params]
+#   - Directional couplers  (7500 geom) [5D params]
 #
-# Total: 10,000 geometries x 5 wavelengths = 50,000 simulations
+# Total: 22,500 geometries x 1 wavelength = 22,500 simulations
 # All tensors: 480x160 px (no padding needed for training)
 # Split: 80/10/10 by geometry_id
 #
@@ -43,16 +39,16 @@ export MKL_NUM_THREADS=1
 
 # ---- Run parameters ----
 
-# Device counts (10,000 total geometries)
+# Device counts (22,500 total geometries)
 N_STRAIGHT=0
-N_TAPER=800
-N_MMI=3000
-N_SBEND=800
-N_YBRANCH=1500
-N_DC=2200
-N_EULER=700
+N_TAPER=0
+N_MMI=7500
+N_SBEND=0
+N_YBRANCH=7500
+N_DC=7500
+N_EULER=0
 N_CIRCULAR=0
-N_CROSSING=1000
+N_CROSSING=0
 
 # Number of parallel workers (leave headroom for OS/IO)
 N_PROCS=26
@@ -77,7 +73,7 @@ SEED=42
 SPLIT_SEED=123
 
 # Output directory
-OUT_DIR="Data/unified_sweep_final"
+OUT_DIR="Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um"
 
 # ---- Create log directory ----
 mkdir -p logs
@@ -92,12 +88,33 @@ else
     echo "No existing index — starting fresh"
 fi
 
+# Wavelength selection (unified_sweep.py uses a module-level constant)
+WAVELENGTH_UM=1.55
+
+# Build a temporary copy of unified_sweep.py with only the requested wavelength.
+# Keep it under FDTD/ so relative module imports (e.g., straight_waveguide.*) still resolve.
+TMP_SWEEP="FDTD/unified_sweep_1p55_tmp_${SLURM_JOB_ID}.py"
+python3 - <<PY
+from pathlib import Path
+src = Path("FDTD/unified_sweep.py")
+dst = Path("${TMP_SWEEP}")
+text = src.read_text()
+text = text.replace("WAVELENGTHS = [1.50, 1.525, 1.55, 1.575, 1.60]", "WAVELENGTHS = [${WAVELENGTH_UM}]")
+dst.write_text(text)
+print(f"Prepared temp sweep script: {dst}")
+PY
+
+cleanup() {
+    rm -f "${TMP_SWEEP}"
+}
+trap cleanup EXIT
+
 # ---- Run ----
 echo "=========================================="
-echo "Final Dataset Generation (all rect 480x160)"
+echo "Final Dataset Generation (all rect 480x160, lambda=${WAVELENGTH_UM}um)"
 echo "=========================================="
 
-python -u FDTD/unified_sweep.py \
+python -u "${TMP_SWEEP}" \
   --out-dir "${OUT_DIR}" \
   --n-straight ${N_STRAIGHT} \
   --n-taper ${N_TAPER} \
@@ -131,8 +148,8 @@ echo "=========================================="
 # Report progress
 if [ -f "${OUT_DIR}/shards/index.json" ]; then
     TOTAL=$(python3 -c "import json; print(len(json.load(open('${OUT_DIR}/shards/index.json'))))" 2>/dev/null || echo "?")
-    echo "Total samples so far: ${TOTAL} / 56800"
-    if [ "${TOTAL}" != "56800" ] && [ "${TOTAL}" != "?" ]; then
+    echo "Total samples so far: ${TOTAL} / 22500"
+    if [ "${TOTAL}" != "22500" ] && [ "${TOTAL}" != "?" ]; then
         echo "*** Not yet complete — resubmit: sbatch unified_sweep_final.slurm ***"
     else
         echo "*** Dataset generation COMPLETE ***"
