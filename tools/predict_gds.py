@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PHASE Field Predictor — Predict electromagnetic fields from GDS device layouts.
+PIC-Flow Field Predictor — Predict electromagnetic fields from GDS device layouts.
 
 Usage:
     python tools/predict_gds.py \
@@ -266,7 +266,7 @@ def create_source_mask(
 
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
-    """Load a trained PHASE model from checkpoint."""
+    """Load a trained PIC-Flow model from checkpoint."""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Model"))
     from complex_physics_unet import ComplexPhysicsUNet
 
@@ -494,7 +494,7 @@ def save_results(
         ax.set_xlabel("x (um)")
         ax.set_ylabel("y (um)")
 
-    fig.suptitle(f"PHASE Prediction | wavelength = {wavelength_um:.3f} um", fontsize=14)
+    fig.suptitle(f"PIC-Flow Prediction | wavelength = {wavelength_um:.3f} um", fontsize=14)
     plt.tight_layout()
     plt.savefig(fig_path, dpi=200, bbox_inches="tight")
     plt.close()
@@ -521,7 +521,7 @@ def parse_layer_map(s: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PHASE Field Predictor — predict EM fields from GDS layouts",
+        description="PIC-Flow Field Predictor — predict EM fields from GDS layouts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--gds", required=True, help="Path to GDS file")

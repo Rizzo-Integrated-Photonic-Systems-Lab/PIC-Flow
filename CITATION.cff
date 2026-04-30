@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "PHASE: A Physics-Embedded Flow-Matching Model for Electromagnetic Prediction of Silicon Photonic Devices"
+title: "PIC-Flow: A Physics-Embedded Flow-Matching Model for Electromagnetic Prediction of Silicon Photonic Devices"
 message: "If you use this software, please cite the accompanying paper."
 type: software
 authors:

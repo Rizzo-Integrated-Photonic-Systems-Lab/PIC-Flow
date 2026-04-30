@@ -1,4 +1,4 @@
-# PHASE — public requirements
+# PIC-Flow — public requirements
 # -----------------------------------------------------------------------------
 # Core training, sampling, and evaluation dependencies.
 # PyTorch is intentionally unpinned: install the wheel that matches your CUDA,

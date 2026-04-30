@@ -842,7 +842,7 @@ def main(args):
 
     results_dir = "logs_physics_unet_pbfm"
     experiment_dir = os.path.join(results_dir, args.version)
-    checkpoint_root = os.environ.get("PHASE_CKPT_ROOT", results_dir)
+    checkpoint_root = os.environ.get("PICFLOW_CKPT_ROOT", results_dir)
     ckpt_experiment_dir = os.path.join(checkpoint_root, args.version)
     ckpt_dir = os.path.join(ckpt_experiment_dir, "checkpoints")
     samples_dir = os.path.join(experiment_dir, "samples")
@@ -2828,7 +2828,7 @@ if __name__ == "__main__":
                         help="ODE sampler time grid: 'quadratic' (more steps near t=0) or 'linear' (uniform).")
 
     parser.add_argument("--use-wandb", type=bool, default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--wandb-project", type=str, default="PHASE")
+    parser.add_argument("--wandb-project", type=str, default="PIC-Flow")
     parser.add_argument("--wandb-entity", type=str, default=None)
 
     parser.add_argument("--device-focus-max", type=float, default=3.0)

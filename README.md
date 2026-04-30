@@ -1,18 +1,18 @@
-# PHASE: Physics-Aware Surrogate for Electromagnetics
+# PIC-Flow: A Physics-Embedded Flow-Matching Model for Silicon Photonic Devices
 
 A neural surrogate that replaces FDTD simulation for 2D photonic device field prediction.
-PHASE pairs a real-valued U-Net with **conditional flow matching** and a **Helmholtz residual
+PIC-Flow pairs a real-valued U-Net with **conditional flow matching** and a **Helmholtz residual
 loss** to generate complex electromagnetic fields ($E_z$) for parameterized silicon-photonic
 devices given their permittivity map, source-port mask, and wavelength.
 
 <p align="center">
   <img src="assets/denoising_trajectory.gif"
-       alt="PHASE denoising trajectory: 100-step Euler integration from Gaussian noise to the predicted E_z field, with the FDTD ground truth shown alongside for reference."
+       alt="PIC-Flow denoising trajectory: 100-step Euler integration from Gaussian noise to the predicted E_z field, with the FDTD ground truth shown alongside for reference."
        width="760">
 </p>
 
 The animation shows what the model actually does: starting from Gaussian noise (left, $t=0$),
-PHASE integrates a learned velocity field along $t \in [0, 1]$ until the field converges to a
+PIC-Flow integrates a learned velocity field along $t \in [0, 1]$ until the field converges to a
 prediction (left, $t=1$) that matches the FDTD reference (right). On a single A100 the
 integration finishes in well under a second; the wall-clock benchmark with as few as 20 Euler
 steps takes ≈ 444 ms and still hits 3 % Helmholtz compliance, ~10× faster than 16-thread
@@ -22,7 +22,7 @@ CPU FDTD on the same node.
 > `outputs/denoising/trajectory.gif` to `assets/denoising_trajectory.gif`.
 
 ```
-input:  (epsilon, source mask, wavelength)  -->  PHASE U-Net (Euler/Heun ODE sampler)  -->  E_z(x,y)
+input:  (epsilon, source mask, wavelength)  -->  PIC-Flow U-Net (Euler/Heun ODE sampler)  -->  E_z(x,y)
 ```
 
 Trained dataset covers three device families at 1.55 µm (multimode interferometers, Y-branches,
@@ -33,8 +33,8 @@ and directional couplers — 22 500 FDTD simulations total).
 ## Install
 
 ```bash
-git clone https://github.com/Rizzo-Integrated-Photonic-Systems-Lab/PHASE.git
-cd PHASE
+git clone https://github.com/Rizzo-Integrated-Photonic-Systems-Lab/PIC-Flow.git
+cd PIC-Flow
 
 # Core deps. PyTorch must match your CUDA — install separately if pip's default doesn't fit:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
@@ -115,7 +115,7 @@ See [`Data/README.md`](Data/README.md) for the dataset layout.
 ## Repo layout
 
 ```
-PHASE/
+PIC-Flow/
 ├── Model/         neural network + training loop + flow matching
 ├── FDTD/          dataset generation (Meep-based) + per-device geometries
 ├── tools/         inference, benchmarks, evaluation
@@ -135,7 +135,7 @@ paper's specific runs.
 If you use this code, please cite:
 
 ```bibtex
-@article{Quaratiello2026PHASE,
+@article{Quaratiello2026PICFlow,
   author  = {Joseph Quaratiello and Anthony Rizzo},
   title   = {A Physics-Embedded Flow-Matching Model for Electromagnetic Prediction
              of Silicon Photonic Devices},
