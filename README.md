@@ -7,30 +7,19 @@ devices given their permittivity map, source-port mask, and wavelength.
 
 <p align="center">
   <img src="assets/denoising_directional_coupler.gif"
-       alt="PIC-Flow denoising trajectory on a directional coupler"
-       width="540"><br>
-  <img src="assets/denoising_mmi.gif"
-       alt="PIC-Flow denoising trajectory on a 2x2 MMI"
-       width="540"><br>
-  <img src="assets/denoising_ybranch.gif"
-       alt="PIC-Flow denoising trajectory on a Y-branch"
-       width="540">
+       alt="PIC-Flow denoising trajectory on a directional coupler: 100-step Euler integration from Gaussian noise to the predicted E_z field, with the FDTD ground truth shown alongside for reference."
+       width="640">
 </p>
 
-The animations show what the model actually does for each of the three device families: starting
-from Gaussian noise (left, $t=0$), PIC-Flow integrates a learned velocity field along
-$t \in [0, 1]$ until the field converges to a prediction (left, $t=1$) that matches the FDTD
-reference (right). On a single A100 the integration finishes in well under a second; the
-wall-clock benchmark with as few as 20 Euler steps takes ≈ 444 ms and still hits 3 % Helmholtz
+The animation shows what the model actually does on a directional coupler: starting from
+Gaussian noise (left, $t=0$), PIC-Flow integrates a learned velocity field along $t \in [0, 1]$
+until the field converges to a prediction (left, $t=1$) that matches the FDTD reference
+(right). On a single A100 the integration finishes in well under a second; the wall-clock
+benchmark with as few as 20 Euler steps takes ≈ 444 ms and still hits 3 % Helmholtz
 compliance, ~10× faster than 16-thread CPU FDTD on the same node.
 
-> Regenerate the GIFs:
-> ```bash
-> python tools/denoising_trajectory.py --device mmi,ybranch,directional_coupler
-> for d in mmi ybranch directional_coupler; do
->   cp outputs/denoising/trajectory_${d}.gif assets/denoising_${d}.gif
-> done
-> ```
+> Regenerate the GIF: `python tools/denoising_trajectory.py --device directional_coupler`,
+> then `cp outputs/denoising/trajectory_directional_coupler.gif assets/denoising_directional_coupler.gif`.
 
 ```
 input:  (epsilon, source mask, wavelength)  -->  PIC-Flow U-Net (Euler/Heun ODE sampler)  -->  E_z(x,y)
@@ -131,7 +120,6 @@ PIC-Flow/
 ├── FDTD/          dataset generation (Meep-based) + per-device geometries
 ├── tools/         inference, benchmarks, evaluation
 ├── notebooks/     hands-on walkthroughs (start here)
-├── examples/      sample evaluation indices
 └── Data/          (gitignored) FDTD ground-truth shards
 ```
 
