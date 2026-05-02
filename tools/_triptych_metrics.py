@@ -168,5 +168,5 @@ def format_metric_label(m: dict[str, Any]) -> str:
     if not np.isfinite(pct):
         return "n/a"
     if pct < 10:
-        return rf"$\varepsilon_R$ = {pct:.1f}%"
-    return rf"$\varepsilon_R$ = {pct:.0f}%"
+        return rf"$\rho_R$ = {pct:.1f}%"
+    return rf"$\rho_R$ = {pct:.0f}%"

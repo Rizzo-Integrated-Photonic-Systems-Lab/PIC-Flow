@@ -303,16 +303,16 @@ def _save_figure(
     # [0,0] = FDTD reference (with translucent green source overlay).
     _plot_panel(axes[0, 0], fdtd_mag, eps, extent=extent, vmax=vmax,
                 title=r"FDTD reference",
-                annot=r"$\varepsilon_R$ ref", show_source=src)
+                annot=r"$\rho_R$ ref", show_source=src)
 
     # Remaining 7 slots = Euler N-step in row-major order over STEP_COUNTS.
     flat_axes = [axes[0, 1], axes[0, 2], axes[0, 3],
                  axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3]]
     for ax, n_steps, mag, m, w_ms in zip(flat_axes, STEP_COUNTS, pred_mags, metrics, walls_ms):
         eps_R = m.get("eps_R_pct", float("nan"))
-        annot = (rf"$\varepsilon_R={eps_R:.1f}\%$" + "\n" + rf"{w_ms:.0f}\,ms"
+        annot = (rf"$\rho_R={eps_R:.1f}\%$" + "\n" + rf"{w_ms:.0f}\,ms"
                  if plt.rcParams["text.usetex"] else
-                 rf"$\varepsilon_R$={eps_R:.1f}%" + "\n" + f"{w_ms:.0f} ms")
+                 rf"$\rho_R$={eps_R:.1f}%" + "\n" + f"{w_ms:.0f} ms")
         _plot_panel(ax, mag, eps, extent=extent, vmax=vmax,
                     title=f"Euler {n_steps}-step", annot=annot, show_source=None)
 

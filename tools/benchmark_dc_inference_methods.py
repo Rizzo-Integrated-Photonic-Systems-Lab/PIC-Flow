@@ -109,15 +109,13 @@ DEFAULT_WAVELENGTH_UM = 1.55
 # Inference configurations to benchmark. Each is timed and produces one |Ez|
 # panel + one row in the summary table.
 CONFIGS = [
-    {"name": "Heun 200 (no AMP)",  "integrator": "heun",  "num_steps": 200, "amp": False},
-    {"name": "Heun 100 (AMP)",     "integrator": "heun",  "num_steps": 100, "amp": True },
-    {"name": "Heun 50 (AMP)",      "integrator": "heun",  "num_steps":  50, "amp": True },
-    {"name": "Heun 20 (AMP)",      "integrator": "heun",  "num_steps":  20, "amp": True },
+    {"name": "Euler 200 (AMP)",    "integrator": "euler", "num_steps": 200, "amp": True },
     {"name": "Euler 100 (AMP)",    "integrator": "euler", "num_steps": 100, "amp": True },
     {"name": "Euler 50 (AMP)",     "integrator": "euler", "num_steps":  50, "amp": True },
     {"name": "Euler 20 (AMP)",     "integrator": "euler", "num_steps":  20, "amp": True },
     {"name": "Euler 10 (AMP)",     "integrator": "euler", "num_steps":  10, "amp": True },
     {"name": "Euler 5 (AMP)",      "integrator": "euler", "num_steps":   5, "amp": True },
+    {"name": "Euler 1 (AMP)",      "integrator": "euler", "num_steps":   1, "amp": True },
 ]
 
 
@@ -348,7 +346,7 @@ def _save_summary_plot(
         title = (
             f"{r['name']}\n"
             f"{r['time_ms']:.0f} ms ({r['speedup']:.1f}×)   "
-            rf"$\varepsilon_R$={r['eps_R_pct']:.1f}%"
+            rf"$\rho_R$={r['eps_R_pct']:.1f}%"
         )
         ax.set_title(title, fontsize=9)
         ax.set_xticks([]); ax.set_yticks([])

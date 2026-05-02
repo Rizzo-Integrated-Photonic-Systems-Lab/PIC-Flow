@@ -455,8 +455,8 @@ def _plot_histograms(data: dict[str, np.ndarray], *, out_path: Path) -> None:
     _plot_panel(
         axes[0], data,
         metric="eps_R", bins=eps_bins,
-        xlabel=r"compliance $\varepsilon_R$ (\%)" if plt.rcParams["text.usetex"]
-               else r"compliance $\varepsilon_R$ (%)",
+        xlabel=r"compliance $\rho_R$ (\%)" if plt.rcParams["text.usetex"]
+               else r"compliance $\rho_R$ (%)",
         title="Helmholtz compliance",
         log_x=True,
     )

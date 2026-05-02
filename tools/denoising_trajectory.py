@@ -63,10 +63,10 @@ DEVICE_LABELS = {
 }
 
 
-# t-values to render in the static panel. At K=100 these become step indices
-# (0, 1, 5, 20, 50, 75, 100). Labeling by t rather than k keeps the panel
-# meaningful regardless of integrator step count.
-PANEL_T_VALUES = (0.00, 0.01, 0.05, 0.20, 0.50, 0.75, 1.00)
+# t-values to render in the static panel. Three frames (noise -> halfway ->
+# final) connected by right-arrows make the noise-to-field transport visually
+# legible without overwhelming the paper figure.
+PANEL_T_VALUES = (0.00, 0.50, 1.00)
 TOTAL_STEPS = 100
 
 
@@ -155,31 +155,54 @@ def _render_panel_frame(ax, mag, eps, *, vmax, title, source=None, show_contour=
 
 def _save_static_panel(
     eps: np.ndarray, src: np.ndarray,
-    fdtd_mag: np.ndarray,
-    traj_mags: np.ndarray,            # [num_steps + 1, H, W]
+    fdtd_mag: np.ndarray,                # unused (kept for API stability)
+    traj_mags: np.ndarray,                # [num_steps + 1, H, W]
     t_values: tuple[float, ...],
     num_steps: int,
     *, out_path: Path, vmax_global: float,
 ) -> None:
+    """Render a flow-matching transport panel: a horizontal strip of |x_t|
+    frames at the requested t-values, separated by right-arrow cells. No FDTD
+    reference; this figure is meant to illustrate the noise -> field transport.
+    """
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(2, 4, figsize=(8.6, 2.6), constrained_layout=True)
-    flat = axes.flatten()
+    from matplotlib.gridspec import GridSpec
 
-    for ax, t_val in zip(flat[: len(t_values)], t_values):
+    n = len(t_values)
+    # Alternating frame / arrow / frame / arrow / ... layout.
+    width_ratios: list[float] = []
+    for i in range(n):
+        width_ratios.append(3.0)            # frame cell
+        if i < n - 1:
+            width_ratios.append(0.55)       # arrow cell
+    fig = plt.figure(figsize=(7.4, 1.55), constrained_layout=True)
+    gs = GridSpec(1, len(width_ratios), figure=fig, width_ratios=width_ratios)
+
+    cell_idx = 0
+    for i, t_val in enumerate(t_values):
+        ax = fig.add_subplot(gs[0, cell_idx])
         k = int(round(float(t_val) * num_steps))
         k = max(0, min(num_steps, k))
-        mag = traj_mags[k]
         if t_val <= 1e-9:
             title = r"$t=0$ (noise)"
         elif abs(t_val - 1.0) < 1e-9:
-            title = r"$t=1$ (final)"
+            title = r"$t=1$ (predicted $|E_z|$)"
         else:
             title = rf"$t={t_val:g}$"
-        _render_panel_frame(ax, mag, eps, vmax=vmax_global, title=title,
+        _render_panel_frame(ax, traj_mags[k], eps, vmax=vmax_global,
+                            title=title,
                             source=(src if t_val <= 1e-9 else None))
-    _render_panel_frame(flat[len(t_values)], fdtd_mag, eps,
-                        vmax=vmax_global, title="FDTD reference",
-                        source=src)
+        cell_idx += 1
+        if i < n - 1:
+            arrow_ax = fig.add_subplot(gs[0, cell_idx])
+            arrow_ax.annotate(
+                "", xy=(0.95, 0.5), xytext=(0.05, 0.5),
+                xycoords="axes fraction",
+                arrowprops=dict(arrowstyle="-|>", lw=1.6, color="black",
+                                mutation_scale=18),
+            )
+            arrow_ax.set_axis_off()
+            cell_idx += 1
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
