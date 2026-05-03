@@ -45,7 +45,10 @@ for _p in (str(MODEL_DIR), str(FDTD_DIR), str(REPO_ROOT)):
 from flow_matching import sample as fm_sample  # noqa: E402
 from physics_unet import PhysicsUNet  # noqa: E402
 from complex_physics_unet import ComplexPhysicsUNet  # noqa: E402
-from unified_sweep import PARAM_RANGES, build_device, get_device_masks  # noqa: E402
+
+def _load_unified_sweep():
+    from unified_sweep import PARAM_RANGES, build_device, get_device_masks  # noqa: E402
+    return PARAM_RANGES, build_device, get_device_masks
 
 
 TRAINED_DEVICE_TYPES = ("mmi", "ybranch", "directional_coupler")
@@ -97,6 +100,7 @@ def _parse_params(args: argparse.Namespace) -> dict[str, float]:
 
 
 def _validated_params(device_type: str, user_params: dict[str, float], fill_missing: str) -> dict[str, float]:
+    PARAM_RANGES, _, _ = _load_unified_sweep()
     if device_type not in PARAM_RANGES:
         raise ValueError(f"Unknown device '{device_type}'. Valid devices: {sorted(PARAM_RANGES)}")
     ranges = PARAM_RANGES[device_type]
@@ -319,6 +323,7 @@ def _make_device_and_arrays(
     crop_x_px: int,
     crop_y_px: int,
 ) -> tuple[Any, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[float, float]]:
+    _, build_device, get_device_masks = _load_unified_sweep()
     cell_x = float(crop_x_px) / float(resolution) + 2.0 * float(dpml)
     cell_y = float(crop_y_px) / float(resolution) + 2.0 * float(dpml)
     dev = build_device(device_type, params, wavelength_um, resolution, dpml, cell_x, cell_y, crop_x_px, crop_y_px)

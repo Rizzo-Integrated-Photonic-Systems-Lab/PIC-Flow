@@ -1113,8 +1113,8 @@ def main(args):
     assert args.batch_size % world == 0, f"--batch-size (global) must be divisible by world_size={world}"
     per_gpu_batch = args.batch_size // world
 
-    train_prefetch = args.prefetch_factor if args.train_num_workers > 0 else 2
-    val_prefetch = args.prefetch_factor if args.val_num_workers > 0 else 2
+    train_prefetch = args.prefetch_factor if args.train_num_workers > 0 else None
+    val_prefetch = args.prefetch_factor if args.val_num_workers > 0 else None
 
     train_loader = DataLoader(
         train_ds,
@@ -1210,7 +1210,11 @@ def main(args):
     ema.set_normalization_stats(stats, normalize_eps=args.normalize_eps)
 
     # torch.compile: enabled when S-param head is not in use (Inductor doesn't support complex backward through learned head)
-    use_compile = int(getattr(args, "unroll_steps", 0)) == 0 and not bool(getattr(base_model, "enable_sparam_head", False))
+    use_compile = (
+        int(getattr(args, "unroll_steps", 0)) == 0
+        and not bool(getattr(base_model, "enable_sparam_head", False))
+        and bool(getattr(args, "compile", True))
+    )
     if use_compile:
         import torch._functorch.config as _ftc
         _ftc.donated_buffer = False
@@ -1806,7 +1810,7 @@ def main(args):
                     compute_residual_val = (residual_weight > 0.0)
                     compute_sparam_val = (sparam_weight > 0.0)
 
-                    fm_v, res_v, ph_v, end_v, phg_v, sp_v, _, _ = cfm_loss_residual(
+                    fm_v, res_v, ph_v, end_v, phg_v, sp_v = cfm_loss_residual(
                         ema,
                         x_t_input,
                         t,
@@ -2719,6 +2723,8 @@ if __name__ == "__main__":
     parser.add_argument("--config-start-epoch", type=int, default=200)
 
     parser.add_argument("--amp", type=bool, default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--compile", type=bool, default=True, action=argparse.BooleanOptionalAction,
+                        help="Use torch.compile on the base model. Disable on platforms without Triton (e.g. Windows).")
     parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"],
                         help="AMP dtype: float16 (needs GradScaler) or bfloat16 (no scaler, more stable)")
     parser.add_argument("--detect-anomaly", type=bool, default=False, action=argparse.BooleanOptionalAction)
