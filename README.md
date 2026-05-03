@@ -40,11 +40,18 @@ cd PIC-Flow
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 
-# Optional: only needed if you generate FDTD data yourself.
+# Optional: only needed if you (a) generate FDTD data yourself via FDTD/unified_sweep.py
+# or notebook 01, or (b) run the FDTD-comparison benchmarks under tools/
+# (benchmark_dc_inference_methods.py, benchmark_fdtd_vs_inference.py).
+# Inference, training, and notebook 03 do NOT need meep.
 # Meep is best installed via conda-forge: `conda install -c conda-forge pymeep`.
 ```
 
-Tested with Python 3.10+, PyTorch 2.x, CUDA 11.8/12.1.
+Tested with Python 3.10+, PyTorch 2.x, CUDA 11.8 / 12.1 / 12.8 on **Linux and macOS**.
+Windows is not a supported platform — Meep has no native Windows build, and several
+PyTorch features used here (`torch.compile` / Triton) are Linux-only.
+Windows users should run inside [WSL2](https://learn.microsoft.com/windows/wsl/install)
+with an Ubuntu environment.
 
 ---
 
@@ -53,43 +60,59 @@ Tested with Python 3.10+, PyTorch 2.x, CUDA 11.8/12.1.
 The fastest path to seeing the model work:
 
 ```bash
-# 1) install (above)
-# 2) pull the pretrained FM+phase+residual checkpoint from Hugging Face (~1 GB)
+# 1) install (above) + jupyterlab + huggingface_hub
+pip install jupyterlab huggingface_hub
+
+# 2) pull the pretrained FM+phase+residual checkpoint (~1 GB)
 hf download RizzoLab/PIC-Flow checkpoints/phase_residual_300.pt --local-dir .
-#   or in Python:
-#     from huggingface_hub import hf_hub_download
-#     hf_hub_download("RizzoLab/PIC-Flow", "checkpoints/phase_residual_300.pt", local_dir=".")
-# 3) open the inference notebook
+
+# 3) pull the held-out test shard you'll evaluate on
+hf download RizzoLab/PIC-Flow-Dataset --repo-type dataset shards/index.json \
+    --local-dir Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+hf download RizzoLab/PIC-Flow-Dataset --repo-type dataset shards/shard_00000.npz \
+    --local-dir Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+#   (notebook 03 only reads one shard; pull the rest later if you want training/eval.)
+
+# 4) open the inference notebook
 jupyter lab notebooks/03_inference.ipynb
 ```
 
-The checkpoint lives at [huggingface.co/RizzoLab/PIC-Flow](https://huggingface.co/RizzoLab/PIC-Flow).
+Hosted artifacts:
 
-The four notebooks cover the full lifecycle:
+- Checkpoints: [huggingface.co/RizzoLab/PIC-Flow](https://huggingface.co/RizzoLab/PIC-Flow)
+- Dataset (22 500 FDTD samples, 13 GB): [huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset](https://huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset)
 
-| Notebook | What it shows |
-|---|---|
-| [`notebooks/01_dataset_generation.ipynb`](notebooks/01_dataset_generation.ipynb) | Generate a small FDTD dataset (~10 geometries/family) with `FDTD/unified_sweep.py`. |
-| [`notebooks/02_training.ipynb`](notebooks/02_training.ipynb) | Smoke-train the U-Net on a tiny subset; loss curves. |
-| [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb) | Load the FM+phase+residual checkpoint, predict $E_z$ on a test sample, plot triptych + compliance. |
+The three notebooks cover the full lifecycle:
+
+| Notebook | What it shows | Needs Meep? | Needs dataset? |
+|---|---|---|---|
+| [`notebooks/01_dataset_generation.ipynb`](notebooks/01_dataset_generation.ipynb) | Generate a small FDTD dataset (~10 geometries/family) with `FDTD/unified_sweep.py`. | Yes | No (writes one) |
+| [`notebooks/02_training.ipynb`](notebooks/02_training.ipynb) | Smoke-train the U-Net on a tiny subset; loss curves. | No | Yes (full pull) |
+| [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb) | Load the FM+phase+residual checkpoint, predict $E_z$ on a test sample, plot triptych + compliance. | No | Yes (one shard) |
 
 ### Training (full)
 
 ```bash
+# Released-checkpoint architecture (~63 M params). The default --hidden-size and
+# --num-res-blocks in train.py build a different ~247 M model, so pass these
+# explicitly to reproduce phase_residual_300.pt:
+ARCH="--hidden-size 56 --num-res-blocks 3 --attn-resolutions 4,8"
+
 # Single GPU
-python Model/train.py --data-root Data/ --epochs 300 --batch-size 4
+python Model/train.py --data-root Data/ --use-shards $ARCH --epochs 300 --batch-size 4
 
 # Multi-GPU (DDP)
-torchrun --nproc_per_node=4 Model/train.py --data-root Data/ --batch-size 16
+torchrun --nproc_per_node=4 Model/train.py --data-root Data/ --use-shards $ARCH --batch-size 16
 
 # Three paper runs (FM, FM+phase, FM+phase+residual)
-python Model/train.py --data-root Data/ --lambda-residual 0 --lambda-phase 0
-python Model/train.py --data-root Data/ --lambda-residual 0 --lambda-phase 0.1
-python Model/train.py --data-root Data/ --lambda-residual 1.0 --lambda-phase 0.1
+python Model/train.py --data-root Data/ --use-shards $ARCH --lambda-residual 0   --lambda-phase 0
+python Model/train.py --data-root Data/ --use-shards $ARCH --lambda-residual 0   --lambda-phase 0.1
+python Model/train.py --data-root Data/ --use-shards $ARCH --lambda-residual 1.0 --lambda-phase 0.1
 ```
 
-`python Model/train.py --help` lists all flags. The defaults reproduce the paper's three runs at
-the appropriate `--lambda-*` weights.
+`python Model/train.py --help` lists all flags. The `--lambda-*` weights select which
+of the three paper variants you train; the `$ARCH` flags pin width/depth to match the
+released checkpoint.
 
 ### Inference (CLI)
 
@@ -107,8 +130,17 @@ python tools/test_set_histograms.py --ckpt checkpoints/phase_residual_300.pt --n
 
 ### Dataset generation (FDTD)
 
+The full 22 500-sample dataset is hosted on Hugging Face — most users should pull it
+rather than regenerate:
+
 ```bash
-# Generate the unified 3-family dataset (~24 hours on a single CPU node with 16 threads)
+hf download RizzoLab/PIC-Flow-Dataset --repo-type dataset \
+    --local-dir Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+```
+
+To regenerate from scratch (requires Meep — Linux/macOS only, ~24 h on a 16-thread CPU):
+
+```bash
 python FDTD/unified_sweep.py --output-dir Data/ \
     --devices mmi,ybranch,directional_coupler \
     --num-samples 7500 --wavelengths 1.55
