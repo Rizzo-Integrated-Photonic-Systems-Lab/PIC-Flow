@@ -54,10 +54,16 @@ The fastest path to seeing the model work:
 
 ```bash
 # 1) install (above)
-# 2) drop a checkpoint at ./checkpoints/phase_300.pt  (link in paper / contact authors)
+# 2) pull the pretrained FM+phase+residual checkpoint from Hugging Face (~1 GB)
+hf download RizzoLab/PIC-Flow checkpoints/phase_residual_300.pt --local-dir .
+#   or in Python:
+#     from huggingface_hub import hf_hub_download
+#     hf_hub_download("RizzoLab/PIC-Flow", "checkpoints/phase_residual_300.pt", local_dir=".")
 # 3) open the inference notebook
 jupyter lab notebooks/03_inference.ipynb
 ```
+
+The checkpoint lives at [huggingface.co/RizzoLab/PIC-Flow](https://huggingface.co/RizzoLab/PIC-Flow).
 
 The four notebooks cover the full lifecycle:
 
@@ -89,14 +95,14 @@ the appropriate `--lambda-*` weights.
 
 ```bash
 # Single device folder (eps.npy, src_mask.npy, sparams.npz with wavelength_um)
-python Model/sample.py --device-dir path/to/device/ --ckpt checkpoints/phase_300.pt
+python Model/sample.py --device-dir path/to/device/ --ckpt checkpoints/phase_residual_300.pt
 
 # Parametric device (no FDTD needed; specify geometry directly)
 python tools/predict_parametric_device.py --device directional_coupler \
-    --gap 0.175 --L_c 5.97 --wavelength 1.55 --ckpt checkpoints/phase_300.pt
+    --gap 0.175 --L_c 5.97 --wavelength 1.55 --ckpt checkpoints/phase_residual_300.pt
 
 # Full test-set sweep with metric histograms
-python tools/test_set_histograms.py --ckpt checkpoints/phase_300.pt --num-steps 100
+python tools/test_set_histograms.py --ckpt checkpoints/phase_residual_300.pt --num-steps 100
 ```
 
 ### Dataset generation (FDTD)
