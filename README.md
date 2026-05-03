@@ -132,8 +132,7 @@ If you use this code, please cite:
 ```bibtex
 @article{Quaratiello2026PICFlow,
   author  = {Joseph Quaratiello and Anthony Rizzo},
-  title   = {A Physics-Embedded Flow-Matching Model for Electromagnetic Prediction
-             of Silicon Photonic Devices},
+  title   = {Physics-Based Flow Matching for Full-Field Prediction of Silicon Photonic Devices},
   journal = {arXiv},
   year    = {2026}
 }
