@@ -1,4 +1,4 @@
-# PIC-Flow: A Physics-Embedded Flow-Matching Model for Silicon Photonic Devices
+# PIC-Flow: Physics-Based Flow Matching for Full-Field Prediction of Silicon Photonic Devices
 
 A neural surrogate that replaces FDTD simulation for 2D photonic device field prediction.
 PIC-Flow pairs a real-valued U-Net with **conditional flow matching** and a **Helmholtz residual
