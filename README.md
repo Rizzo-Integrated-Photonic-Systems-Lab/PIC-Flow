@@ -30,7 +30,7 @@ compliance, ~10× faster than 16-thread CPU FDTD on the same node.
 
 
 Trained dataset covers three device families at 1.55 µm (multimode interferometers, Y-branches,
-and directional couplers — 22 500 FDTD simulations total).
+and directional couplers — 22,500 FDTD simulations total).
 
 ---
 
@@ -84,7 +84,7 @@ jupyter lab notebooks/03_inference.ipynb
 Hosted artifacts:
 
 - Checkpoints: [huggingface.co/RizzoLab/PIC-Flow](https://huggingface.co/RizzoLab/PIC-Flow)
-- Dataset (22 500 FDTD samples, 13 GB): [huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset](https://huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset)
+- Dataset (22,500 FDTD samples, 13 GB): [huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset](https://huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset)
 
 The three notebooks cover the full lifecycle:
 
@@ -134,7 +134,7 @@ python tools/test_set_histograms.py --ckpt checkpoints/phase_residual_300.pt --n
 
 ### Dataset generation (FDTD)
 
-The full 22 500-sample dataset is hosted on Hugging Face — most users should pull it
+The full 22,500-sample dataset is hosted on Hugging Face — most users should pull it
 rather than regenerate:
 
 ```bash
