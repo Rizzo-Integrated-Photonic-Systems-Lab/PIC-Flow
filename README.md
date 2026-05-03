@@ -22,7 +22,11 @@ compliance, ~10× faster than 16-thread CPU FDTD on the same node.
 > then `cp outputs/denoising/trajectory_directional_coupler.gif assets/denoising_directional_coupler.gif`.
 
 
-input:  (epsilon, source mask, wavelength)  -->  PIC-Flow U-Net (Euler/Heun ODE sampler)  -->  E_z(x,y)
+<p align="center">
+  <img src="assets/system.png"
+       alt="High level system flow"
+       width="840">
+</p>
 
 
 Trained dataset covers three device families at 1.55 µm (multimode interferometers, Y-branches,
