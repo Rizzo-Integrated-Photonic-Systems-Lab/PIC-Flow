@@ -21,9 +21,9 @@ compliance, ~10× faster than 16-thread CPU FDTD on the same node.
 > Regenerate the GIF: `python tools/denoising_trajectory.py --device directional_coupler`,
 > then `cp outputs/denoising/trajectory_directional_coupler.gif assets/denoising_directional_coupler.gif`.
 
-```
+
 input:  (epsilon, source mask, wavelength)  -->  PIC-Flow U-Net (Euler/Heun ODE sampler)  -->  E_z(x,y)
-```
+
 
 Trained dataset covers three device families at 1.55 µm (multimode interferometers, Y-branches,
 and directional couplers — 22 500 FDTD simulations total).
