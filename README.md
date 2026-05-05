@@ -86,13 +86,28 @@ Hosted artifacts:
 - Checkpoints: [huggingface.co/RizzoLab/PIC-Flow](https://huggingface.co/RizzoLab/PIC-Flow)
 - Dataset (22,500 FDTD samples, 13 GB): [huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset](https://huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset)
 
-The three notebooks cover the full lifecycle:
+### Try it locally (interactive notebook)
+
+[`notebooks/04_interactive.ipynb`](notebooks/04_interactive.ipynb) ships a
+live `ipywidgets` UI: pick a device, slide its 5 geometric parameters, and
+watch $|E_z|$ update inline as you slide. Adjustable Euler step count for
+the speed-vs-quality tradeoff (20 steps ≈ 0.4 s per inference on an A100).
+
+```bash
+pip install jupyterlab ipywidgets huggingface_hub
+# Optional: pre-pull the checkpoint so the first cell run doesn't download.
+hf download RizzoLab/PIC-Flow checkpoints/phase_residual_300.pt
+jupyter lab notebooks/04_interactive.ipynb
+```
+
+The four notebooks cover the full lifecycle:
 
 | Notebook | What it shows | Needs Meep? | Needs dataset? |
 |---|---|---|---|
 | [`notebooks/01_dataset_generation.ipynb`](notebooks/01_dataset_generation.ipynb) | Generate a small FDTD dataset (~10 geometries/family) with `FDTD/unified_sweep.py`. | Yes | No (writes one) |
 | [`notebooks/02_training.ipynb`](notebooks/02_training.ipynb) | Smoke-train the U-Net on a tiny subset; loss curves. | No | Yes (full pull) |
 | [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb) | Load the FM+phase+residual checkpoint, predict $E_z$ on a test sample, plot triptych + compliance. | No | Yes (one shard) |
+| [`notebooks/04_interactive.ipynb`](notebooks/04_interactive.ipynb) | Real-time `ipywidgets` UI: pick a device, slide its 5 geometric parameters, watch $E_z$ update inline as you slide. Adjustable Euler steps for the speed-vs-quality tradeoff. | Yes (rasterizer) | No |
 
 ### Training (full)
 

@@ -63,10 +63,12 @@ DEVICE_LABELS = {
 }
 
 
-# t-values to render in the static panel. Three frames (noise -> halfway ->
-# final) connected by right-arrows make the noise-to-field transport visually
-# legible without overwhelming the paper figure.
-PANEL_T_VALUES = (0.00, 0.50, 1.00)
+# t-values to render in the static panel. Six frames laid out in a 2x3 grid
+# (top row: t = 0.0, 0.2, 0.4; bottom row: t = 0.6, 0.8, 1.0), with
+# right-arrows between adjacent frames in each row. The t-labels carry the
+# implicit ordering from the end of row 1 to the start of row 2.
+PANEL_T_VALUES = (0.00, 0.20, 0.40, 0.60, 0.80, 1.00)
+PANEL_N_COLS = 3
 TOTAL_STEPS = 100
 
 
@@ -159,50 +161,92 @@ def _save_static_panel(
     traj_mags: np.ndarray,                # [num_steps + 1, H, W]
     t_values: tuple[float, ...],
     num_steps: int,
-    *, out_path: Path, vmax_global: float,
+    *, out_path: Path, vmax_global: float, n_cols: int = PANEL_N_COLS,
 ) -> None:
-    """Render a flow-matching transport panel: a horizontal strip of |x_t|
-    frames at the requested t-values, separated by right-arrow cells. No FDTD
-    reference; this figure is meant to illustrate the noise -> field transport.
+    """Render a flow-matching transport panel: |x_t| frames laid out in a
+    serpentine (boustrophedon) reading order. Row 0 reads left->right, row 1
+    reads right->left, etc. A short vertical arrow connects the end of each
+    row to the start of the next on the right edge of the figure, so the
+    visual flow is continuous from t=0 to t=1 with no full-width connector.
+    No FDTD reference; this figure illustrates the noise -> field transport.
     """
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
+    from matplotlib.patches import ConnectionPatch
 
     n = len(t_values)
-    # Alternating frame / arrow / frame / arrow / ... layout.
-    width_ratios: list[float] = []
-    for i in range(n):
-        width_ratios.append(3.0)            # frame cell
-        if i < n - 1:
-            width_ratios.append(0.55)       # arrow cell
-    fig = plt.figure(figsize=(7.4, 1.55), constrained_layout=True)
-    gs = GridSpec(1, len(width_ratios), figure=fig, width_ratios=width_ratios)
+    if n % n_cols != 0:
+        raise ValueError(f"len(t_values)={n} not divisible by n_cols={n_cols}")
+    n_rows = n // n_cols
 
-    cell_idx = 0
-    for i, t_val in enumerate(t_values):
-        ax = fig.add_subplot(gs[0, cell_idx])
-        k = int(round(float(t_val) * num_steps))
-        k = max(0, min(num_steps, k))
-        if t_val <= 1e-9:
-            title = r"$t=0$ (noise)"
-        elif abs(t_val - 1.0) < 1e-9:
-            title = r"$t=1$ (predicted $|E_z|$)"
-        else:
-            title = rf"$t={t_val:g}$"
-        _render_panel_frame(ax, traj_mags[k], eps, vmax=vmax_global,
-                            title=title,
-                            source=(src if t_val <= 1e-9 else None))
-        cell_idx += 1
-        if i < n - 1:
-            arrow_ax = fig.add_subplot(gs[0, cell_idx])
-            arrow_ax.annotate(
-                "", xy=(0.95, 0.5), xytext=(0.05, 0.5),
-                xycoords="axes fraction",
-                arrowprops=dict(arrowstyle="-|>", lw=1.6, color="black",
-                                mutation_scale=18),
-            )
-            arrow_ax.set_axis_off()
-            cell_idx += 1
+    # Within each row: frame / arrow / frame / arrow / frame -> 2*n_cols - 1 cells.
+    width_ratios: list[float] = []
+    for i in range(n_cols):
+        width_ratios.append(3.0)            # frame cell
+        if i < n_cols - 1:
+            width_ratios.append(0.55)       # arrow cell
+
+    frame_w = 2.5
+    frame_h = 1.25
+    fig_w = sum(width_ratios) / 3.0 * frame_w
+    fig_h = n_rows * frame_h + 0.3 * (n_rows - 1)
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=True)
+    gs = GridSpec(n_rows, len(width_ratios), figure=fig, width_ratios=width_ratios)
+
+    # Serpentine: row 0 reads L->R (t-indices 0..n_cols-1), row 1 reads R->L
+    # (t-indices reversed), row 2 reads L->R again, ...
+    rightmost_axes_per_row: list[plt.Axes] = [None] * n_rows  # type: ignore[list-item]
+
+    for row in range(n_rows):
+        is_left_to_right = (row % 2 == 0)
+        # Pull the t-values that belong to this row in reading order.
+        block = list(t_values[row * n_cols : (row + 1) * n_cols])
+        # In the figure we always lay them out left->right; for R->L rows we
+        # reverse the block so the right edge of the figure carries the
+        # earliest t in this row, which connects vertically to the previous
+        # row's last t.
+        layout = block if is_left_to_right else list(reversed(block))
+        for col_in_row, t_val in enumerate(layout):
+            cell_idx = 2 * col_in_row
+            ax = fig.add_subplot(gs[row, cell_idx])
+            k = int(round(float(t_val) * num_steps))
+            k = max(0, min(num_steps, k))
+            if t_val <= 1e-9:
+                title = r"$t=0$ (noise)"
+            elif abs(t_val - 1.0) < 1e-9:
+                title = r"$t=1$ (predicted $|E_z|$)"
+            else:
+                title = rf"$t={t_val:g}$"
+            _render_panel_frame(ax, traj_mags[k], eps, vmax=vmax_global,
+                                title=title,
+                                source=(src if t_val <= 1e-9 else None))
+            if col_in_row < n_cols - 1:
+                arrow_ax = fig.add_subplot(gs[row, cell_idx + 1])
+                if is_left_to_right:
+                    xy_tail, xy_head = (0.05, 0.5), (0.95, 0.5)
+                else:
+                    xy_tail, xy_head = (0.95, 0.5), (0.05, 0.5)
+                arrow_ax.annotate("", xy=xy_head, xytext=xy_tail,
+                                  xycoords="axes fraction",
+                                  arrowprops=dict(arrowstyle="-|>", lw=1.6, color="black",
+                                                  mutation_scale=18))
+                arrow_ax.set_axis_off()
+        # Track the axis at the rightmost figure-x position for this row, since
+        # that's where the inter-row arrow lives.
+        rightmost_axes_per_row[row] = ax  # last ax we added has col_in_row = n_cols - 1
+
+    # Inter-row vertical arrows: down on the right edge between consecutive rows.
+    for row in range(n_rows - 1):
+        top_ax    = rightmost_axes_per_row[row]
+        bottom_ax = rightmost_axes_per_row[row + 1]
+        diag = ConnectionPatch(
+            xyA=(0.92, -0.05), coordsA=top_ax.transAxes,
+            xyB=(0.92, 1.18),  coordsB=bottom_ax.transAxes,
+            arrowstyle="-|>", lw=1.6, color="black", mutation_scale=18,
+            shrinkA=2, shrinkB=2,
+            zorder=10,
+        )
+        fig.add_artist(diag)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
