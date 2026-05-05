@@ -40,6 +40,7 @@ from circular_bend.circular_bend import CircularBend2D
 from crossing.crossing import UniformCrossing2D
 
 from sweep_utils import latin_hypercube, quantize_01, assign_splits
+from param_ranges import INPUT_PORTS, PARAM_RANGES
 
 
 # =============================================================================
@@ -406,76 +407,6 @@ DEFAULT_COUNTS = {
     "circular_bend": 1500,        # 2D param space
     "crossing": 3000,             # 2D param space (4-port)
 }
-
-# Parameter ranges per device (9 device types).
-# All values should be multiples of 1/(2*resolution) for pixel-grid alignment.
-# At resolution=20: quantum = 1/40 = 0.025 µm.
-# Rectangular domain: 480×160 interior at res=20 (24.0 × 8.0 µm).
-# Square-domain support remains available for experiments/previews, but the
-# active final dataset currently uses the rectangular domain for all devices.
-PARAM_RANGES = {
-    "straight": {
-        "wg_width_um": (0.40, 0.575),       # 8/20 – 11.5/20 (≥8 px per wg width)
-        "dev_length_um": (6.0, 18.0),        # fit in 24 µm X
-    },
-    "taper": {
-        "wg_width_in": (0.40, 0.575),        # narrow end
-        "wg_width_out": (0.60, 2.0),         # wide end
-        "taper_length_um": (3.0, 15.0),      # fit in 24 µm X
-    },
-    "mmi": {
-        "wg_width_um":    (0.40, 0.575),     # 8/20 – 11.5/20
-        "mmi_width_um":   (4.5, 5.5),        # keep up to 1.5 µm tapers inside MMI body
-        "mmi_length_um":  (8.0, 15.0),       # fit in 24 µm X
-        "taper_width_um": (0.575, 1.5),      # 11.5/20 – 1.5
-        "taper_length_um":(1.0, 3.0),        # taper length per side
-    },
-    "sbend": {
-        "wg_width_um": (0.40, 0.575),        # 8/20 – 11.5/20
-        "lateral_offset_um": (2.0, 5.5),     # fit in 8 µm Y
-        "R_min_um": (3.0, 7.0),              # reduce X extent
-    },
-    "ybranch": {
-        "wg_width_um": (0.40, 0.575),        # 8/20 – 11.5/20
-        "l_junction_um": (1.0, 3.0),
-        "l_bend_um": (4.0, 7.0),
-        "h_bend_um": (0.575, 2.5),           # fit in 8 µm Y
-        "l_out_um": (1.0, 4.0),              # fit in 24 µm X
-    },
-    "directional_coupler": {
-        "wg_width_um": (0.40, 0.575),        # 8/20 – 11.5/20
-        "gap_um": (0.10, 0.35),              # 2/20 – 7/20 (≥2 px across gap)
-        "wg_length_um": (5.0, 8.0),          # fit in 24 µm X
-        "bend_length_um": (4.0, 6.0),
-        "lead_extra_gap_um": (0.825, 2.0),   # fit in 8 µm Y
-    },
-    "euler_bend": {
-        "wg_width": (0.40, 0.575),           # 8/20 – 11.5/20
-        "R_min_um": (2.0, 3.4),              # fit in 8 µm rectangular height with source/port clearance
-    },
-    "circular_bend": {
-        "wg_width": (0.40, 0.575),           # 8/20 – 11.5/20
-        "bend_radius_um": (2.0, 3.5),        # fit in 8 µm rectangular height
-    },
-    "crossing": {
-        "wg_width_h": (0.40, 0.575),         # horizontal WG width
-        "wg_width_v": (0.40, 0.575),         # vertical WG width
-    },
-}
-
-# Number of input ports per device type (9 device types)
-INPUT_PORTS = {
-    "straight": [1, 2],
-    "taper": [1, 2],
-    "mmi": [1, 2],
-    "sbend": [1, 2],
-    "ybranch": [1, 2, 3],              # Port 1 = splitter, Ports 2/3 = combiner
-    "directional_coupler": [1, 2],     # Symmetric, use 1 or 2
-    "euler_bend": [1, 2],
-    "circular_bend": [1, 2],
-    "crossing": [1, 2, 3, 4],          # 4-port device
-}
-
 
 # =============================================================================
 # Sampling utilities

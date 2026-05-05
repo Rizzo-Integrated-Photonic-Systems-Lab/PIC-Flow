@@ -23,6 +23,7 @@ import json
 import math
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -45,10 +46,14 @@ for _p in (str(MODEL_DIR), str(FDTD_DIR), str(REPO_ROOT)):
 from flow_matching import sample as fm_sample  # noqa: E402
 from physics_unet import PhysicsUNet  # noqa: E402
 from complex_physics_unet import ComplexPhysicsUNet  # noqa: E402
+from param_ranges import PARAM_RANGES  # noqa: E402
 
-def _load_unified_sweep():
-    from unified_sweep import PARAM_RANGES, build_device, get_device_masks  # noqa: E402
-    return PARAM_RANGES, build_device, get_device_masks
+
+def _load_meep_builders():
+    """Meep-backed geometry rasterization (requires `conda install -c conda-forge pymeep`)."""
+    from unified_sweep import build_device, get_device_masks  # noqa: E402
+
+    return build_device, get_device_masks
 
 
 TRAINED_DEVICE_TYPES = ("mmi", "ybranch", "directional_coupler")
@@ -100,7 +105,6 @@ def _parse_params(args: argparse.Namespace) -> dict[str, float]:
 
 
 def _validated_params(device_type: str, user_params: dict[str, float], fill_missing: str) -> dict[str, float]:
-    PARAM_RANGES, _, _ = _load_unified_sweep()
     if device_type not in PARAM_RANGES:
         raise ValueError(f"Unknown device '{device_type}'. Valid devices: {sorted(PARAM_RANGES)}")
     ranges = PARAM_RANGES[device_type]
@@ -280,37 +284,54 @@ def _build_cond_vector(wavelength_um: float, stats: dict[str, Any], *, device: t
     return cond
 
 
+@contextmanager
+def _meep_quiet():
+    """Temporarily silence Meep's init_sim / structure logging (interactive notebook noise)."""
+    try:
+        import meep as mp
+    except ModuleNotFoundError:
+        yield
+        return
+    prev = int(mp.verbosity)
+    mp.verbosity(0)
+    try:
+        yield
+    finally:
+        mp.verbosity(prev)
+
+
 def _get_eps_and_cell(dev: Any, *, crop_pml: bool = True) -> tuple[np.ndarray, tuple[float, float]]:
-    if hasattr(dev, "get_eps_and_cell"):
-        eps, cell_size = dev.get_eps_and_cell(crop_pml=crop_pml)
-        return np.asarray(eps, dtype=np.float32), (float(cell_size[0]), float(cell_size[1]))
+    with _meep_quiet():
+        if hasattr(dev, "get_eps_and_cell"):
+            eps, cell_size = dev.get_eps_and_cell(crop_pml=crop_pml)
+            return np.asarray(eps, dtype=np.float32), (float(cell_size[0]), float(cell_size[1]))
 
-    import meep as mp
+        import meep as mp
 
-    sim = mp.Simulation(
-        cell_size=dev.cell,
-        resolution=int(dev.resolution),
-        boundary_layers=[mp.PML(float(dev.dpml))],
-        geometry=dev.geometry,
-        default_material=dev.clad_medium,
-        sources=[],
-    )
-    sim.init_sim()
-    eps_mid = sim.get_epsilon().T
-    sim.reset_meep()
+        sim = mp.Simulation(
+            cell_size=dev.cell,
+            resolution=int(dev.resolution),
+            boundary_layers=[mp.PML(float(dev.dpml))],
+            geometry=dev.geometry,
+            default_material=dev.clad_medium,
+            sources=[],
+        )
+        sim.init_sim()
+        eps_mid = sim.get_epsilon().T
+        sim.reset_meep()
 
-    cell_x = float(dev.cell_x)
-    cell_y = float(dev.cell_y)
-    if not crop_pml:
-        return eps_mid.astype(np.float32, copy=False), (cell_x, cell_y)
+        cell_x = float(dev.cell_x)
+        cell_y = float(dev.cell_y)
+        if not crop_pml:
+            return eps_mid.astype(np.float32, copy=False), (cell_x, cell_y)
 
-    p = int(getattr(dev, "pml_px", round(float(dev.dpml) * float(dev.resolution))))
-    if p <= 0:
-        return eps_mid.astype(np.float32, copy=False), (cell_x, cell_y)
-    return (
-        eps_mid[p:-p, p:-p].astype(np.float32, copy=False),
-        (cell_x - 2.0 * float(dev.dpml), cell_y - 2.0 * float(dev.dpml)),
-    )
+        p = int(getattr(dev, "pml_px", round(float(dev.dpml) * float(dev.resolution))))
+        if p <= 0:
+            return eps_mid.astype(np.float32, copy=False), (cell_x, cell_y)
+        return (
+            eps_mid[p:-p, p:-p].astype(np.float32, copy=False),
+            (cell_x - 2.0 * float(dev.dpml), cell_y - 2.0 * float(dev.dpml)),
+        )
 
 
 def _make_device_and_arrays(
@@ -323,7 +344,7 @@ def _make_device_and_arrays(
     crop_x_px: int,
     crop_y_px: int,
 ) -> tuple[Any, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[float, float]]:
-    _, build_device, get_device_masks = _load_unified_sweep()
+    build_device, get_device_masks = _load_meep_builders()
     cell_x = float(crop_x_px) / float(resolution) + 2.0 * float(dpml)
     cell_y = float(crop_y_px) / float(resolution) + 2.0 * float(dpml)
     dev = build_device(device_type, params, wavelength_um, resolution, dpml, cell_x, cell_y, crop_x_px, crop_y_px)

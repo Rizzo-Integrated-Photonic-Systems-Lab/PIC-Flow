@@ -139,9 +139,11 @@ released checkpoint.
 # Single device folder (eps.npy, src_mask.npy, sparams.npz with wavelength_um)
 python Model/sample.py --device-dir path/to/device/ --ckpt checkpoints/phase_residual_300.pt
 
-# Parametric device (no FDTD needed; specify geometry directly)
+# Parametric device (rasterizes geometry with Meep — install pymeep; see Install)
 python tools/predict_parametric_device.py --device directional_coupler \
-    --gap 0.175 --L_c 5.97 --wavelength 1.55 --ckpt checkpoints/phase_residual_300.pt
+    --source-port 1 --fill-missing midpoint \
+    --params '{"gap_um":0.175,"wg_length_um":5.97}' \
+    --wavelength-um 1.55 --ckpt checkpoints/phase_residual_300.pt
 
 # Full test-set sweep with metric histograms
 python tools/test_set_histograms.py --ckpt checkpoints/phase_residual_300.pt --num-steps 100

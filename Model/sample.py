@@ -86,34 +86,68 @@ def _infer_device_type_from_path(device_dir: Path) -> str:
     return ""
 
 
-def _build_model_from_ckpt_args(ckpt_args, stats: dict | None, *, device: torch.device):
-    dx = float(getattr(ckpt_args, "dx"))
-    lam0 = float(getattr(ckpt_args, "lambda_um"))
-    omega = 2.0 * np.pi / lam0
-    pml_cells = int(getattr(ckpt_args, "pml_cells", 0))
+def _parse_csv_ints(text: str | None) -> tuple[int, ...]:
+    if not text:
+        return ()
+    return tuple(int(x.strip()) for x in str(text).split(",") if x.strip())
 
-    in_channels = int(getattr(ckpt_args, "in_channels", 0) or 0)
+
+def _ckpt_get(obj, name: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _build_model_from_ckpt_args(ckpt_args, stats: dict | None, *, device: torch.device):
+    dx = float(_ckpt_get(ckpt_args, "dx"))
+    lam0 = float(_ckpt_get(ckpt_args, "lambda_um"))
+    omega = 2.0 * np.pi / lam0
+    pml_cells = int(_ckpt_get(ckpt_args, "pml_cells", 0))
+
+    in_channels = int(_ckpt_get(ckpt_args, "in_channels", 0) or 0)
     if (in_channels <= 0) and (stats is not None):
         in_channels = int(stats.get("x_channels", 4))
     if in_channels <= 0:
-        include_sdf = bool(getattr(ckpt_args, "include_sdf", False))
+        include_sdf = bool(_ckpt_get(ckpt_args, "include_sdf", False))
         in_channels = 4 + (1 if include_sdf else 0)
 
-    enable_physics = bool(getattr(ckpt_args, "physics_features", True))
-    use_complex = bool(getattr(ckpt_args, "complex_unet", False))
+    enable_physics = bool(_ckpt_get(ckpt_args, "physics_features", True))
+    use_complex = bool(_ckpt_get(ckpt_args, "complex_unet", False))
+
+    channel_mult = _parse_csv_ints(_ckpt_get(ckpt_args, "channel_mult", "1,2,4,8"))
+    if not channel_mult:
+        channel_mult = (1, 2, 4, 8)
+    if bool(_ckpt_get(ckpt_args, "no_attention", False)):
+        attn_res = ()
+    else:
+        attn_res = _parse_csv_ints(_ckpt_get(ckpt_args, "attn_resolutions", ""))
+
+    lambda_sparam = float(_ckpt_get(ckpt_args, "lambda_sparam", 0.0))
+    sparam_mode = str(_ckpt_get(ckpt_args, "sparam_mode", "project"))
+
+    cond_dim = 1
+    if stats is not None:
+        cond_dim = int(stats.get("cond_dim", _ckpt_get(ckpt_args, "cond_dim", 1)))
+    else:
+        cond_dim = int(_ckpt_get(ckpt_args, "cond_dim", 1))
+
+    model_dropout = float(_ckpt_get(ckpt_args, "model_dropout", _ckpt_get(ckpt_args, "dropout", 0.0)))
 
     model_kwargs = dict(
         in_channels=in_channels,
         out_channels=2,
-        model_channels=int(getattr(ckpt_args, "hidden_size")),
-        num_res_blocks=4,
-        channel_mult=(1, 2, 4, 8),
-        attention_resolutions=(8, 16),
-        dropout=0.0,
+        model_channels=int(_ckpt_get(ckpt_args, "hidden_size")),
+        num_res_blocks=int(_ckpt_get(ckpt_args, "num_res_blocks")),
+        channel_mult=channel_mult,
+        attention_resolutions=attn_res,
+        dropout=model_dropout,
         dims=2,
         use_checkpoint=False,
-        num_heads=4,
-        cond_dim=int(getattr(ckpt_args, "cond_dim", 1)),
+        num_heads=int(_ckpt_get(ckpt_args, "num_heads", 8)),
+        cond_dim=cond_dim,
+        enable_sparam_head=(lambda_sparam > 0.0 and sparam_mode == "head"),
         dx=dx,
         dy=dx,
         omega=omega,
