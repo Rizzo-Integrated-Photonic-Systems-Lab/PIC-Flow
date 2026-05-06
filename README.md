@@ -18,8 +18,9 @@ until the field converges to a prediction (left, $t=1$) that matches the FDTD re
 benchmark with as few as 20 Euler steps takes ≈ 444 ms and still hits 3 % Helmholtz
 compliance, ~10× faster than 16-thread CPU FDTD on the same node.
 
-> Regenerate the GIF: `python tools/denoising_trajectory.py --device directional_coupler`,
-> then `cp outputs/denoising/trajectory_directional_coupler.gif assets/denoising_directional_coupler.gif`.
+> Regenerate the GIF (after Quickstart, so the checkpoint and one shard are local):
+> `python tools/denoising_trajectory.py --device directional_coupler`, then
+> `cp outputs/denoising/trajectory_directional_coupler.gif assets/denoising_directional_coupler.gif`.
 
 
 <p align="center">
@@ -86,59 +87,53 @@ Hosted artifacts:
 - Checkpoints: [huggingface.co/RizzoLab/PIC-Flow](https://huggingface.co/RizzoLab/PIC-Flow)
 - Dataset (22,500 FDTD samples, 13 GB): [huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset](https://huggingface.co/datasets/RizzoLab/PIC-Flow-Dataset)
 
-### Try it locally (interactive notebook)
+The HF repos are public — no `hf auth login` needed.
 
-[`notebooks/04_interactive.ipynb`](notebooks/04_interactive.ipynb) ships a
-live `ipywidgets` UI: pick a device, slide its 5 geometric parameters, and
-watch $|E_z|$ update inline as you slide. Adjustable Euler step count for
-the speed-vs-quality tradeoff (20 steps ≈ 0.4 s per inference on an A100).
-
-```bash
-pip install jupyterlab ipywidgets huggingface_hub
-# Optional: pre-pull the checkpoint so the first cell run doesn't download.
-hf download RizzoLab/PIC-Flow checkpoints/phase_residual_300.pt
-jupyter lab notebooks/04_interactive.ipynb
-```
-
-The four notebooks cover the full lifecycle:
+The three notebooks cover the full lifecycle:
 
 | Notebook | What it shows | Needs Meep? | Needs dataset? |
 |---|---|---|---|
 | [`notebooks/01_dataset_generation.ipynb`](notebooks/01_dataset_generation.ipynb) | Generate a small FDTD dataset (~10 geometries/family) with `FDTD/unified_sweep.py`. | Yes | No (writes one) |
-| [`notebooks/02_training.ipynb`](notebooks/02_training.ipynb) | Smoke-train the U-Net on a tiny subset; loss curves. | No | Yes (full pull) |
-| [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb) | Load the FM+phase+residual checkpoint, predict $E_z$ on a test sample, plot triptych + compliance. | No | Yes (one shard) |
-| [`notebooks/04_interactive.ipynb`](notebooks/04_interactive.ipynb) | Real-time `ipywidgets` UI: pick a device, slide its 5 geometric parameters, watch $E_z$ update inline as you slide. Adjustable Euler steps for the speed-vs-quality tradeoff. | Yes (rasterizer) | No |
+| [`notebooks/02_training.ipynb`](notebooks/02_training.ipynb) | Smoke-train the U-Net on a tiny subset; loss curves. | No | One shard (uses `--skip-missing-shards`); pull more for serious training |
+| [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb) | Load the FM+phase+residual checkpoint, predict $E_z$ on a test sample, plot triptych + compliance. | No | Yes (one shard, as in Quickstart above) |
 
 ### Training (full)
+
+Pull the full 13 GB dataset first (one-time):
+
+```bash
+hf download RizzoLab/PIC-Flow-Dataset --repo-type dataset \
+    --local-dir Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+```
 
 ```bash
 # Released-checkpoint architecture (~63 M params). The default --hidden-size and
 # --num-res-blocks in train.py build a different ~247 M model, so pass these
 # explicitly to reproduce phase_residual_300.pt:
 ARCH="--hidden-size 56 --num-res-blocks 3 --attn-resolutions 4,8"
+SWEEP="unified_sweep_mmi_ybranch_dc_7500_each_1p55um"
+DATA="--data-root Data/ --include-sweeps $SWEEP --use-shards"
 
 # Single GPU
-python Model/train.py --data-root Data/ --use-shards $ARCH --epochs 300 --batch-size 4
+python Model/train.py $DATA $ARCH --epochs 300 --batch-size 4
 
 # Multi-GPU (DDP)
-torchrun --nproc_per_node=4 Model/train.py --data-root Data/ --use-shards $ARCH --batch-size 16
+torchrun --nproc_per_node=4 Model/train.py $DATA $ARCH --batch-size 16
 
 # Three paper runs (FM, FM+phase, FM+phase+residual)
-python Model/train.py --data-root Data/ --use-shards $ARCH --lambda-residual 0   --lambda-phase 0
-python Model/train.py --data-root Data/ --use-shards $ARCH --lambda-residual 0   --lambda-phase 0.1
-python Model/train.py --data-root Data/ --use-shards $ARCH --lambda-residual 1.0 --lambda-phase 0.1
+python Model/train.py $DATA $ARCH --lambda-residual 0   --lambda-phase 0
+python Model/train.py $DATA $ARCH --lambda-residual 0   --lambda-phase 0.1
+python Model/train.py $DATA $ARCH --lambda-residual 1.0 --lambda-phase 0.1
 ```
 
 `python Model/train.py --help` lists all flags. The `--lambda-*` weights select which
 of the three paper variants you train; the `$ARCH` flags pin width/depth to match the
-released checkpoint.
+released checkpoint. `--include-sweeps` is required because `train.py` defaults to a
+different (legacy) sweep name.
 
 ### Inference (CLI)
 
 ```bash
-# Single device folder (eps.npy, src_mask.npy, sparams.npz with wavelength_um)
-python Model/sample.py --device-dir path/to/device/ --ckpt checkpoints/phase_residual_300.pt
-
 # Parametric device (rasterizes geometry with Meep — install pymeep; see Install)
 python tools/predict_parametric_device.py --device directional_coupler \
     --source-port 1 --fill-missing midpoint \
@@ -148,6 +143,8 @@ python tools/predict_parametric_device.py --device directional_coupler \
 # Full test-set sweep with metric histograms
 python tools/test_set_histograms.py --ckpt checkpoints/phase_residual_300.pt --num-steps 100
 ```
+
+For shard-based inference on individual test samples, use [`notebooks/03_inference.ipynb`](notebooks/03_inference.ipynb).
 
 ### Dataset generation (FDTD)
 
@@ -162,9 +159,9 @@ hf download RizzoLab/PIC-Flow-Dataset --repo-type dataset \
 To regenerate from scratch (requires Meep — Linux/macOS only, ~24 h on a 16-thread CPU):
 
 ```bash
-python FDTD/unified_sweep.py --output-dir Data/ \
-    --devices mmi,ybranch,directional_coupler \
-    --num-samples 7500 --wavelengths 1.55
+python FDTD/unified_sweep.py --out-dir Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um \
+    --n-mmi 7500 --n-ybranch 7500 --n-directional-coupler 7500 \
+    --wavelengths 1.55
 ```
 
 See [`Data/README.md`](Data/README.md) for the dataset layout.

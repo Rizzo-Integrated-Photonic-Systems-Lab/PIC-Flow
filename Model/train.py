@@ -1021,6 +1021,7 @@ def main(args):
                 use_shards=args.use_shards,
                 shard_subdir=args.shard_subdir,
                 shard_index_name=args.shard_index_name,
+                skip_missing_shards=bool(getattr(args, "skip_missing_shards", False)),
                 include_sweeps=include_sweeps,
                 exclude_devices=exclude_devices,
                 include_wavelengths=include_wavelengths,
@@ -1053,6 +1054,7 @@ def main(args):
             use_shards=args.use_shards,
             shard_subdir=args.shard_subdir,
             shard_index_name=args.shard_index_name,
+            skip_missing_shards=bool(getattr(args, "skip_missing_shards", False)),
             include_sweeps=include_sweeps,
             exclude_devices=exclude_devices,
             include_wavelengths=include_wavelengths,
@@ -1084,6 +1086,7 @@ def main(args):
             use_shards=args.use_shards,
             shard_subdir=args.shard_subdir,
             shard_index_name=args.shard_index_name,
+            skip_missing_shards=bool(getattr(args, "skip_missing_shards", False)),
             include_sweeps=include_sweeps,
             exclude_devices=exclude_devices,
             include_wavelengths=include_wavelengths,
@@ -2658,6 +2661,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-shards", type=bool, default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument("--shard-subdir", type=str, default="shards")
     parser.add_argument("--shard-index-name", type=str, default="index.json")
+    parser.add_argument("--skip-missing-shards", type=bool, default=False, action=argparse.BooleanOptionalAction,
+                        help="Drop index.json entries whose shard file isn't on disk (lets you train on a partial dataset).")
     parser.add_argument("--include-sweeps", type=str, default="directional_coupler_sweep",
                         help="Comma-separated sweep subdirectory names to include (empty = all)")
     parser.add_argument("--exclude-devices", type=str, default="",

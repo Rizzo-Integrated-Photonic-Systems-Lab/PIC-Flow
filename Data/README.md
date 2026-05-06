@@ -10,8 +10,8 @@ Data/
 └── unified_sweep_mmi_ybranch_dc_7500_each_1p55um/
     └── shards/
         ├── index.json
-        ├── 0000.npz
-        ├── 0001.npz
+        ├── shard_00000.npz
+        ├── shard_00001.npz
         └── ...
 ```
 
@@ -36,4 +36,9 @@ Meep is required (install via `conda install -c conda-forge pymeep`).
 
 ## Download
 
-Pre-generated shards may be released alongside the paper. Until then, run the generator above.
+Pre-generated shards are hosted on Hugging Face:
+
+```bash
+hf download RizzoLab/PIC-Flow-Dataset --repo-type dataset \
+    --local-dir Data/unified_sweep_mmi_ybranch_dc_7500_each_1p55um
+```

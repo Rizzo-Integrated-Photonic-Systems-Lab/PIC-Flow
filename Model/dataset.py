@@ -256,6 +256,7 @@ class FDTDDataset(Dataset):
         # --- Corrupt/Bad sample handling ---
         skip_bad_samples: bool = True,     # Skip corrupted samples instead of crashing
         bad_sample_max_retries: int = 10,  # Max retries before failing
+        skip_missing_shards: bool = False, # Drop index entries whose shard file is absent on disk
         # --- Joint training: S-param conditioning ---
         include_sparams_cond: bool = False, # Append S-params to conditioning vector
         # --- Mixed-domain center padding ---
@@ -327,6 +328,7 @@ class FDTDDataset(Dataset):
 
         self.skip_bad_samples = bool(skip_bad_samples)
         self.bad_sample_max_retries = max(1, int(bad_sample_max_retries))
+        self.skip_missing_shards = bool(skip_missing_shards)
 
         # Mixed-domain center padding: pad all samples to a common canvas size.
         # E.g., canvas_hw=(320, 480) pads 160×480 rect and 320×320 sq to 320×480.
@@ -667,6 +669,8 @@ class FDTDDataset(Dataset):
                 raise RuntimeError(f"Missing shard index {index_path}")
             with open(index_path, "r") as f:
                 entries = json.load(f)
+            shard_present_cache: Dict[str, bool] = {}
+            skipped_missing = 0
             for e in entries:
                 # Filter by split if target_split is specified
                 if target_split is not None:
@@ -686,11 +690,27 @@ class FDTDDataset(Dataset):
                     if wl is None or not any(abs(wl - target) < 0.01 for target in include_wavelengths):
                         continue
 
-                shard_path = shard_dir / e["shard"]
+                shard_name = e["shard"]
+                shard_path = shard_dir / shard_name
+                if self.skip_missing_shards:
+                    present = shard_present_cache.get(shard_name)
+                    if present is None:
+                        present = shard_path.is_file()
+                        shard_present_cache[shard_name] = present
+                    if not present:
+                        skipped_missing += 1
+                        continue
                 slot = int(e["slot"])
                 # Use tag if present, otherwise geometry_id (unified_sweep format)
                 tag = e.get("tag", e.get("geometry_id", ""))
                 refs.append((shard_path, slot, tag))
+            if self.skip_missing_shards and skipped_missing > 0:
+                missing = sorted(s for s, ok in shard_present_cache.items() if not ok)
+                print(
+                    f"[dataset.py] skip_missing_shards: dropped {skipped_missing} entries "
+                    f"across {len(missing)} missing shard(s) under {shard_dir} "
+                    f"(e.g. {missing[:3]})"
+                )
         if not refs:
             if target_split is not None:
                 raise RuntimeError(f"No shard entries found for split='{target_split}' under sweeps {sweep_dirs}")

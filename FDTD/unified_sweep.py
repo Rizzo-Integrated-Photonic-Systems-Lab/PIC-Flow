@@ -916,6 +916,7 @@ def shard_writer_process(q: mp.Queue, shards_dir: str, shard_size: int,
 # Main
 # =============================================================================
 def main():
+    global WAVELENGTHS
     parser = argparse.ArgumentParser(description="Unified multi-device photonic sweep")
 
     # Output
@@ -975,7 +976,18 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--split-seed", type=int, default=123)
 
+    # Wavelength override (default: module-level WAVELENGTHS)
+    parser.add_argument("--wavelengths", type=str, default=None,
+                        help="Comma-separated wavelengths in µm (e.g. '1.55'). Default: "
+                             + ",".join(f"{w:g}" for w in WAVELENGTHS))
+
     args = parser.parse_args()
+
+    if args.wavelengths is not None:
+        parsed = [float(s) for s in args.wavelengths.split(",") if s.strip()]
+        if not parsed:
+            parser.error("--wavelengths must list at least one value")
+        WAVELENGTHS = parsed
 
     # Set thread limits
     os.environ["OMP_NUM_THREADS"] = "1"
